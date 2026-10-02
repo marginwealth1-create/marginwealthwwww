@@ -57,7 +57,7 @@ export default function TwoFAEnrollPage() {
         <div className="mb-4 grid size-12 place-items-center rounded-2xl bg-primary/10 text-primary ring-1 ring-primary/15">
           <ShieldCheck className="size-5" />
         </div>
-        <h2 className="text-3xl font-bold tracking-tight">
+        <h2 className="font-display text-3xl font-bold tracking-tight">
           Enable two-factor authentication
         </h2>
         <p className="text-sm text-muted-foreground">
@@ -124,7 +124,7 @@ export default function TwoFAEnrollPage() {
 
           <Button
             onClick={enable}
-            className="h-12 w-full rounded-xl text-sm font-semibold shadow-lg shadow-primary/20"
+            className="h-12 w-full rounded-xl bg-gold text-sm font-semibold text-[#0B1020] hover:bg-gold/90"
             loading={busy}
             disabled={code.length !== 6}
           >

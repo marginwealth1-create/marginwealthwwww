@@ -7,7 +7,7 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { toast } from "sonner";
-import { Loader2, Wrench } from "lucide-react";
+import { ArrowRight, Loader2, Wrench, Zap } from "lucide-react";
 import { useBranding } from "@/lib/branding-context";
 import { useAuthStore } from "@/stores/authStore";
 import { ApiError, AuthAPI, ProfileAPI, setTokens } from "@/lib/api";
@@ -16,6 +16,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { InstallPwaButton } from "@/components/common/InstallPwaButton";
+import { cn } from "@/lib/utils";
+import { FIELD, GOLD_BTN } from "../styles";
 
 const schema = z.object({
   identifier: z.string().min(3, "Enter your user ID or mobile no."),
@@ -195,19 +197,20 @@ function LoginPageInner() {
         </div>
       )}
 
-      <h1 className="text-2xl font-semibold tracking-tight">Sign in</h1>
-      <p className="mt-1.5 text-sm text-muted-foreground">
-        Use your user ID or registered mobile number.
+      <p className="text-xs font-semibold uppercase tracking-[0.2em] text-gold">Secure login</p>
+      <h1 className="mt-2 font-display text-3xl font-bold tracking-tight">Welcome back</h1>
+      <p className="mt-2 text-sm text-muted-foreground">
+        Sign in with your user ID or registered mobile number.
       </p>
 
-      <form onSubmit={form.handleSubmit(onSubmit)} className="mt-8 space-y-5">
+      <form onSubmit={form.handleSubmit(onSubmit)} className="mt-7 space-y-5">
         <div className="space-y-2">
           <Label htmlFor="identifier">User ID or mobile</Label>
           <Input
             id="identifier"
             placeholder="K7M2QX or 9999900000"
             autoComplete="username"
-            className="h-11"
+            className={FIELD}
             {...form.register("identifier")}
           />
           {form.formState.errors.identifier && (
@@ -227,12 +230,12 @@ function LoginPageInner() {
               id="password"
               type={showPwd ? "text" : "password"}
               autoComplete="current-password"
-              className="h-11 pr-16"
+              className={cn(FIELD, "pr-16")}
               {...form.register("password")}
             />
             <button
               type="button"
-              className="absolute inset-y-0 right-0 px-3 text-xs font-medium text-muted-foreground hover:text-foreground"
+              className="absolute inset-y-0 right-0 px-4 text-xs font-semibold text-muted-foreground hover:text-foreground"
               onClick={() => setShowPwd((v) => !v)}
               aria-label={showPwd ? "Hide password" : "Show password"}
             >
@@ -253,38 +256,45 @@ function LoginPageInner() {
               maxLength={6}
               placeholder="123456"
               autoComplete="one-time-code"
-              className="h-11 tracking-[0.3em]"
+              className={cn(FIELD, "tracking-[0.3em]")}
               {...form.register("two_fa_code")}
             />
           </div>
         )}
 
-        <Button type="submit" className="h-11 w-full" loading={form.formState.isSubmitting}>
-          Sign in
+        <Button type="submit" className={GOLD_BTN} loading={form.formState.isSubmitting}>
+          Sign in {!form.formState.isSubmitting && <ArrowRight />}
         </Button>
       </form>
+
+      <div className="my-6 flex items-center gap-3 text-xs text-muted-foreground">
+        <span className="h-px flex-1 bg-white/10" />
+        or
+        <span className="h-px flex-1 bg-white/10" />
+      </div>
 
       <Button
         type="button"
         variant="outline"
-        className="mt-3 h-11 w-full"
+        className="h-12 w-full rounded-xl border-white/10 bg-white/[0.03] hover:bg-white/[0.07]"
         onClick={handleDemoLogin}
         loading={demoLoading}
       >
-        Try a demo account
+        {!demoLoading && <Zap className="text-gold" />}
+        Try demo — ₹50L virtual funds
       </Button>
 
-      <p className="mt-8 text-center text-sm text-muted-foreground">
+      <p className="mt-7 text-center text-sm text-muted-foreground">
         New here?{" "}
         <Link
           href={urlRef ? `/register?ref=${encodeURIComponent(urlRef)}` : "/register"}
-          className="font-medium text-foreground underline underline-offset-4 hover:text-primary"
+          className="font-semibold text-gold hover:text-gold/80"
         >
-          Create an account
+          Open an account
         </Link>
       </p>
 
-      <div className="mt-6 flex flex-wrap items-center justify-center gap-4">
+      <div className="mt-5 flex flex-wrap items-center justify-center gap-4">
         <InstallPwaButton variant="compact" />
         <TelegramLink />
       </div>

@@ -63,7 +63,7 @@ export default function ForgotPasswordPage() {
         <div className="mb-4 grid size-12 place-items-center rounded-2xl bg-primary/10 text-primary ring-1 ring-primary/15">
           <KeyRound className="size-5" />
         </div>
-        <h2 className="text-3xl font-bold tracking-tight">Forgot password</h2>
+        <h2 className="font-display text-3xl font-bold tracking-tight">Forgot password</h2>
         <p className="text-sm text-muted-foreground">
           {step === "request"
             ? "Enter your email or mobile and we'll send a reset code."
@@ -102,7 +102,7 @@ export default function ForgotPasswordPage() {
               />
             </div>
           </div>
-          <Button type="submit" className="h-12 w-full rounded-xl text-sm font-semibold shadow-lg shadow-primary/20" loading={requestForm.formState.isSubmitting}>
+          <Button type="submit" className="h-12 w-full rounded-xl bg-gold text-sm font-semibold text-[#0B1020] hover:bg-gold/90" loading={requestForm.formState.isSubmitting}>
             Send reset code
           </Button>
         </form>
@@ -135,7 +135,7 @@ export default function ForgotPasswordPage() {
               />
             </div>
           </div>
-          <Button type="submit" className="h-12 w-full rounded-xl text-sm font-semibold shadow-lg shadow-primary/20" loading={resetForm.formState.isSubmitting}>
+          <Button type="submit" className="h-12 w-full rounded-xl bg-gold text-sm font-semibold text-[#0B1020] hover:bg-gold/90" loading={resetForm.formState.isSubmitting}>
             Reset password
           </Button>
         </form>

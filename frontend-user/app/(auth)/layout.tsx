@@ -3,6 +3,7 @@
 import { Suspense, useState } from "react";
 import { usePathname, useSearchParams } from "next/navigation";
 import Link from "next/link";
+import { Lock, ShieldCheck } from "lucide-react";
 import { BrandGlyph } from "@/components/layout/BrandGlyph";
 import { Wordmark } from "@/components/layout/Wordmark";
 import { useBranding } from "@/lib/branding-context";
@@ -114,22 +115,55 @@ function AuthLayoutInner({ children }: { children: React.ReactNode }) {
     </Link>
   );
 
-  // One plain centred column — no card, no side panel. Register gets a
-  // little more width for its two-up name fields.
+  // Full-bleed dark canvas with a centred glass card. `dark` scopes the dark
+  // theme tokens to the auth pages, so the shared Input / Button / Label pick
+  // them up without per-field overrides. Register gets a wider card for its
+  // two-up email + mobile row.
   return (
-    <main className="flex min-h-screen flex-col items-center bg-background px-5">
+    <main className="dark relative flex min-h-screen flex-col overflow-hidden bg-[#060914] text-foreground">
       <div
-        className={cn(
-          "flex w-full flex-1 flex-col justify-center py-12",
-          pathname === "/register" ? "max-w-md" : "max-w-sm",
+        aria-hidden
+        className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_70%_50%_at_10%_0%,rgba(59,91,219,0.32),transparent_60%),radial-gradient(ellipse_50%_45%_at_95%_100%,rgba(230,184,57,0.16),transparent_60%)]"
+      />
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 [background-image:linear-gradient(rgba(255,255,255,0.035)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.035)_1px,transparent_1px)] [background-size:56px_56px] [mask-image:radial-gradient(ellipse_at_center,black,transparent_75%)]"
+      />
+      {showPlatformDefault && (
+        <BrandGlyph className="pointer-events-none absolute -bottom-24 -right-20 size-[30rem] opacity-[0.06]" />
+      )}
+
+      <header className="relative z-10 flex items-center justify-between px-5 py-5 sm:px-10">
+        {brandMark}
+        {showPlatformDefault && (
+          <Link href="/" className="text-sm text-muted-foreground transition-colors hover:text-foreground">
+            &larr; Back to website
+          </Link>
         )}
-      >
-        <div className="mb-10 flex justify-center">{brandMark}</div>
-        {children}
+      </header>
+
+      <div className="relative z-10 flex flex-1 items-center justify-center px-4 py-6">
+        <div
+          className={cn(
+            "w-full rounded-3xl border border-white/10 bg-[#0B1020]/75 p-6 shadow-2xl shadow-black/50 backdrop-blur-xl sm:p-9",
+            pathname === "/register" ? "max-w-md" : "max-w-[25rem]",
+          )}
+        >
+          {children}
+        </div>
       </div>
-      <p className="py-6 text-xs text-muted-foreground">
-        &copy; {new Date().getFullYear()} {tenantName || platformName}
-      </p>
+
+      <footer className="relative z-10 flex flex-wrap items-center justify-center gap-x-5 gap-y-1 px-5 pb-6 text-xs text-muted-foreground">
+        <span className="inline-flex items-center gap-1.5">
+          <Lock className="size-3.5" /> 256-bit encrypted
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <ShieldCheck className="size-3.5" /> 2FA available
+        </span>
+        <span>
+          &copy; {new Date().getFullYear()} {tenantName || platformName}
+        </span>
+      </footer>
     </main>
   );
 }
