@@ -42,14 +42,15 @@ Paste:
 ```
 marginwealth ALL=(root) NOPASSWD: /usr/bin/systemctl restart marginwealth-backend
 marginwealth ALL=(root) NOPASSWD: /usr/bin/systemctl reload marginwealth-backend
-marginwealth ALL=(root) NOPASSWD: /usr/bin/journalctl -u marginwealth-backend *
+marginwealth ALL=(root) NOPASSWD: /usr/bin/journalctl -u marginwealth-backend --no-pager -n 20
 marginwealth ALL=(root) NOPASSWD: /usr/bin/systemctl reload nginx
 marginwealth ALL=(root) NOPASSWD: /usr/sbin/nginx -t
-marginwealth ALL=(root) NOPASSWD: /usr/bin/cp * /etc/nginx/sites-available/marginwealth
+marginwealth ALL=(root) NOPASSWD: /usr/bin/cp /opt/marginwealth/deploy/nginx/marginwealth.conf /etc/nginx/sites-available/marginwealth
 ```
 
 Save (`Ctrl+O`, `Enter`, `Ctrl+X`). visudo will syntax-check before
-writing, so a typo here won't lock you out.
+writing, so a typo here won't lock you out. sudo ≥ 1.9.16 rejects `*`
+wildcards in arguments, so the rules spell out the exact commands deploy.sh runs.
 
 ### 3. Make sure the EC2 has the repo at `/opt/marginwealth`
 

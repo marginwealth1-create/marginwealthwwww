@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { MpPageHero, MpProse, MpSection } from "@/components/marketing/mp-ui";
 
 export const metadata: Metadata = {
-  title: "Refund Policy | MarginWealth",
+  title: "Refund Policy",
   description:
     "How refunds work at MarginWealth for account charges, subscriptions and added funds.",
 };

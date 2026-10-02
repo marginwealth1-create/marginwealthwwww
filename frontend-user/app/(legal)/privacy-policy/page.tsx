@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { MpPageHero, MpProse, MpSection } from "@/components/marketing/mp-ui";
 
 export const metadata: Metadata = {
-  title: "Privacy Policy | MarginWealth",
+  title: "Privacy Policy",
   description:
     "How MarginWealth collects, uses, protects and shares your personal and financial information across its trading and investing services.",
   alternates: { canonical: "/privacy" },

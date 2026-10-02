@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { MpPageHero, MpProse, MpSection } from "@/components/marketing/mp-ui";
 
 export const metadata: Metadata = {
-  title: "Terms & Conditions | MarginWealth",
+  title: "Terms & Conditions",
   description:
     "The terms and conditions governing the use of MarginWealth's trading and investing services across NSE, BSE & MCX.",
 };
