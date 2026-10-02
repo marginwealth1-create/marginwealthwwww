@@ -1,0 +1,112 @@
+<!DOCTYPE HTML>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport"
+    content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no" />
+  <title>MarginWealth Chart</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #0d0d0d; overflow: hidden; }
+    #tv { position: absolute; inset: 0; }
+  </style>
+  <!-- Licensed TradingView Advanced Charts library (placed on the server,
+       NOT committed to git per the TradingView redistribution licence). -->
+  <script src="charting_library/charting_library.standalone.js"></script>
+  <script src="datafeed.js"></script>
+</head>
+<body>
+  <div id="tv"></div>
+  <script>
+    (function () {
+      function post(o) {
+        try { window.ReactNativeWebView.postMessage(JSON.stringify(o)); } catch (e) {}
+      }
+      // Config injected by the RN WebView before this script runs.
+      var C = window.__CFG || {};
+      var dark = C.theme !== "light";
+
+      var df = new MarginWealthDatafeed();
+      window.__df = df;
+
+      var darkOverrides = {
+        "paneProperties.background": "#0d0d0d",
+        "paneProperties.backgroundType": "solid",
+        "paneProperties.vertGridProperties.color": "#1a1a1a",
+        "paneProperties.horzGridProperties.color": "#1a1a1a",
+        "scalesProperties.textColor": "#A1A1AA",
+        "scalesProperties.lineColor": "#2a2a2a",
+        "mainSeriesProperties.candleStyle.upColor": "#22C55E",
+        "mainSeriesProperties.candleStyle.downColor": "#EF4444",
+        "mainSeriesProperties.candleStyle.borderUpColor": "#22C55E",
+        "mainSeriesProperties.candleStyle.borderDownColor": "#EF4444",
+        "mainSeriesProperties.candleStyle.wickUpColor": "#22C55E",
+        "mainSeriesProperties.candleStyle.wickDownColor": "#EF4444",
+      };
+      var lightOverrides = {
+        "paneProperties.background": "#ffffff",
+        "paneProperties.backgroundType": "solid",
+        "mainSeriesProperties.candleStyle.upColor": "#16A34A",
+        "mainSeriesProperties.candleStyle.downColor": "#DC2626",
+        "mainSeriesProperties.candleStyle.borderUpColor": "#16A34A",
+        "mainSeriesProperties.candleStyle.borderDownColor": "#DC2626",
+        "mainSeriesProperties.candleStyle.wickUpColor": "#16A34A",
+        "mainSeriesProperties.candleStyle.wickDownColor": "#DC2626",
+      };
+
+      var widget = (window.tvWidget = new TradingView.widget({
+        container: "tv",
+        library_path: "charting_library/",
+        datafeed: df,
+        symbol: String(C.token || "256265"),
+        interval: String(C.interval || "5"),
+        timezone: "Asia/Kolkata",
+        locale: "en",
+        autosize: true,
+        theme: dark ? "dark" : "light",
+        // Mobile-tuned chrome. The app already provides its own symbol
+        // header + timeframe bar, so the chart hides the symbol search /
+        // compare / save-load to stay clean; indicators + drawings stay
+        // reachable from the header + left toolbar. Tweak freely.
+        disabled_features: [
+          "use_localstorage_for_settings",
+          "header_symbol_search",
+          "header_compare",
+          "symbol_search_hot_key",
+          "popup_hints",
+          "header_saveload",
+          "border_around_the_chart",
+        ],
+        enabled_features: ["hide_left_toolbar_by_default"],
+        overrides: dark ? darkOverrides : lightOverrides,
+        loading_screen: { backgroundColor: dark ? "#0d0d0d" : "#ffffff" },
+      }));
+
+      widget.onChartReady(function () {
+        post({ type: "ready" });
+
+        // RN host bridges — change resolution / symbol without a reload.
+        window.__setResolution = function (res) {
+          try { widget.activeChart().setResolution(String(res)); } catch (e) {}
+        };
+        window.__setSymbol = function (token) {
+          try {
+            widget.setSymbol(String(token), widget.activeChart().resolution(), function () {});
+          } catch (e) {}
+        };
+      });
+
+      // Receive ticks / commands from the RN host.
+      function handle(raw) {
+        try {
+          var m = JSON.parse(raw);
+          if (m.type === "tick") { if (window.__tick) window.__tick(m.price, m.ts); }
+          else if (m.type === "resolution") { if (window.__setResolution) window.__setResolution(m.res); }
+          else if (m.type === "symbol") { if (window.__setSymbol) window.__setSymbol(m.token); }
+        } catch (e) {}
+      }
+      document.addEventListener("message", function (e) { handle(e.data); });
+      window.addEventListener("message", function (e) { handle(e.data); });
+    })();
+  </script>
+</body>
+</html>

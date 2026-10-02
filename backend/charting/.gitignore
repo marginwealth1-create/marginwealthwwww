@@ -1,0 +1,10 @@
+# TradingView Advanced Charts is a LICENSED library and must NOT be committed
+# to a (public) repository per its redistribution terms. Place the library
+# folder on the server only — copy `charting_library/` from your licensed
+# TradingView download into THIS directory so it's served at
+# /charting/charting_library/...
+charting_library/
+
+# Optional UDF sample datafeed — we ship our own datafeed.js, so the bundled
+# sample is not needed, but ignore it too if you copy the whole package.
+datafeeds/

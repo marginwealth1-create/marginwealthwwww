@@ -1,0 +1,30 @@
+/* MarginWealth public site — only what Tailwind can't say inline. */
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* Faint dot grid behind the hero. */
+.mw-dots {
+  background-image: radial-gradient(rgb(148 163 184 / 0.35) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+/* Instrument ticker — the track holds the list twice, so -50% loops seamlessly. */
+@keyframes mw-marquee {
+  to {
+    transform: translateX(-50%);
+  }
+}
+.mw-marquee {
+  animation: mw-marquee 45s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  .mw-marquee {
+    animation: none;
+  }
+}

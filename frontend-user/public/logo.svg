@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 264 64" width="264" height="64" role="img" aria-label="MarginWealth">
+  <polygon points="6.00,46.00 6.00,17.20 12.84,17.20 24.00,32.32 35.16,17.20 42.00,17.20 42.00,46.00 35.16,46.00 35.16,28.72 24.00,43.84 12.84,28.72 12.84,46.00" fill="#3B5BDB"/>
+  <polygon points="24.00,10.00 29.76,17.20 24.00,24.40 18.24,17.20" fill="#E6B839"/>
+  <text x="52" y="46" font-family="'Space Grotesk', Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="31" font-weight="700" letter-spacing="-0.8">
+    <tspan fill="#0B0B0B">Margin</tspan><tspan fill="#3B5BDB">Wealth</tspan>
+  </text>
+</svg>

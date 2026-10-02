@@ -1,0 +1,148 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* PWA hardening — these sit OUTSIDE @layer so they win regardless of
+   Tailwind's reset order. They make the installed admin app behave
+   like a native shell:
+     - No iOS "Aa" text-size override
+     - No double-tap zoom (we still let scrollers + inputs work)
+     - No system text-selection on chrome (toolbars / nav / pills) —
+       inputs / table cells / paragraphs opt back in explicitly. */
+html {
+  -webkit-text-size-adjust: 100%;
+  -ms-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  touch-action: manipulation;
+  overscroll-behavior-y: none;
+}
+body {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* Re-enable selection for typeable / readable surfaces so admins can
+   still copy values from tables, cells, paragraphs, and inputs. */
+input,
+textarea,
+select,
+[contenteditable="true"],
+p, span, td, th, code, pre, .selectable {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+@layer base {
+  /* ── Light (default) ──────────────────────────────────────────── */
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 0 0% 9%;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 9%;
+    --muted: 0 0% 96%;
+    --muted-foreground: 0 0% 40%;
+    --border: 0 0% 90%;
+    --input: 0 0% 90%;
+    --ring: 228 69% 55%;
+    --primary: 228 69% 55%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 0 0% 96%;
+    --secondary-foreground: 0 0% 9%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --accent: 0 0% 96%;
+    --accent-foreground: 0 0% 9%;
+    --profit: 158 64% 38%;
+    --loss: 0 72% 51%;
+    --info: 217 91% 50%;
+    --info-foreground: 0 0% 100%;
+    --atm: 38 92% 50%;
+    --atm-foreground: 0 0% 9%;
+    --radius: 0.5rem;
+    color-scheme: light;
+  }
+
+  /* ── Dark ─────────────────────────────────────────────────────── */
+  .dark {
+    --background: 0 0% 4%;
+    --foreground: 0 0% 100%;
+    --card: 0 0% 10%;
+    --card-foreground: 0 0% 100%;
+    --popover: 0 0% 8%;
+    --popover-foreground: 0 0% 100%;
+    --muted: 0 0% 14%;
+    --muted-foreground: 0 0% 63%;
+    --border: 0 0% 16%;
+    --input: 0 0% 16%;
+    --ring: 228 69% 55%;
+    --primary: 228 69% 55%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 0 0% 16%;
+    --secondary-foreground: 0 0% 100%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --accent: 0 0% 14%;
+    --accent-foreground: 0 0% 100%;
+    --profit: 158 64% 40%;
+    --loss: 0 84% 60%;
+    --info: 217 91% 60%;
+    --info-foreground: 0 0% 100%;
+    --atm: 38 92% 55%;
+    --atm-foreground: 0 0% 9%;
+    color-scheme: dark;
+  }
+
+  * { @apply border-border; }
+  html, body { @apply h-full; }
+  body {
+    @apply bg-background text-foreground antialiased;
+    /* No `font-feature-settings`: `ss01`/`cv01`/`cv11` are Inter-specific
+       OpenType stylistic-set / character-variant features that swap in
+       alternate glyph shapes. With the project's system-ui font stack this
+       just enforces whatever stock system font is rendering — kept off so
+       admin and user app render with default system glyphs. */
+  }
+}
+
+@layer utilities {
+  .font-tabular { font-variant-numeric: tabular-nums; }
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 3px;
+  }
+
+  /* ── Mobile-responsive helpers ─────────────────────────────────── */
+  /* iOS safe-area aware bottom padding for bottom-fixed bars. */
+  .safe-area-bottom { padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .safe-area-pt { padding-top: env(safe-area-inset-top, 0px); }
+
+  /* Apple HIG / Material minimum tap target = 44px. */
+  .tap-target { min-height: 44px; min-width: 44px; }
+
+  /* Hide scrollbar but keep scrolling (used for chip rows / pill tabs). */
+  .no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+
+  /* Opt-in helper: makes the FIRST column of a <table> sticky-left so
+     the row identifier stays visible while a wide table scrolls
+     horizontally on mobile. Wrap the table in `overflow-x-auto` AND
+     give the parent `<table>` (or its container) the class. */
+  .table-sticky-first thead th:first-child,
+  .table-sticky-first tbody td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: hsl(var(--card));
+  }
+
+  /* Prevents horizontal page scroll if a child accidentally overflows
+     viewport (e.g. an off-canvas drawer mid-animation). */
+  .clip-x { overflow-x: clip; }
+}

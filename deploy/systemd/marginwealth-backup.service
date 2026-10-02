@@ -1,0 +1,37 @@
+# ─────────────────────────────────────────────────────────────────────
+#  MarginWealth — local MongoDB → Atlas warm-standby backup (oneshot)
+#
+#  Triggered by marginwealth-backup.timer every 15 minutes. Streams a full
+#  mongodump of local Mongo into mongorestore --drop against Atlas, so the
+#  Atlas cluster is an exact mirror of local after each run. The app NEVER
+#  talks to Atlas — it stays on fast local Mongo; Atlas is the restore-from
+#  copy for when this VPS dies.
+#
+#  ⚠️  PATHS assume the repo lives at /root/marginwealth. Adjust if yours is
+#      under /opt/marginwealth (match scripts/deploy.sh / `systemctl cat
+#      marginwealth-backend`). Needs mongodump + mongorestore on PATH
+#      (apt-get install -y mongodb-database-tools).
+# ─────────────────────────────────────────────────────────────────────
+[Unit]
+Description=MarginWealth MongoDB → Atlas warm-standby backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+# Point the script at the live backend .env (source + Atlas URIs live there).
+Environment=ENV_FILE=/root/marginwealth/backend/.env
+ExecStart=/usr/bin/env bash /root/marginwealth/backend/scripts/backup_to_atlas.sh
+# Don't let a stuck dump run forever — a 15-min cadence means a >10-min run
+# is already abnormal; kill it so the next tick gets a clean slate.
+TimeoutStartSec=600
+
+# ── Keep the live platform FAST: the backup must only use SPARE capacity ──
+#  The trading engine (0.5 s risk sweep, order fills, WS fanout) always wins
+#  CPU + disk over the dump, so a backup tick can never add latency to a
+#  stop-loss / take-profit / stop-out. These are best-effort de-prioritisers;
+#  on a small DB the dump finishes in seconds anyway.
+Nice=19
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle

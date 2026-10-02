@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────────────────────────────
+#  Runs marginwealth-backup.service ONCE A DAY at 23:50 IST — i.e. after the
+#  Indian market has closed for the day. Backing up post-close means the
+#  full day's trading (orders/trades/positions/wallets) is captured, and the
+#  ~10-min M0-throttled dump runs when there is zero live trading load, so it
+#  can never touch market-hours performance.
+#
+#  OnCalendar=… Asia/Kolkata → fires at 23:50 India time regardless of the
+#                       server's own timezone (the box runs UTC). Needs
+#                       systemd ≥ 252 for the timezone suffix (Ubuntu 23.04+);
+#                       on older systemd use the UTC equivalent: 18:20:00.
+#  Persistent=true    → if the VPS was OFF at 23:50, run the backup once on
+#                       the next boot so a day is never silently skipped.
+# ─────────────────────────────────────────────────────────────────────
+[Unit]
+Description=Run MarginWealth MongoDB → Atlas backup daily at 23:50 IST (post market close)
+
+[Timer]
+OnCalendar=*-*-* 23:50:00 Asia/Kolkata
+Persistent=true
+RandomizedDelaySec=60
+Unit=marginwealth-backup.service
+
+[Install]
+WantedBy=timers.target

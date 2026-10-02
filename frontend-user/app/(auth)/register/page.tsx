@@ -1,0 +1,359 @@
+"use client";
+
+import { Suspense, useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useBranding } from "@/lib/branding-context";
+import { STORAGE_KEYS } from "@/lib/constants";
+import Link from "next/link";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { toast } from "sonner";
+import { Check, Eye, EyeOff, X, User, Mail, Phone, Lock } from "lucide-react";
+import { AuthAPI, ApiError } from "@/lib/api";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { cn } from "@/lib/utils";
+
+const schema = z.object({
+  full_name: z.string().min(2, "Enter your full name").max(128),
+  email: z.string().email("Invalid email"),
+  mobile: z
+    .string()
+    .regex(/^[6-9]\d{9}$/, "10-digit Indian mobile starting 6/7/8/9"),
+  password: z
+    .string()
+    .min(6, "Minimum 6 characters")
+    .regex(/[A-Z]/, "Must contain an uppercase letter")
+    .regex(/[a-z]/, "Must contain a lowercase letter")
+    .regex(/\d/, "Must contain a digit")
+    .regex(/[^A-Za-z0-9]/, "Must contain a special character (e.g. @, #, $)"),
+});
+type FormValues = z.infer<typeof schema>;
+
+const PWD_RULES = [
+  { id: "len",   label: "At least 6 characters",       test: (s: string) => s.length >= 6 },
+  { id: "upper", label: "One uppercase letter (A–Z)",  test: (s: string) => /[A-Z]/.test(s) },
+  { id: "lower", label: "One lowercase letter (a–z)",  test: (s: string) => /[a-z]/.test(s) },
+  { id: "digit", label: "One number (0–9)",            test: (s: string) => /\d/.test(s) },
+  { id: "spec",  label: "One special character (@, #, $…)", test: (s: string) => /[^A-Za-z0-9]/.test(s) },
+];
+
+type Strength = {
+  score: number;
+  label: string;
+  chipClass: string;
+  barClass: string;
+};
+
+function passwordStrength(pwd: string): Strength {
+  const score = PWD_RULES.reduce((n, r) => n + (r.test(pwd) ? 1 : 0), 0);
+  if (!pwd) {
+    return { score: 0, label: "", chipClass: "", barClass: "bg-muted" };
+  }
+  if (score <= 2) {
+    return {
+      score,
+      label: "Weak",
+      chipClass: "bg-sell/15 text-sell ring-1 ring-sell/30",
+      barClass: "bg-sell",
+    };
+  }
+  if (score <= 4) {
+    return {
+      score,
+      label: "Medium",
+      chipClass: "bg-atm/20 text-atm ring-1 ring-atm/40",
+      barClass: "bg-atm",
+    };
+  }
+  return {
+    score,
+    label: "Strong",
+    chipClass: "bg-buy/15 text-buy ring-1 ring-buy/30",
+    barClass: "bg-buy",
+  };
+}
+
+export default function RegisterPage() {
+  return (
+    <Suspense fallback={null}>
+      <RegisterPageInner />
+    </Suspense>
+  );
+}
+
+function RegisterPageInner() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const urlRef = (searchParams?.get("ref") || "").trim().toUpperCase();
+
+  // Persist the referral code so admin/broker/sub-broker attribution survives
+  // a demo-login → logout → register round-trip (the ?ref= query is dropped
+  // across those hops, and the footer "Sign in" link doesn't carry it). A
+  // fresh ?ref= in the URL always wins and overwrites; otherwise we fall back
+  // to the last captured code. clearTokens() (logout) does NOT touch this key.
+  const [storedRef, setStoredRef] = useState("");
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (urlRef) {
+      window.localStorage.setItem(STORAGE_KEYS.referralCode, urlRef);
+      setStoredRef(urlRef);
+    } else {
+      setStoredRef(
+        (window.localStorage.getItem(STORAGE_KEYS.referralCode) || "")
+          .trim()
+          .toUpperCase(),
+      );
+    }
+  }, [urlRef]);
+  const refCode = urlRef || storedRef;
+
+  // On a tenant custom domain (e.g. stockcafe.live) the URL has no ?ref=,
+  // so fall back to the resolved brand's admin code. Belt-and-suspenders
+  // alongside the backend's Origin/Referer detection — covers the case
+  // where a proxy strips the Origin header.
+  const { branding } = useBranding();
+  const [showPwd, setShowPwd] = useState(false);
+  const [pwdFocused, setPwdFocused] = useState(false);
+
+  const form = useForm<FormValues>({
+    resolver: zodResolver(schema),
+    defaultValues: { full_name: "", email: "", mobile: "", password: "" },
+    mode: "onChange",
+  });
+
+  const pwd = form.watch("password") || "";
+  const strength = passwordStrength(pwd);
+  const showRules = pwdFocused || pwd.length > 0;
+  const [blockedMsg, setBlockedMsg] = useState<string | null>(null);
+
+  async function onSubmit(values: FormValues) {
+    try {
+      await AuthAPI.register({
+        full_name: values.full_name,
+        email: values.email,
+        mobile: values.mobile,
+        password: values.password,
+        referral_code: refCode || branding?.user_code || undefined,
+      });
+      // Consumed — drop the persisted code so a later unrelated signup on
+      // this browser isn't mis-attributed to a stale referrer.
+      try {
+        window.localStorage.removeItem(STORAGE_KEYS.referralCode);
+      } catch {
+        /* ignore */
+      }
+      toast.success("Account created. Please sign in.");
+      router.push(refCode ? `/login?ref=${encodeURIComponent(refCode)}` : "/login");
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : "Registration failed";
+      // Registration turned off for this pool → prominent popup, not a toast.
+      if (/registration is (temporarily )?disabled/i.test(msg)) {
+        setBlockedMsg(msg);
+      } else {
+        toast.error(msg);
+      }
+    }
+  }
+
+  return (
+    <div className="space-y-4 sm:space-y-6">
+      {/* Registration-disabled popup — shown when this pool has signups off. */}
+      {blockedMsg && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={() => setBlockedMsg(null)}>
+          <div className="w-full max-w-sm rounded-2xl bg-card p-6 text-center shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <div className="mx-auto mb-3 grid size-12 place-items-center rounded-full bg-amber-500/15 text-amber-500">
+              <X className="size-6" />
+            </div>
+            <h3 className="text-lg font-semibold">Registration closed</h3>
+            <p className="mt-1.5 text-sm text-muted-foreground">{blockedMsg}</p>
+            <Button className="mt-5 w-full" onClick={() => setBlockedMsg(null)}>OK</Button>
+          </div>
+        </div>
+      )}
+      {/* Header — hidden on mobile (tab bar already says "Register"),
+          visible on desktop where the tab bar is absent. */}
+      <div className="hidden space-y-1.5 lg:block">
+        <h2 className="text-3xl font-bold tracking-tight">Create account</h2>
+        <p className="text-sm text-muted-foreground">
+          Open your trading account in 60 seconds.
+        </p>
+      </div>
+
+      {/* Form */}
+      <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-3.5 sm:space-y-5">
+        {/* Full name */}
+        <div className="space-y-1.5">
+          <Label htmlFor="full_name" className="text-sm font-medium">Full name</Label>
+          <div className="relative">
+            <User className="absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              id="full_name"
+              placeholder="Rohan Sharma"
+              autoComplete="name"
+              className="h-10 rounded-xl border-border/60 bg-muted/40 pl-10 text-sm transition-colors focus:border-primary/50 focus:bg-background sm:h-12"
+              {...form.register("full_name")}
+            />
+          </div>
+          {form.formState.errors.full_name && (
+            <p className="text-xs text-destructive">{form.formState.errors.full_name.message}</p>
+          )}
+        </div>
+
+        {/* Email + Mobile */}
+        <div className="grid grid-cols-2 gap-3 sm:gap-4">
+          <div className="space-y-1.5">
+            <Label htmlFor="email" className="text-sm font-medium">Email</Label>
+            <div className="relative">
+              <Mail className="absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground sm:left-3.5 sm:size-4" />
+              <Input
+                id="email"
+                type="email"
+                placeholder="you@example.com"
+                autoComplete="email"
+                className="h-10 rounded-xl border-border/60 bg-muted/40 pl-9 text-sm transition-colors focus:border-primary/50 focus:bg-background sm:h-12 sm:pl-10"
+                {...form.register("email")}
+              />
+            </div>
+            {form.formState.errors.email && (
+              <p className="text-xs text-destructive">{form.formState.errors.email.message}</p>
+            )}
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="mobile" className="text-sm font-medium">Mobile</Label>
+            <div className="relative">
+              <Phone className="absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground sm:left-3.5 sm:size-4" />
+              <Input
+                id="mobile"
+                inputMode="numeric"
+                maxLength={10}
+                autoComplete="tel"
+                placeholder="9999900000"
+                className="h-10 rounded-xl border-border/60 bg-muted/40 pl-9 text-sm transition-colors focus:border-primary/50 focus:bg-background sm:h-12 sm:pl-10"
+                {...form.register("mobile")}
+              />
+            </div>
+            {form.formState.errors.mobile && (
+              <p className="text-xs text-destructive">{form.formState.errors.mobile.message}</p>
+            )}
+          </div>
+        </div>
+
+        {/* Password */}
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between">
+            <Label htmlFor="password" className="text-sm font-medium">Password</Label>
+            {pwd && (
+              <span
+                className={cn(
+                  "rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider",
+                  strength.chipClass,
+                )}
+              >
+                {strength.label}
+              </span>
+            )}
+          </div>
+
+          <div className="relative">
+            <Lock className="absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              id="password"
+              type={showPwd ? "text" : "password"}
+              placeholder="e.g. Abc@1234"
+              autoComplete="new-password"
+              className="h-10 rounded-xl border-border/60 bg-muted/40 pl-10 pr-12 text-sm transition-colors focus:border-primary/50 focus:bg-background sm:h-12"
+              {...form.register("password", {
+                onBlur: () => setPwdFocused(false),
+              })}
+              onFocus={() => setPwdFocused(true)}
+            />
+            <button
+              type="button"
+              onClick={() => setShowPwd((v) => !v)}
+              aria-label={showPwd ? "Hide password" : "Show password"}
+              aria-pressed={showPwd}
+              tabIndex={-1}
+              className="absolute inset-y-0 right-0 flex items-center px-3.5 text-muted-foreground transition-colors hover:text-foreground"
+            >
+              {showPwd ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+            </button>
+          </div>
+
+          {/* Strength bar */}
+          <div className="flex gap-1.5" aria-hidden>
+            {[0, 1, 2, 3, 4].map((i) => (
+              <div
+                key={i}
+                className={cn(
+                  "h-1 flex-1 rounded-full transition-colors duration-300 sm:h-1.5",
+                  i < strength.score ? strength.barClass : "bg-muted",
+                )}
+              />
+            ))}
+          </div>
+
+          {/* Live rules checklist — always 2-col so it stays compact on mobile */}
+          {showRules && (
+            <ul
+              className="grid grid-cols-2 gap-1.5 rounded-xl border border-border/40 bg-muted/20 p-3 sm:gap-2 sm:p-3.5"
+              aria-live="polite"
+            >
+              {PWD_RULES.map((r) => {
+                const ok = r.test(pwd);
+                return (
+                  <li
+                    key={r.id}
+                    className={cn(
+                      "flex items-center gap-1.5 text-[11px] transition-colors sm:text-xs",
+                      ok ? "text-buy" : "text-muted-foreground",
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        "grid size-3.5 shrink-0 place-items-center rounded-full transition-colors sm:size-4",
+                        ok ? "bg-buy/15" : "bg-muted",
+                      )}
+                    >
+                      {ok ? (
+                        <Check className="size-2 sm:size-2.5" strokeWidth={3} />
+                      ) : (
+                        <X className="size-2 text-muted-foreground sm:size-2.5" strokeWidth={3} />
+                      )}
+                    </span>
+                    <span className="leading-tight">{r.label}</span>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
+          {form.formState.errors.password && !showRules && (
+            <p className="text-xs text-destructive">{form.formState.errors.password.message}</p>
+          )}
+        </div>
+
+        <Button
+          type="submit"
+          className="h-11 w-full"
+          loading={form.formState.isSubmitting}
+        >
+          Create account
+        </Button>
+      </form>
+
+      {/* Footer */}
+      <p className="text-center text-sm text-muted-foreground">
+        Already have an account?{" "}
+        <Link
+          href={refCode ? `/login?ref=${encodeURIComponent(refCode)}` : "/login"}
+          className="font-semibold text-primary hover:text-primary/80"
+        >
+          Sign in
+        </Link>
+      </p>
+    </div>
+  );
+}

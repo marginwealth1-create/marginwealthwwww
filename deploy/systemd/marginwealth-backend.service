@@ -1,0 +1,75 @@
+# ─────────────────────────────────────────────────────────────────────
+#  MarginWealth backend — multi-worker systemd unit (gunicorn + uvicorn)
+#
+#  WHY gunicorn instead of a single `uvicorn` process:
+#    A single asyncio worker serialises EVERY request, WebSocket frame,
+#    order fill and the 250 ms risk sweep on ONE event loop. Under load
+#    the loop saturates → slow /health, laggy ticks, multi-second position
+#    pages, and a full restart drops every connection for the boot window.
+#    Running N gunicorn workers (each its own UvicornWorker event loop)
+#    spreads that work across the box's vCPUs and lets us ROLL workers on
+#    deploy (SIGHUP) with zero socket downtime.
+#
+#  HARD REQUIREMENTS (must match the app's multi-worker design):
+#    • NO --preload. Each worker MUST run its own lifespan so the Redis
+#      leader election (leader:feed for the trading engine; leader:expiry_
+#      cleanup / leader:weekly_settlement / … for the Mongo-only loops)
+#      elects ONE worker per loop. --preload would fork after startup and
+#      break it.
+#    • UvicornWorker already uses uvloop + httptools when installed, so the
+#      old `--loop uvloop` flag is unnecessary.
+#    • The whole STATEFUL TRADING ENGINE is leader-gated under one Redis
+#      lock (`leader:feed`) in app.main: the Zerodha WS pool, Infoway feed,
+#      market-tick fanout, feed:subscribe listener, risk enforcer,
+#      pending-order poller and daily Zerodha auto-login ALL run on the one
+#      leader worker (they share in-process price state). So 4 workers still
+#      open exactly ONE upstream feed connection and run ONE risk loop.
+#      The other workers serve HTTP/WebSocket traffic and read prices from
+#      the leader's `mdlive:{token}` Redis snapshot — that's the scaling win.
+#
+#  ⚠️  PATHS BELOW ASSUME the repo lives at /opt/marginwealth (matches
+#      scripts/deploy.sh). BEFORE applying, confirm your CURRENT unit's
+#      paths with:   systemctl cat marginwealth-backend
+#      and edit WorkingDirectory + the gunicorn path to match your venv.
+# ─────────────────────────────────────────────────────────────────────
+[Unit]
+Description=MarginWealth FastAPI backend (gunicorn/uvicorn, multi-worker)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=marginwealth
+Group=marginwealth
+WorkingDirectory=/opt/marginwealth/backend
+
+# 8 vCPU box → 4 workers leaves headroom for the Next.js PM2 apps + nginx.
+# gunicorn reads WEB_CONCURRENCY automatically when --workers is omitted.
+Environment=WEB_CONCURRENCY=4
+# Load the application secrets/config.
+EnvironmentFile=/opt/marginwealth/backend/.env
+
+ExecStart=/opt/marginwealth/backend/.venv/bin/gunicorn app.main:app \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --bind 127.0.0.1:8000 \
+    --timeout 120 \
+    --graceful-timeout 30 \
+    --keep-alive 65 \
+    --forwarded-allow-ips=* \
+    --access-logfile - \
+    --error-logfile -
+
+# Graceful rolling reload: gunicorn re-imports the app, starts new workers
+# and retires old ones one at a time — the listen socket is never unbound.
+# `scripts/deploy.sh` calls `systemctl reload` for code-only deploys.
+ExecReload=/bin/kill -s HUP $MAINPID
+
+# Restart policy + graceful stop window (matches --graceful-timeout and the
+# 30 s leader-lock TTL so a stopped leader hands off cleanly).
+Restart=always
+RestartSec=3
+TimeoutStopSec=35
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

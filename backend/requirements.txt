@@ -1,0 +1,91 @@
+# Web framework
+fastapi>=0.115.5,<0.117
+uvicorn[standard]>=0.32.1,<0.34
+gunicorn>=23.0.0,<24
+
+# Async / WebSockets
+websockets>=13.1,<15
+httpx>=0.27.2,<0.29
+aiofiles>=24.1.0,<25
+
+# Database (MongoDB)
+motor>=3.6.0,<4
+beanie>=1.27.0,<2
+pymongo>=4.9.2,<5
+
+# Cache / Pub-Sub
+redis[hiredis]>=5.2.0,<6
+
+# Validation / Serialization
+pydantic>=2.10.0,<3
+pydantic-settings>=2.7.0,<3
+email-validator>=2.2.0,<3
+
+# Auth / Security
+python-jose[cryptography]>=3.3.0,<4
+passlib[bcrypt]>=1.7.4,<2
+bcrypt>=4.2.0,<5
+pyotp>=2.9.0,<3
+python-multipart>=0.0.18
+
+# Web Push (VAPID) — deposit/withdrawal/wallet tray notifications that
+# reach the operator even when the PWA has been force-stopped (Android
+# battery saver) or the phone is locked. Uses the standard webpush
+# protocol against the browser vendor's push service (FCM / Mozilla
+# autopush / Apple APNs).
+pywebpush>=2.0.0,<3
+
+# Background workers
+celery>=5.4.0,<6
+apscheduler>=3.10.4,<4
+flower>=2.0.1,<3
+
+# Logging / Observability
+structlog>=24.4.0
+python-json-logger>=2.0.7,<4
+sentry-sdk[fastapi]>=2.18.0,<3
+prometheus-fastapi-instrumentator>=7.0.0,<8
+
+# Reporting
+reportlab>=4.2.5
+openpyxl>=3.1.5
+pandas>=2.3.0
+
+# AWS (S3 backups)
+boto3==1.35.71
+
+# Zerodha Kite Connect SDK (REST + WebSocket ticker)
+kiteconnect>=5.2.0
+
+# Headless browser for Zerodha auto-login (drives Kite OAuth + TOTP screen
+# daily so admin doesn't have to manually login every morning).
+# After installing this package run `playwright install chromium` once on
+# every host running the backend to download the actual browser binary.
+playwright>=1.45.0,<2
+# 2.x replaced the 1.x `stealth_async` function with a `Stealth` class; the
+# auto-login code supports BOTH APIs but pin to 2.x (matches prod = 2.0.3) so
+# `stealth` is actually applied — without it Kite CAPTCHAs the headless login
+# and the daily auto-login dies at totp_submit.
+playwright-stealth>=2.0.3,<3
+
+# MetaAPI (MetaTrader 4/5) cloud SDK — optional forex/metals/indices/commodities
+# feed (opt-in via METAAPI_FEED). Lazily imported in metaapi_service so the
+# backend still boots if it's not installed and the feed is off.
+metaapi-cloud-sdk>=27.0.0
+
+# Utilities
+python-dotenv>=1.0.1
+orjson>=3.10.11
+tenacity>=9.0.0,<10
+ulid-py>=1.1.0,<2
+
+# Dev / Test
+pytest>=8.3.3,<9
+pytest-asyncio>=0.24.0,<2
+pytest-cov>=6.0.0,<7
+mongomock-motor>=0.0.34
+fakeredis>=2.26.1,<3
+ruff>=0.7.4
+black>=24.10.0
+mypy>=1.13.0
+pre-commit>=4.0.1,<5
