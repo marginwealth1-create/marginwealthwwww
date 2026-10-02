@@ -22,7 +22,7 @@
 set -euo pipefail
 
 DOMAIN="${1:-}"
-EMAIL="${2:-ops@marginwealth.com}"
+EMAIL="${2:-ops@marginwealth.live}"
 
 if [[ -z "$DOMAIN" ]]; then
   echo "ERROR: domain argument required" >&2

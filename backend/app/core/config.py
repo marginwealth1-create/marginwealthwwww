@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     # Settings). Empty = not configured, and the UI simply hides the email
     # option rather than showing a dead address — which is why this has no
     # invented default. Previously the seed hard-coded a stale
-    # `support@marginwealth.com` straight into the DB.
+    # `support@marginwealth.live` straight into the DB.
     SUPPORT_EMAIL: str = ""
     APP_ENV: Literal["development", "staging", "production"] = "development"
     APP_DEBUG: bool = False
@@ -187,7 +187,7 @@ class Settings(BaseSettings):
 
     # ── Public backend URL (used by OAuth callback URLs etc.) ────────
     # Override in production to your actual API hostname, e.g.
-    # https://api.marginwealth.com — Kite redirects the user's browser here.
+    # https://api.marginwealth.live — Kite redirects the user's browser here.
     BACKEND_PUBLIC_URL: str = "http://localhost:8000"
 
     # ── Rate limit ───────────────────────────────────────────────────
@@ -270,7 +270,7 @@ class Settings(BaseSettings):
     SMTP_PORT: int = 587
     SMTP_USER: str = ""
     SMTP_PASSWORD: SecretStr = Field(default=SecretStr(""))
-    SMTP_FROM: str = "no-reply@marginwealth.com"
+    SMTP_FROM: str = "no-reply@marginwealth.live"
     SMTP_TLS: bool = True
     SMS_PROVIDER: Literal["mock", "twilio", "msg91"] = "mock"
     SMS_API_KEY: SecretStr = Field(default=SecretStr(""))
@@ -304,10 +304,10 @@ class Settings(BaseSettings):
     # leave blank in dev — push send is a no-op until both are set.
     VAPID_PUBLIC_KEY: str = ""
     VAPID_PRIVATE_KEY: SecretStr = Field(default=SecretStr(""))
-    VAPID_SUBJECT: str = "mailto:admin@marginwealth.com"
+    VAPID_SUBJECT: str = "mailto:admin@marginwealth.live"
 
     # ── Seed ─────────────────────────────────────────────────────────
-    SEED_SUPER_ADMIN_EMAIL: str = "admin@marginwealth.com"
+    SEED_SUPER_ADMIN_EMAIL: str = "admin@marginwealth.live"
     SEED_SUPER_ADMIN_PASSWORD: SecretStr = Field(default=SecretStr("Admin@123"))
     SEED_SUPER_ADMIN_MOBILE: str = "9999999999"
     RUN_SEED_ON_STARTUP: bool = True

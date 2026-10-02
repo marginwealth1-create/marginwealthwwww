@@ -54,7 +54,7 @@ async def by_code(user_code: str):
 async def platform():
     """Resolve the PLATFORM-DEFAULT branding — i.e. the super admin's
     logo + brand_name + favicon.  Used by the user app when the
-    visitor is on the platform host (marginwealth.com, no tenant
+    visitor is on the platform host (marginwealth.live, no tenant
     referral) so the auth screens still render the super admin's
     branding instead of falling back to the generic glyph.
     """

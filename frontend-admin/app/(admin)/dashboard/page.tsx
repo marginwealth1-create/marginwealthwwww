@@ -91,7 +91,7 @@ export default function AdminDashboardPage() {
     admin?.custom_domain && admin.custom_domain_status === "READY"
       ? `https://${admin.custom_domain}`
       : process.env.NEXT_PUBLIC_USER_APP_URL?.replace(/\/$/, "") ??
-        "https://app.marginwealth.com";
+        "https://app.marginwealth.live";
   const referralLink = admin?.user_code
     ? `${appUrl}/register?ref=${admin.user_code}`
     : null;

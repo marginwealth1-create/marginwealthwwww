@@ -4,7 +4,7 @@ import { NextRequest } from "next/server";
  * Same-origin icon proxy for PWA manifest.
  *
  * Chrome Android prioritises same-origin icons over cross-origin ones.
- * Admin logos live on api.marginwealth.com (cross-origin), so Chrome
+ * Admin logos live on api.marginwealth.live (cross-origin), so Chrome
  * always picked the platform default /icons/icon-192.png instead.
  *
  * This route proxies the admin logo through the Next.js server so the

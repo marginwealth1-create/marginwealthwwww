@@ -99,7 +99,7 @@ function buildBrandedManifest(b: ResolvedBrand): Record<string, unknown> {
   const shortName = (b.brand_name?.trim() || PLATFORM_DEFAULT.short_name).slice(0, 12);
   const logo = b.logo_url ? `${API_BASE}${b.logo_url}` : null;
   // Same-origin proxy so Chrome Android accepts the launcher icon — it
-  // ignores cross-origin icons on api.marginwealth.com and falls back to the
+  // ignores cross-origin icons on api.marginwealth.live and falls back to the
   // platform leaf. `id` keeps each tenant's PWA distinct so installing
   // admin-A doesn't overwrite admin-B on the same origin.
   const proxyIcon = `/api/brand-icon?u=${encodeURIComponent(code)}`;

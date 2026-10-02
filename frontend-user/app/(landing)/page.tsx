@@ -423,8 +423,8 @@ function Faq() {
           <h2 className="text-slate-900 mt-3 font-display text-4xl font-bold tracking-tight">Questions, answered.</h2>
           <p className="mt-4 text-slate-600">
             Can&apos;t find what you need? Write to{" "}
-            <a href="mailto:support@marginwealth.com" className="font-semibold text-brand-600 hover:text-brand-700">
-              support@marginwealth.com
+            <a href="mailto:support@marginwealth.live" className="font-semibold text-brand-600 hover:text-brand-700">
+              support@marginwealth.live
             </a>
             .
           </p>

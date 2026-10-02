@@ -28,7 +28,7 @@ logger = logging.getLogger("create_test_user")
 
 
 # ── Test user spec ───────────────────────────────────────────────────────
-TEST_EMAIL = "test@marginwealth.com"
+TEST_EMAIL = "test@marginwealth.live"
 TEST_MOBILE = "9000000001"
 TEST_PASSWORD = "Test@MarginWealth2026!"
 TEST_FULL_NAME = "Test Trader"

@@ -114,7 +114,7 @@ export default function UserDetailPage() {
   // A placeholder contact is an absence, not a value — the header and the
   // form below both render it as one.
   const isPlaceholder = (v: string | undefined | null) =>
-    !!v && (v.endsWith("@noemail.marginwealth.com") || v.startsWith("NOMOB"));
+    !!v && (v.endsWith("@noemail.marginwealth.live") || v.startsWith("NOMOB"));
   const [contact, setContact] = useState({ full_name: "", email: "", mobile: "" });
   const [contactDirty, setContactDirty] = useState(false);
   useEffect(() => {

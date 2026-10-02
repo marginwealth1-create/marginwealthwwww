@@ -4,7 +4,7 @@ export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000
 /** WebSocket origin for the live tick feed (`/ws/marketdata`) and the
  *  user event bridge (`/ws/user`). We derive it from `API_URL` when
  *  `NEXT_PUBLIC_WS_URL` isn't set — this is the single most common
- *  production-only bug: ops sets `NEXT_PUBLIC_API_URL=https://api.marginwealth.com`
+ *  production-only bug: ops sets `NEXT_PUBLIC_API_URL=https://api.marginwealth.live`
  *  but forgets `NEXT_PUBLIC_WS_URL`, and the build embeds the hardcoded
  *  `ws://localhost:8000` fallback. The browser then tries to open a WS to
  *  the user's own machine from a public origin and the connection fails
@@ -14,7 +14,7 @@ export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000
  *
  *  Auto-derivation: `http://` → `ws://`, `https://` → `wss://`. An
  *  explicit `NEXT_PUBLIC_WS_URL` always wins so a split API/WS host (e.g.
- *  separate `ws.marginwealth.com` later) still works without changing this file. */
+ *  separate `ws.marginwealth.live` later) still works without changing this file. */
 function _deriveWsFromApi(api: string): string {
   if (api.startsWith("https://")) return "wss://" + api.slice("https://".length);
   if (api.startsWith("http://")) return "ws://" + api.slice("http://".length);

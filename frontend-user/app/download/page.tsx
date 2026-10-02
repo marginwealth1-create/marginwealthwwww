@@ -41,7 +41,7 @@ async function fetchBranding(path: string): Promise<Branding | null> {
 function isPlatformHost(host: string): boolean {
   const h = host.toLowerCase().split(":")[0];
   return (
-    /(^|\.)marginwealth\.com$/.test(h) ||
+    /(^|\.)marginwealth\.live$/.test(h) ||
     h === "localhost" ||
     h === "127.0.0.1" ||
     /\.(vercel|netlify|fly)\.(app|dev)$/.test(h)

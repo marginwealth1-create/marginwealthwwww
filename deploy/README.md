@@ -20,7 +20,7 @@ GitHub Action over SSH but can also be run by hand on the EC2.
 |--------|-------|
 | `EC2_HOST` | `<your-elastic-ip>` |
 | `EC2_USER` | `marginwealth` |
-| `EC2_SSH_KEY` | paste the full contents of `marginwealth.com.pem` (the PRIVATE key, including the `-----BEGIN OPENSSH PRIVATE KEY-----` and `-----END OPENSSH PRIVATE KEY-----` lines) |
+| `EC2_SSH_KEY` | paste the full contents of `marginwealth.live.pem` (the PRIVATE key, including the `-----BEGIN OPENSSH PRIVATE KEY-----` and `-----END OPENSSH PRIVATE KEY-----` lines) |
 | `EC2_PORT` | `22` (optional — defaults to 22) |
 
 > Use a deploy-only SSH key in production. The current key gives full sudo
@@ -41,6 +41,8 @@ Paste:
 
 ```
 marginwealth ALL=(root) NOPASSWD: /usr/bin/systemctl restart marginwealth-backend
+marginwealth ALL=(root) NOPASSWD: /usr/bin/systemctl reload marginwealth-backend
+marginwealth ALL=(root) NOPASSWD: /usr/bin/journalctl -u marginwealth-backend *
 marginwealth ALL=(root) NOPASSWD: /usr/bin/systemctl reload nginx
 marginwealth ALL=(root) NOPASSWD: /usr/sbin/nginx -t
 marginwealth ALL=(root) NOPASSWD: /usr/bin/cp * /etc/nginx/sites-available/marginwealth
@@ -56,7 +58,7 @@ If you haven't already:
 ```bash
 sudo mkdir -p /opt/marginwealth
 sudo chown ubuntu:ubuntu /opt/marginwealth
-git clone https://github.com/shivammacoss/marginwealth_ind.git /opt/marginwealth
+git clone https://github.com/marginwealth1-create/marginwealthwwww.git /opt/marginwealth
 chmod +x /opt/marginwealth/scripts/deploy.sh
 ```
 
@@ -71,10 +73,33 @@ Push to `main` (any commit, even a README touch). Watch
 3. Healthchecks pass (backend returns 401 on auth-required endpoint,
    user/admin domains return 200/307)
 
+## Live server (marginwealth.live)
+
+Host `srv2020148` / `201.18.211.172`, Ubuntu 26.04. Repo at `/opt/marginwealth`,
+owned by the `marginwealth` user (who runs `deploy.sh`). Services:
+
+| Piece | How it runs |
+|-------|-------------|
+| MongoDB 8.2 | Docker container `mongo` (host network, `127.0.0.1:27017`, auth + replica set `rs0`). 8.0.x refuses to start on Linux ≥ 6.19. |
+| Redis | `redis-server` (apt), localhost only |
+| Backend | systemd `marginwealth-backend` (gunicorn, `127.0.0.1:8000`), venv from `uv` (Python 3.12) |
+| Frontends | PM2 `marginwealth-user` (:3000) / `marginwealth-admin` (:3001) under the `marginwealth` user, bound to 127.0.0.1 |
+| TLS | Let's Encrypt via certbot webroot `/var/www/certbot`, symlinked to `/etc/ssl/marginwealth/origin.{crt,key}` |
+
+Secrets live only on the server: `backend/.env`, `frontend-*/.env.local`, and
+`/root/marginwealth-secrets.env` (Mongo passwords, admin login).
+
+Day-to-day deploy after pushing to `main`:
+
+```bash
+ssh root@201.18.211.172
+sudo -iu marginwealth bash /opt/marginwealth/scripts/deploy.sh
+```
+
 ## Manual deploy (no GitHub)
 
 ```bash
-ssh -i marginwealth.com.pem ubuntu@<your-elastic-ip>
+ssh -i marginwealth.live.pem ubuntu@<your-elastic-ip>
 cd /opt/marginwealth
 bash scripts/deploy.sh
 ```

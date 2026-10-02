@@ -28,11 +28,11 @@ export default function DownloadAppPage() {
 
   // Client-facing origin — the END-USER app, not the admin host. Same
   // resolution the Branding page uses: env override → strip "admin." →
-  // fallback to marginwealth.com.
+  // fallback to marginwealth.live.
   const platformOrigin = useMemo(() => {
     const fromEnv = (process.env.NEXT_PUBLIC_USER_APP_URL || "").trim();
     if (fromEnv) return fromEnv.replace(/\/+$/, "").replace(/^http:/, "https:");
-    if (typeof window === "undefined") return "https://marginwealth.com";
+    if (typeof window === "undefined") return "https://marginwealth.live";
     const url = new URL(window.location.origin);
     url.protocol = "https:";
     if (url.hostname.startsWith("admin.")) {

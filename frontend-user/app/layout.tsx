@@ -43,8 +43,8 @@ const plexMono = IBM_Plex_Mono({
 
 // Hosts that are the platform itself (not a tenant's branded domain).
 const PLATFORM_METADATA_HOSTS = new Set([
-  "marginwealth.com",
-  "www.marginwealth.com",
+  "marginwealth.live",
+  "www.marginwealth.live",
   "localhost",
   "127.0.0.1",
 ]);

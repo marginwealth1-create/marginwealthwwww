@@ -256,7 +256,7 @@ async def create_oxapay_deposit(payload: DepositCreate, user: CurrentUser):
 
     base = (_settings.BACKEND_PUBLIC_URL or "http://localhost:8000").rstrip("/")
     callback_url = f"{base}/api/v1/webhooks/oxapay/{owner_code}"
-    dom = owner.custom_domain if (owner and owner.custom_domain) else "marginwealth.com"
+    dom = owner.custom_domain if (owner and owner.custom_domain) else "marginwealth.live"
     return_url = f"https://{dom}/wallet"
     try:
         inv = await oxapay_service.create_invoice(

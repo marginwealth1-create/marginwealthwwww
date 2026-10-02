@@ -97,16 +97,16 @@ export default function PrivacyPage() {
               <span>
                 Email:{" "}
                 <a
-                  href="mailto:privacy@marginwealth.com"
+                  href="mailto:privacy@marginwealth.live"
                   className="font-medium text-mp-accent hover:underline"
                 >
-                  privacy@marginwealth.com
+                  privacy@marginwealth.live
                 </a>
               </span>
               <span className="text-mp-text-mut">
                 Support:{" "}
                 <a href="/contact" className="text-mp-accent hover:underline">
-                  marginwealth.com/contact
+                  marginwealth.live/contact
                 </a>
               </span>
             </div>

@@ -203,7 +203,7 @@ export function useMarketStream(tokens: string[]): Map<string, MarketQuote> {
       // Production-debugging breadcrumb: log the resolved WS origin once per
       // connect attempt. If the panel shows "—" everywhere in prod, this is
       // the first thing to check in DevTools console — if it prints
-      // `ws://localhost:8000` from marginwealth.com, NEXT_PUBLIC_WS_URL wasn't set
+      // `ws://localhost:8000` from marginwealth.live, NEXT_PUBLIC_WS_URL wasn't set
       // at build time (or the build wasn't redeployed after fixing the env).
       // eslint-disable-next-line no-console
       console.info("[market-ws] connecting", url);

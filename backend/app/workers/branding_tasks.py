@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 CERTBOT_TIMEOUT_SEC: Final[int] = 180
-CERTBOT_EMAIL_DEFAULT: Final[str] = "ops@marginwealth.com"
+CERTBOT_EMAIL_DEFAULT: Final[str] = "ops@marginwealth.live"
 PROVISION_SCRIPT: Final[str] = "/usr/local/bin/marginwealth-add-branded-domain"
 
 

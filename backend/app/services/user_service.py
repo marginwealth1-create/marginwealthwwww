@@ -24,7 +24,7 @@ from app.utils.validators import is_valid_mobile_in, normalize_mobile_in
 
 
 # Stand-ins for a missing email / phone on an admin-created account.
-NO_EMAIL_DOMAIN = "noemail.marginwealth.com"
+NO_EMAIL_DOMAIN = "noemail.marginwealth.live"
 NO_MOBILE_PREFIX = "NOMOB"
 
 

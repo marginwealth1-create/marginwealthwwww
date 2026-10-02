@@ -110,8 +110,8 @@ export function SiteFooter() {
             <p className="mt-4 max-w-xs text-sm leading-relaxed text-slate-500">
               One account for Indian and global markets — equity, F&amp;O, commodities, forex, crypto and US stocks.
             </p>
-            <a href="mailto:support@marginwealth.com" className="mt-4 inline-block text-sm font-semibold text-brand-600 hover:text-brand-700">
-              support@marginwealth.com
+            <a href="mailto:support@marginwealth.live" className="mt-4 inline-block text-sm font-semibold text-brand-600 hover:text-brand-700">
+              support@marginwealth.live
             </a>
           </div>
           {FOOTER_COLS.map((col) => (

@@ -51,7 +51,7 @@ def _signup_host(request: Request) -> str:
     attribution.
 
     The browser sits on the tenant's custom domain (e.g. ``stockcafe.live``)
-    but the API lives on a shared host (``api.marginwealth.com``), so the
+    but the API lives on a shared host (``api.marginwealth.live``), so the
     request's ``Host`` header is the API host — NOT the tenant. The
     cross-origin fetch DOES carry ``Origin`` (and ``Referer``) = the tenant
     domain (the same signal the branding CORS middleware keys off), so we

@@ -1381,7 +1381,7 @@ _uploads_dir.mkdir(parents=True, exist_ok=True)
 
 
 # CORS for static files: custom-domain PWA installs fetch logo from
-# api.marginwealth.com → stockcafe.live origin. Without ACAO header
+# api.marginwealth.live → stockcafe.live origin. Without ACAO header
 # Chrome blocks the image and PWA gets the default platform icon.
 @app.middleware("http")
 async def uploads_cors_middleware(request: Request, call_next):

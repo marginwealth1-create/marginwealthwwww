@@ -112,10 +112,10 @@ sudo certbot certificates       # lists current certs and expiry
 Pick one admin (preferably an internal test account, not a real
 revenue-generating sub-admin) and walk through the full flow:
 
-1. Admin logs into `https://marginwealth.com/admin`.
+1. Admin logs into `https://marginwealth.live/admin`.
 2. Navigates to `Settings → Branding`.
 3. Uploads a logo, types brand name, hits Save.
-4. Opens `https://marginwealth.com/register?ref=<their user_code>` in
+4. Opens `https://marginwealth.live/register?ref=<their user_code>` in
    incognito. Should see admin's logo + brand name, registers a fake
    user. Verify in Mongo: `db.users.findOne({email: "fake@..."})` →
    `assigned_admin_id` matches admin, `signup_origin: "BRANDED_REFERRAL"`.
@@ -130,7 +130,7 @@ revenue-generating sub-admin) and walk through the full flow:
 9. Login with the fake user from step 4 → after login, browser should
    auto-redirect to `https://branding-test.<your-tld>/dashboard`
    (signup_origin gate fires).
-10. Existing 10k users (sample 5) — login on `marginwealth.com/login`
+10. Existing 10k users (sample 5) — login on `marginwealth.live/login`
     works as before, no redirect, dashboard loads.
 
 If step 10 ever fails for any existing user → set

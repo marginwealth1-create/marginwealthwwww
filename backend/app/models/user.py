@@ -431,7 +431,7 @@ class User(TimestampMixin):
     # How this user originally signed up — drives the post-login
     # cross-origin redirect gate. `None` ≡ "PLATFORM" (the default for
     # every existing legacy user, hence no backfill).
-    #   PLATFORM         : signed up at marginwealth.com/register (or pre-rollout)
+    #   PLATFORM         : signed up at marginwealth.live/register (or pre-rollout)
     #   BRANDED_REFERRAL : signed up via /r/<admin_user_code>/signup or ?ref=
     #   CUSTOM_DOMAIN    : signed up directly on admin's custom_domain host
     signup_origin: str | None = None

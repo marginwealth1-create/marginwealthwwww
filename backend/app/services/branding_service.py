@@ -180,7 +180,7 @@ async def find_platform_super_admin() -> User | None:
     render their branding (logo + brand_name + favicon) when the
     visitor isn't on a specific tenant's domain or referral link.
 
-    Without this, the platform host (marginwealth.com) had no
+    Without this, the platform host (marginwealth.live) had no
     branding source at all — BrandingProvider stayed null and the
     auth screens fell back to the hard-coded MarginWealth glyph.
     Picking the OLDEST active SUPER_ADMIN matches the bootstrap
