@@ -1580,12 +1580,45 @@ async def list_holdings(user_id: str | PydanticObjectId) -> list[Holding]:
 
 
 # ── Intraday → carryforward auto-rollover ───────────────────────────
+def plan_carry_cuts(
+    items: list[tuple[Any, Decimal, Decimal, Decimal, Decimal, Decimal]],
+    need: Decimal,
+    capacity: Decimal,
+) -> dict[Any, Decimal]:
+    """Units to square off so the rest of a user's book can carry overnight.
+
+    `items` = (key, open_qty, lot_size, delta, locked_margin, pnl), worst
+    P&L first. `need` is the extra overnight margin of the whole book,
+    `capacity` the free funds. Cutting part of a position drops its share of
+    `need` AND hands its locked margin ± P&L back to `capacity`, so a user
+    keeps exactly what the funds cover (operator: "jitna fund utna hold")
+    instead of losing the whole position. Whole lots only (a share for
+    equity); a position that frees nothing by being cut is closed in full.
+    """
+    import math
+
+    cuts: dict[Any, Decimal] = {}
+    for key, qty, lot, delta, old, pnl in items:
+        if need <= capacity:
+            break
+        lots = qty / lot
+        if lots <= 0:
+            continue
+        gain_per_lot = (max(delta, Decimal(0)) + old + pnl) / lots
+        k = Decimal(math.ceil((need - capacity) / gain_per_lot)) if gain_per_lot > 0 else lots
+        share = min(k, lots) / lots
+        cuts[key] = qty if k >= lots else k * lot
+        need -= max(delta, Decimal(0)) * share
+        capacity += (old + pnl) * share
+    return cuts
+
+
 async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> dict[str, int]:
     """At market close for a segment group, flip every open MIS position in
     that group to NRML. For each position we re-resolve the NRML margin
     against the user's effective segment settings; if the wallet can't
-    afford the overnight delta, the position is force-squareoff'd before
-    the type flip (so we never leave it in NRML while under-margined).
+    afford the overnight delta, just enough quantity is squared off before
+    the type flip that the rest is covered (never NRML while under-margined).
 
     Also sweeps already-open NRML positions in the group: any whose wallet
     can't cover the (correctly-resolved) carry margin is force-closed too.
@@ -1640,6 +1673,7 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
 
     converted = 0
     force_closed = 0
+    trimmed = 0  # partly squared off, the rest carried
     skipped = 0
     # Users whose positions were flipped MIS→NRML in-place below. After the
     # loop we consolidate each one's OPEN book so a freshly-converted NRML
@@ -1849,22 +1883,23 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
     # For each user, compare the TOTAL additional margin needed to back the
     # overnight (CF) carry of their whole open book against what the wallet can
     # cover (available + credit). If it fits, everything carries. If not, square
-    # off the worst-loss positions FIRST — one at a time, subtracting each
-    # freed requirement — until the remainder fits, then carry the survivors.
+    # off only the QUANTITY the funds can't carry, worst P&L first (see
+    # plan_carry_cuts) — the rest of each position carries.
     # USED is NEVER re-locked to the overnight amount: the MIS→NRML flip is
     # margin-neutral (the intraday 700× lock stays put), CF is purely a gate.
     from app.models._base import OrderAction as _OA, OrderType as _OT
     from app.models.user import User as _User
 
-    async def _force_close_carry(pos) -> bool:
-        """Flatten `pos` at market (opposite-side `is_squareoff` MARKET order)
-        and stamp close_reason=CARRY_FORWARD_FAIL. Returns True on success.
-        Mirrors the risk_enforcer squareoff primitive — hold-time guards
-        bypassed, moves EXACTLY the open qty."""
+    async def _force_close_carry(pos, qty_close=None) -> bool:
+        """Square off `qty_close` units of `pos` (default: all of it) at market
+        (opposite-side `is_squareoff` MARKET order) and stamp
+        close_reason=CARRY_FORWARD_FAIL if that flattened it. Returns True on
+        success. Mirrors the risk_enforcer squareoff primitive — hold-time
+        guards bypassed."""
         user_doc = await _User.get(pos.user_id)
         if user_doc is None:
             return False
-        qty_open = abs(pos.quantity)
+        qty_open = abs(pos.quantity) if qty_close is None else float(qty_close)
         lots_open = max(0.01, qty_open / max(1, pos.instrument.lot_size or 1))
         action = _OA.SELL if pos.quantity > 0 else _OA.BUY
         await order_service.place_order(
@@ -1904,32 +1939,53 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
         # their whole book (only genuine shortfalls — delta > 0 — count).
         need = sum((it[3] for it in items if it[3] > 0), to_decimal(0))
 
-        # Which positions to square off: worst unrealized loss first, freeing
-        # each one's delta, until the remaining need fits capacity. Partial —
-        # the survivors carry. `unrealized_pnl` is kept fresh by the
-        # risk_enforcer loop; None → treated as 0.
-        to_close_ids: set = set()
+        # Short of funds → cut only the quantity the funds can't carry, worst
+        # P&L first (plan_carry_cuts); the rest of each position carries.
+        cuts: dict = {}
         if need > capacity:
-            ranked = sorted(items, key=lambda it: to_decimal(it[0].unrealized_pnl or 0))
-            for it in ranked:
-                if need <= capacity:
-                    break
-                pos_i, _nm, _om, delta_i = it
-                to_close_ids.add(pos_i.id)
-                if delta_i > 0:
-                    need -= delta_i
+            from app.services.market_data_service import get_ltp
+
+            plan = []
+            for pos_i, _nm, old_i, delta_i in items:
+                try:
+                    ltp = to_decimal(await get_ltp(pos_i.instrument.token) or 0)
+                except Exception:  # noqa: BLE001
+                    ltp = to_decimal(0)
+                pnl = (
+                    (ltp - to_decimal(pos_i.avg_price)) * to_decimal(pos_i.quantity)
+                    if ltp > 0
+                    else to_decimal(pos_i.unrealized_pnl or 0)
+                )
+                plan.append((
+                    pos_i.id,
+                    to_decimal(abs(pos_i.quantity)),
+                    to_decimal(max(1, int(pos_i.instrument.lot_size or 1))),
+                    delta_i,
+                    old_i,
+                    pnl,
+                ))
+            plan.sort(key=lambda it: it[5])
+            cuts = plan_carry_cuts(plan, need, capacity)
 
         for pos_i, new_margin, old_margin, delta in items:
-            # ── Flagged under-funded → force-close ──
-            if pos_i.id in to_close_ids:
+            # ── Under-funded → square off the part the funds can't carry ──
+            cut = cuts.get(pos_i.id)
+            if cut is not None:
                 try:
-                    if await _force_close_carry(pos_i):
-                        force_closed += 1
-                    else:
-                        skipped += 1
+                    ok = await _force_close_carry(pos_i, cut)
                 except Exception:  # noqa: BLE001
+                    ok = False
+                if not ok:
                     skipped += 1
-                continue
+                    continue
+                if cut >= to_decimal(abs(pos_i.quantity)):
+                    force_closed += 1
+                    continue
+                trimmed += 1
+                # The partial close changed qty/margin — never save the stale doc.
+                pos_i = await Position.get(pos_i.id)
+                if pos_i is None or pos_i.status != PositionStatus.OPEN:
+                    continue
 
             # ── Survivor already NRML → carries as-is (no re-lock) ──
             if pos_i.product_type != _PT.MIS:
@@ -2013,7 +2069,12 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
         except Exception:  # noqa: BLE001
             logger.exception("intraday_to_carry_consolidate_failed user=%s", _uid)
 
-    return {"converted": converted, "force_closed": force_closed, "skipped": skipped}
+    return {
+        "converted": converted,
+        "force_closed": force_closed,
+        "trimmed": trimmed,
+        "skipped": skipped,
+    }
 
 
 # Module-level kill switch + state — same pattern as risk_enforcer_loop.
