@@ -258,14 +258,20 @@ async def list_users(
     # never subtracted) and (b) sticky after a delete — deleting a closed
     # trade posts a REVERSAL row (not a PNL row), so the deleted trade's P&L
     # lingered here forever. Include CHARGES (brokerage), REVERSAL
-    # (delete/reopen/edit undo), and the stop-out settlement legs so a delete
-    # of any close nets its whole footprint back to zero. Operator: "trade
-    # delete karne par pnl and brokerage dono weekly se hat jaye."
+    # (delete/reopen/edit undo) so a delete of any close nets its whole
+    # footprint back to zero. Operator: "trade delete karne par pnl and
+    # brokerage dono weekly se hat jaye."
+    #
+    # Only rows that MOVE the wallet count, so Balance = funds ± Weekly P&L.
+    # SETTLEMENT_OUTSTANDING_BOOKED never moves it (balance 0 → 0; the
+    # shortfall is owed, shown as "Settlement due"); it's counted when it is
+    # actually paid — the RECOVERY row debits the wallet. Counting both also
+    # double-charged a shortfall recovered the same week (29-Oct HPY86W:
+    # card −3,925.17 vs wallet −3,593.00).
     _WK_TYPES = [
         TransactionType.PNL.value,
         TransactionType.CHARGES.value,
         TransactionType.REVERSAL.value,
-        TransactionType.SETTLEMENT_OUTSTANDING_BOOKED.value,
         TransactionType.SETTLEMENT_OUTSTANDING_RECOVERY.value,
     ]
     try:

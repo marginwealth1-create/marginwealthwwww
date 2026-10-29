@@ -537,6 +537,7 @@ function UserMobileCard({
   onStats: () => void;
 }) {
   const weeklyPnl = Number(r.wallet?.weekly_closed_pnl ?? 0);
+  const settlementDue = Number(r.wallet?.settlement_outstanding ?? 0);
 
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-gradient-to-br from-card to-card/60 p-3 shadow-sm transition-shadow hover:shadow-md">
@@ -600,6 +601,20 @@ function UserMobileCard({
           <span className="font-semibold tabular-nums">
             {weeklyPnl > 0 ? "+" : "−"}₹
             {Math.abs(weeklyPnl).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </span>
+        </div>
+      )}
+
+      {/* Owed but not yet taken from the wallet — recovered from the next
+          deposit, so it's outside Balance and Weekly P&L until then. */}
+      {settlementDue > 0 && (
+        <div
+          className="mt-1.5 flex items-center justify-between rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-600 dark:text-amber-400"
+          title="Charges the wallet couldn't cover at the time — taken from the next deposit"
+        >
+          <span>Settlement due (next deposit)</span>
+          <span className="font-semibold tabular-nums">
+            ₹{settlementDue.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </span>
         </div>
       )}
