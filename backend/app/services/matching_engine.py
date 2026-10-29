@@ -858,6 +858,9 @@ async def trigger_pending_orders() -> int:
         logger.exception("pending_order_scan_failed")
         return 0
 
+    # Keep parked-order tokens live in `_state` even when nobody has the chart
+    # open — otherwise get_ltp_instant below reads a frozen price.
+    market_data_service.hold_tokens("pending_orders", {o.instrument.token for o in rows})
     if not rows:
         return 0
 

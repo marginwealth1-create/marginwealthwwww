@@ -9,13 +9,14 @@ backfilled with 00:00 rather than left empty.
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
 
 import pytest
 
 from app.services.eod_order_cleanup import (
     apply_cutoff_override,
     cutoff_reached,
+    order_expired,
     parse_cutoff,
 )
 
@@ -39,9 +40,9 @@ def test_cutoff_parsing(raw, expected):
     assert parse_cutoff(raw) == expected
 
 
-def test_blank_means_the_segment_is_never_swept():
-    # Forex and crypto relied on this before the setting existed; a blank must
-    # not start cancelling their overnight orders.
+def test_blank_never_clears_brackets():
+    # cutoff_reached now only drives the opt-in SL/TP clearing; a blank row's
+    # ORDERS still expire at the market close (see default_cutoff below).
     assert cutoff_reached(parse_cutoff(""), AFTERNOON, None) is False
 
 
@@ -90,3 +91,65 @@ def test_override_on_a_segment_with_no_seed_time():
     out: dict[str, time] = {}
     apply_cutoff_override(out, "CRYPTO", "21:00")
     assert out == {"CRYPTO": time(21, 0)}
+
+
+# ── Parked orders expire at their market's close ─────────────────────────
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _ist(day, hh, mm):  # Oct 2026: 29 Thu, 30 Fri, 31 Sat, 2 Nov Mon
+    return datetime(2026, 10 if day > 2 else 11, day, hh, mm, tzinfo=IST)
+
+
+def test_nse_order_placed_today_expires_at_1530_same_day():
+    # The old sweep only expired orders from BEFORE today → they lived 1-2 days.
+    placed = _ist(29, 10, 0)
+    assert not order_expired("NFO_OPTION", placed, _ist(29, 15, 29), None)
+    assert order_expired("NFO_OPTION", placed, _ist(29, 15, 31), None)
+    assert order_expired("NSE_EQUITY", placed, _ist(29, 15, 31), None)
+
+
+def test_order_placed_after_close_gets_the_next_session():
+    placed = _ist(29, 16, 0)
+    assert not order_expired("NSE_INDEX_OPTION_SELL", placed, _ist(30, 15, 0), None)
+    assert order_expired("NSE_INDEX_OPTION_SELL", placed, _ist(30, 15, 31), None)
+
+
+def test_friday_evening_order_survives_the_weekend():
+    placed = _ist(30, 18, 0)
+    assert not order_expired("NFO_FUTURE", placed, _ist(31, 16, 0), None)
+    assert not order_expired("NFO_FUTURE", placed, _ist(2, 10, 0), None)
+    assert order_expired("NFO_FUTURE", placed, _ist(2, 15, 31), None)
+
+
+def test_mcx_expires_after_the_mcx_close():
+    placed = _ist(29, 20, 0)
+    assert not order_expired("MCX_FUTURE", placed, _ist(29, 23, 54), None)
+    assert order_expired("MCX_FUTURE", placed, _ist(29, 23, 56), None)
+
+
+@pytest.mark.parametrize("seg", ["FOREX", "CRYPTO_SPOT", "COMMODITIES", "STOCKS", "INDICES"])
+def test_round_the_clock_markets_expire_after_midnight(seg):
+    placed = _ist(29, 23, 0)
+    assert not order_expired(seg, placed, _ist(29, 23, 59), None)
+    assert order_expired(seg, placed, _ist(30, 0, 1), None)
+
+
+def test_configured_time_wins_and_naive_utc_is_handled():
+    placed_naive_utc = datetime(2026, 10, 29, 4, 30)  # 10:00 IST
+    assert order_expired("NSE_EQUITY", placed_naive_utc, _ist(29, 15, 5), time(15, 0))
+    assert not order_expired("NSE_EQUITY", placed_naive_utc, _ist(29, 15, 5), None)
+
+
+def test_held_token_survives_a_browser_unsubscribe():
+    from app.services import market_data_service as mds
+
+    mds.hold_tokens("risk", {"424242"})
+    mds.subscribe(["515151"])
+    mds.unsubscribe(["424242", "515151"])  # last browser left both charts
+    assert "424242" in mds._subscribed
+    assert "515151" not in mds._subscribed
+    mds.hold_tokens("risk", set())
+    mds.unsubscribe(["424242"])
+    assert "424242" not in mds._subscribed

@@ -1174,6 +1174,9 @@ async def enforce_once(shard_id: int = 0, num_shards: int = 1) -> int:
     # so demo-position state is never transiently evicted.
     if _is_full_tick:
         _prune_stale_state(set(user_id_strs), set(all_token_set))
+        # Keep every held token live in `_state` even after the last browser
+        # watching it unsubscribes (see market_data_service.hold_tokens).
+        market_data_service.hold_tokens("risk", all_token_set)
 
     # ── 3. Batch LTP + quote snapshot from in-memory WS state ───────────
     # Both functions read `_state[token]` directly (pure dict lookup,

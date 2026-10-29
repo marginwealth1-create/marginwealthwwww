@@ -1473,9 +1473,29 @@ def subscribe(tokens: list[str]) -> None:
             logger.debug("metaapi_on_demand_subscribe_failed", exc_info=True)
 
 
+# Tokens the server's own loops price every tick (risk enforcer, pending-order
+# poller, open-position reconciler), keyed by owner. `unsubscribe` has no
+# ref-count, so one browser leaving a chart dropped the token for EVERYONE:
+# tick_loop stopped refreshing its `_state`, and get_ltp_instant kept handing
+# the enforcer that frozen price (29-Oct NIFTY CE short: the 70% warning never
+# fired and the 80% stop-out fired at 105%). Held tokens are never dropped.
+_held: dict[str, set[str]] = {}
+
+
+def hold_tokens(owner: str, tokens) -> None:
+    """Pin `tokens` for `owner` (replacing its previous set) and make sure
+    they're subscribed."""
+    _held[owner] = {str(t) for t in tokens}
+    missing = [t for t in _held[owner] if t not in _subscribed]
+    if missing:
+        subscribe(missing)
+
+
 def unsubscribe(tokens: list[str]) -> None:
+    held = set().union(*_held.values())
     for t in tokens:
-        _subscribed.discard(t)
+        if t not in held:
+            _subscribed.discard(t)
 
     # NOTE: we deliberately do NOT propagate unsubscribe to Infoway. There
     # is no cross-connection ref-count here, so if user A closes a EURUSD
@@ -1529,6 +1549,7 @@ async def ensure_open_position_subscriptions() -> dict[str, int]:
             "exchange": ex_str,
         }
 
+    _held["open_positions"] = set(all_tokens)
     if not all_tokens:
         return {"positions": 0, "kite": 0, "newly_subscribed": 0}
 

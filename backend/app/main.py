@@ -834,11 +834,11 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         )
         setattr(app, "_bonus_expiry_task", bonus_task)
 
-    # EOD pending-order auto-cancel: just after 00:00 IST (and once on boot),
-    # expire every still-parked NSE/BSE/NFO/BFO/MCX LIMIT/SL-M order so a
-    # DAY order can't carry into the next session and fire on the next day's
-    # prices. Releases the blocked margin and marks the order EXPIRED. Forex
-    # (24×5) / crypto (24×7) are exempt. Mongo-only → own leader lock.
+    # EOD pending-order auto-cancel: every minute, expire parked LIMIT/SL/SL-M
+    # orders whose market has closed since they were placed (NSE/BSE 15:30,
+    # MCX 23:55, forex/crypto/international midnight IST, or the Segment
+    # Settings time) so a DAY order can't fire on the next session's prices.
+    # Releases the blocked margin. Mongo-only → own leader lock.
     from app.services.eod_order_cleanup import eod_order_cleanup_loop
     eod_cancel_task: _asyncio.Task = _asyncio.create_task(
         _supervise(

@@ -20,16 +20,15 @@ time the row is swept once per IST day:
     brackets are day-scoped too). A carried position is therefore
     unprotected until the user sets them again.
 
-A row with **no time set is never swept**, so its orders carry exactly as
-they did before this was configurable. ``00:00`` reproduces the original
-midnight sweep.
+A row with **no time set** falls back to its market's close
+(``default_cutoff``): NSE/BSE/NFO/BFO 15:30, MCX 23:55, everything that
+trades round the clock (forex, crypto, COMEX, US stocks/indices) midnight IST.
+SL/TP clearing on carried positions still runs only for rows with a time set.
 
-AMO HANDLING
-------------
-An AMO is placed in the evening FOR THE NEXT session, so it must survive the
-sweep that immediately follows its placement. It is given exactly one
-session: expired only once it is older than the START of the previous IST
-day.
+An order expires once it was placed BEFORE the most recent cutoff
+(``last_cutoff``). So an order placed after the close (an AMO) survives the
+next session and expires at that session's close; exchange segments skip
+weekends, so a Friday-evening order still gets Monday.
 
 SAFETY / PLACEMENT
 ------------------
@@ -48,7 +47,7 @@ from app.models._base import OrderType
 from app.models.order import Order, OrderStatus
 from app.services import wallet_service
 from app.utils.decimal_utils import to_decimal
-from app.utils.time_utils import now_ist, now_utc, start_of_day_ist, to_utc
+from app.utils.time_utils import is_weekend, now_ist, now_utc
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +98,43 @@ def cutoff_reached(
     if last_run_day == now.strftime("%Y%m%d"):
         return False
     return now.time() >= cutoff
+
+
+_INDIAN = ("NSE", "BSE", "NFO", "BFO")
+
+
+def default_cutoff(segment: str | None) -> _dtime:
+    """Expiry time when Segment Settings leaves it blank: the exchange close
+    for Indian cash/F&O and MCX (23:55 = after MCX's winter close; summer
+    closes 23:30), midnight IST for round-the-clock markets."""
+    seg = (segment or "").upper()
+    if seg.startswith(_INDIAN):
+        return _dtime(15, 30)
+    if seg.startswith("MCX"):
+        return _dtime(23, 55)
+    return _dtime(0, 0)
+
+
+def last_cutoff(cut: _dtime, now: datetime, trading_days_only: bool) -> datetime:
+    """Most recent cutoff instant at or before `now` (IST). Exchange segments
+    skip weekends so an order placed Friday evening lives through Monday."""
+    d = now.date() if now.time() >= cut else now.date() - timedelta(days=1)
+    while trading_days_only and is_weekend(d):
+        d -= timedelta(days=1)
+    return datetime.combine(d, cut, tzinfo=now.tzinfo)
+
+
+def order_expired(
+    segment: str | None, created: datetime | None, now: datetime, configured: _dtime | None
+) -> bool:
+    """A parked order is stale once it was placed before the last cutoff."""
+    if created is None:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=_UTC)
+    seg = (segment or "").upper()
+    cut = configured if configured is not None else default_cutoff(seg)
+    return created < last_cutoff(cut, now, seg.startswith(_INDIAN + ("MCX",)))
 
 
 def admin_row_for_segment(segment: str | None) -> str | None:
@@ -212,40 +248,33 @@ async def clear_carry_brackets(seg_names: set[str]) -> int:
 
 
 async def expire_stale_day_orders() -> dict[str, int]:
-    """One EOD sweep. Expires still-parked NSE/MCX LIMIT/SL-M orders whose
-    session is over, releasing their blocked margin. Never raises — one bad
-    order must not stop the rest. Returns ``{scanned, expired}``.
+    """One sweep. Expires parked LIMIT/SL/SL-M orders placed before their
+    segment's last cutoff, releasing their blocked margin. Never raises — one
+    bad order must not stop the rest. Returns ``{scanned, expired}``.
     """
     global _last_run_day
 
     now = now_ist()
     cutoffs = await segment_cutoffs()
+    # Bracket clearing stays opt-in: only rows with a configured time.
     due = {
         name
         for name, cut in cutoffs.items()
         if cutoff_reached(cut, now, _last_run_day.get(name))
     }
-    if not due:
-        return {"scanned": 0, "expired": 0, "brackets_cleared": 0}
 
     try:
         rows = await Order.find(
             {
                 "status": {"$in": [OrderStatus.OPEN.value, OrderStatus.PARTIAL.value]},
-                "order_type": {"$in": [OrderType.LIMIT.value, OrderType.SL_M.value]},
+                "order_type": {
+                    "$in": [OrderType.LIMIT.value, OrderType.SL.value, OrderType.SL_M.value]
+                },
             }
         ).to_list()
     except Exception:
         logger.exception("eod_order_scan_failed")
         return {"scanned": 0, "expired": 0}
-
-    if not rows:
-        return {"scanned": 0, "expired": 0}
-
-    today_start_utc = to_utc(start_of_day_ist(now.date()))
-    # AMO gets one full session — only expired once older than the START of
-    # the PREVIOUS IST day (it already had its session and didn't fill).
-    amo_cutoff_utc = to_utc(start_of_day_ist(now.date() - timedelta(days=1)))
 
     expired = 0
     affected_users: set[str] = set()
@@ -253,14 +282,8 @@ async def expire_stale_day_orders() -> dict[str, int]:
     for o in rows:
         try:
             seg = getattr(o.instrument, "segment", None)
-            if admin_row_for_segment(str(seg) if seg else None) not in due:
-                continue
-
-            created = o.created_at
-            if created is not None and created.tzinfo is None:
-                created = created.replace(tzinfo=_UTC)
-            cutoff = amo_cutoff_utc if o.is_amo else today_start_utc
-            if created is None or created >= cutoff:
+            row = admin_row_for_segment(str(seg) if seg else None)
+            if not order_expired(str(seg) if seg else None, o.created_at, now, cutoffs.get(row or "")):
                 continue
 
             o.status = OrderStatus.EXPIRED
@@ -324,7 +347,7 @@ async def expire_stale_day_orders() -> dict[str, int]:
 
     # Brackets on positions carrying overnight go the same way as the parked
     # orders — operator decision; see clear_carry_brackets.
-    brackets = await clear_carry_brackets(due)
+    brackets = await clear_carry_brackets(due) if due else 0
 
     day_key = now.strftime("%Y%m%d")
     for name in due:
