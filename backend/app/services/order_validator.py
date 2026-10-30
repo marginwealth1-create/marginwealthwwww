@@ -1217,9 +1217,32 @@ async def validate(
                 "No funds available to open a new position. "
                 "Close existing positions or add funds."
             )
-        if margin_required > available:
+        # The opening brokerage is debited from the same cash the moment this
+        # fills, so the order needs margin + its own brokerage free (₹2,500
+        # margin + ₹25 brokerage → ₹2,525). Without it a fill whose margin ate
+        # all the cash left the brokerage unpaid as settlement outstanding.
+        # Same call as the matching engine, so it's exactly what gets charged.
+        from app.services import brokerage_calculator
+
+        opening_charges = to_decimal(
+            (
+                await brokerage_calculator.calculate(
+                    segment_type=instrument.segment,
+                    action=action,
+                    product_type=product_type,
+                    qty=quantity,
+                    price=ref_price,
+                    lot_size=instrument.lot_size,
+                    netting_override=s,
+                    is_closing=False,
+                    charge_on=s.get("charge_on"),
+                )
+            ).total
+        )
+        if margin_required + opening_charges > available:
             raise InsufficientFundsError(
-                f"Need ₹{margin_required:.2f}, have ₹{available:.2f}"
+                f"Need ₹{margin_required + opening_charges:.2f} (margin ₹{margin_required:.2f}"
+                f" + brokerage ₹{opening_charges:.2f}), have ₹{available:.2f}"
             )
 
     # 10) stop-loss mandatory

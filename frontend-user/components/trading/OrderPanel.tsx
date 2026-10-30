@@ -726,9 +726,14 @@ export function OrderPanel({ instrument, ltp, bid, ask, open, high, low, close, 
       );
       const credit = Number(walletSummary.credit_limit ?? 0);
       const total = free + credit;
-      if (intradayMargin > 0 && total < intradayMargin) {
+      // The opening brokerage is debited at the fill from the same cash, so
+      // the order needs margin + brokerage free (server enforces the same).
+      const openBrk =
+        String(effSettings?.charge_on ?? "both").toLowerCase() === "close" ? 0 : brokeragePreview ?? 0;
+      const need = intradayMargin + openBrk;
+      if (intradayMargin > 0 && total < need) {
         toast.error(
-          `Insufficient balance — need ${formatINR(intradayMargin)}, have ${formatINR(total)}`,
+          `Insufficient balance — need ${formatINR(need)} (margin ${formatINR(intradayMargin)} + brokerage ${formatINR(openBrk)}), have ${formatINR(total)}`,
         );
         return;
       }
