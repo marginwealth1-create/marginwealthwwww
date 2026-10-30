@@ -1013,13 +1013,9 @@ function TransactionsFeed({
       } else if (tt === "CHARGES") {
         kind = "charge";
         if (!narration) narration = "Brokerage & charges";
-      } else if (tt === "SETTLEMENT_OUTSTANDING_BOOKED") {
-        kind = "shortfall";
-        if (!narration) narration = "Loss exceeded your balance — recorded as outstanding (owed)";
-      } else if (tt === "SETTLEMENT_OUTSTANDING_RECOVERY") {
-        kind = "charge";
-        if (!narration) narration = "Outstanding recovered from deposit";
       }
+      // Settlement (outstanding) rows are hidden from users per the operator —
+      // no `kind` → skipped. Still recorded and visible to admins.
       if (!kind) continue;
       out.push({
         id: `txn-${t.id}`,
