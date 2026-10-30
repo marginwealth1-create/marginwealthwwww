@@ -1723,6 +1723,18 @@ def plan_carry(
     return plan
 
 
+def affordable_carry(qty: Decimal, cash: Decimal, locked: Decimal, full_margin: Decimal, step: Decimal) -> Decimal:
+    """Qty of a position whose overnight margin the free cash plus the margin
+    it already locks covers right now — one step short, as headroom for the
+    square's brokerage / P&L. The executor's last resort when the plan's
+    estimate was off and a flip can't be funded: carry this much, square the
+    rest, instead of squaring the whole position."""
+    if full_margin <= 0:
+        return qty
+    keep = floor_to_step(qty * (cash + locked) / full_margin, step) - step
+    return max(min(keep, qty - step), Decimal(0))
+
+
 def rollover_fire_time(close: Any, delay_min: int) -> Any:
     """close + delay as a wall-clock time, clamped to 23:59. divmod, because
     a naive minute add ("15:66") never matches and silently skips the day."""
@@ -2108,15 +2120,37 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
             except Exception:  # noqa: BLE001
                 logger.exception("cf_carry_failed", extra={"position_id": str(pos.id)})
                 deferred.append((pos, s, mark))
-        # Retry once (cash may have been locked by legs squared after it);
-        # still unfunded → square whole. Never leave a position MIS overnight
-        # at intraday leverage with half the margin it needs.
+        # Retry once (cash may have been locked by legs squared after it).
+        # Still unfunded → the plan's estimate was off (30-Oct J4MP6E: option
+        # brokerage under-priced, a planned carry squared whole): carry what
+        # the cash covers NOW and square only the rest. Nothing fits → square
+        # whole. Never leave a position MIS overnight at intraday leverage
+        # with half the margin it needs.
         for pos, s, mark in deferred:
             ok = False
             fresh = None
             try:
                 fresh = await Position.get(pos.id)
                 ok = fresh is None or fresh.status != PositionStatus.OPEN or await _carry(fresh, s, mark)
+                if not ok:
+                    w_now = await wallet_service.get_or_create(fresh.user_id)
+                    qty = to_decimal(abs(fresh.quantity))
+                    step = carry_step(s.get("min_lot"), fresh.instrument.lot_size)
+                    keep = affordable_carry(
+                        qty,
+                        to_decimal(w_now.available_balance) + to_decimal(w_now.credit_limit),
+                        to_decimal(fresh.margin_used),
+                        overnight_margin(s, qty, mark, fresh.instrument.lot_size, position_is_usd(fresh)),
+                        step,
+                    )
+                    logger.warning(
+                        "cf_carry_resized_to_cash",
+                        extra={"position_id": str(fresh.id), "qty": str(qty), "keep": str(keep)},
+                    )
+                    if keep >= step and await _square(fresh, qty - keep, "CARRY_FORWARD_PARTIAL", mark):
+                        out["trimmed"] += 1
+                        fresh = await Position.get(fresh.id)
+                        ok = fresh is None or fresh.status != PositionStatus.OPEN or await _carry(fresh, s, mark)
             except Exception:  # noqa: BLE001
                 logger.exception("cf_carry_retry_failed", extra={"position_id": str(pos.id)})
             if not ok:

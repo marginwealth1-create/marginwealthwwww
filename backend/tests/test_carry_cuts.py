@@ -9,6 +9,7 @@ from decimal import Decimal as D
 
 from app.services import market_data_service as mds
 from app.services.position_service import (
+    affordable_carry,
     carry_step,
     exit_mark,
     overnight_margin,
@@ -94,6 +95,19 @@ def test_carry_step():
     assert carry_step(0.01, 1) == D("0.01")   # crypto / forex
     assert carry_step(1, 65) == D(1)          # F&O: whole units
     assert carry_step(0, 1) == D(1)
+
+
+# ── executor fallback: plan was off, carry what the cash covers ─────────────
+
+def test_unfunded_flip_keeps_what_cash_covers_not_zero():
+    # 30-Oct J4MP6E BANKNIFTY 54600CE: 30 qty, ₹274.38 intraday lock, ₹2,730.30
+    # overnight, ₹2,401.93 free after the other squares → 28 carry (was: all squared).
+    assert affordable_carry(D(30), D("2401.93"), D("274.38"), D("2730.30"), D(1)) == D(28)
+
+
+def test_fallback_squares_when_nothing_fits_and_never_keeps_all():
+    assert affordable_carry(D(30), D(0), D(10), D(3000), D(1)) == D(0)
+    assert affordable_carry(D(30), D(999999), D(0), D(3000), D(1)) == D(29)  # still unfunded → at least one step goes
 
 
 # ── sweep time ─────────────────────────────────────────────────────────────
