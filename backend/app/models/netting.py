@@ -219,6 +219,8 @@ class NettingFieldsBase(BaseModel):
     isActive: bool | None = None
     tradingEnabled: bool | None = None
     allowOvernight: bool | None = None
+    # % of notional charged once per night for carrying a position (EOD rollover).
+    carryForwardChargePercent: float | None = None
     # Expiry day
     expiryProfitHoldMinSeconds: int | None = None
     expiryLossHoldMinSeconds: int | None = None
@@ -310,6 +312,7 @@ class NettingFieldsRequired(BaseModel):
     isActive: bool = True
     tradingEnabled: bool = True
     allowOvernight: bool = True
+    carryForwardChargePercent: float = 0.0
     # Expiry day
     expiryProfitHoldMinSeconds: int = 0
     expiryLossHoldMinSeconds: int = 0

@@ -237,6 +237,9 @@ export const CATEGORY_FIELDS: Record<string, FieldDef[]> = {
         { v: false, l: "No" },
       ],
     },
+    // % of notional debited once per night for each carried position at the
+    // EOD rollover (0 = free).
+    { key: "carryForwardChargePercent", label: "Carry charge % / night", type: "number" },
   ],
   expiryHold: [
     { key: "expiryProfitHoldMinSeconds", label: "Expiry profit hold (s)", type: "number" },
@@ -294,6 +297,7 @@ const OVERNIGHT_FIELD_KEYS = new Set([
   "expiryDayOptionBuyMargin",
   "expiryDayOptionSellMargin",
   "allowOvernight",
+  "carryForwardChargePercent",
 ]);
 
 export function isFieldNA(segment: SegmentRow | undefined, categoryId: string, field: FieldDef): boolean {

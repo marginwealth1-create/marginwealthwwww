@@ -2269,6 +2269,7 @@ def _to_legacy_dict(
         "intraday_lot_limit": float(pick("maxExchangeLots", 0.0) or 0.0) if lot_applies else 0.0,
         "holding_lot_limit": float(pick("maxExchangeLots", 0.0) or 0.0) if lot_applies else 0.0,
         "selling_overnight": bool(pick("allowOvernight", True)),
+        "carry_forward_charge_percent": float(pick("carryForwardChargePercent", 0.0) or 0.0),
         "limit_percentage": float(pick("limitAwayPercent", 0.0) or 0.0),
         "limit_within_day_range": bool(pick("limitWithinDayRange", False) or False),
         "block_pending_orders": bool(pick("blockPendingOrders", False) or False),

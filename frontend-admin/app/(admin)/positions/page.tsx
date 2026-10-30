@@ -74,6 +74,16 @@ const CLOSE_REASON_META: Record<
     label: "CF · Insufficient funds",
     cls: "bg-amber-500/10 text-amber-400 ring-amber-500/30",
   },
+  // EOD rollover squared the part of the book the funds couldn't carry.
+  CARRY_FORWARD_TRIM: {
+    label: "CF · Trimmed",
+    cls: "bg-amber-500/10 text-amber-400 ring-amber-500/30",
+  },
+  // EOD rollover squared part of this position; the rest carried overnight.
+  CARRY_FORWARD_PARTIAL: {
+    label: "CF · Part closed",
+    cls: "bg-amber-500/10 text-amber-400 ring-amber-500/30",
+  },
   // Segment doesn't allow overnight at all (intraday-only product).
   EOD_OVERNIGHT_DISABLED: {
     label: "EOD · Intraday only",
@@ -1732,6 +1742,8 @@ function AdminPositionsInner() {
                   <option value="STOP_OUT">STOP_OUT (risk auto-flatten)</option>
                   <option value="CARRY_FORWARD_FAIL">CARRY_FORWARD_FAIL (insufficient overnight margin)</option>
                   <option value="EOD_OVERNIGHT_DISABLED">EOD_OVERNIGHT_DISABLED (intraday-only segment)</option>
+                  <option value="CARRY_FORWARD_TRIM">CARRY_FORWARD_TRIM (squared to fit funds)</option>
+                  <option value="CARRY_FORWARD_PARTIAL">CARRY_FORWARD_PARTIAL (part squared, rest carried)</option>
                   <option value="ADMIN">ADMIN (manual close)</option>
                   <option value="EOD">EOD (auto-rollover)</option>
                 </select>

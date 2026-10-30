@@ -501,24 +501,15 @@ async def open_positions(user: CurrentUser):
             try:
                 mode = s.get("margin_calc_mode") or "times"
                 if _recompute_overnight_holding(r.product_type, mode):
-                    avg_native = float(str(r.avg_price))
-                    qty_abs = abs(float(r.quantity))
-                    notional = avg_native * qty_abs
-                    ovn_fixed = float(s.get("overnight_fixed_margin_per_lot") or 0)
-                    if mode == "fixed" and ovn_fixed > 0:
-                        lot_size = max(1, int(getattr(r.instrument, "lot_size", 1) or 1))
-                        lots = qty_abs / lot_size
-                        cf = ovn_fixed * lots
-                    else:
-                        ovn_pct = float(s.get("overnight_margin_percentage") or 100.0) / 100.0
-                        ovn_lev = float(s.get("overnight_leverage") or 1.0) or 1.0
-                        cf = notional * ovn_pct / ovn_lev
-                        # USD-quoted instruments — convert to INR like the
-                        # validator does at order time (fixed-per-lot is
-                        # already admin-entered in INR so it's skipped).
-                        if market_data_service.position_is_usd(r):
-                            cf = cf * market_data_service.get_usd_inr_rate()
-                    holding_margin = round(cf, 2)
+                    # Same formula + exit-side mark the EOD rollover uses
+                    # (r.ltp was just refreshed to the bid/ask close side).
+                    mark = position_service.exit_mark(r.quantity, None, None, r.ltp, r.avg_price)
+                    holding_margin = float(
+                        position_service.overnight_margin(
+                            s, r.quantity, mark, r.instrument.lot_size,
+                            market_data_service.position_is_usd(r),
+                        )
+                    )
             except Exception:
                 pass
         d["holding_margin"] = f"{holding_margin:.2f}"
@@ -1377,21 +1368,10 @@ async def list_active_trades(user: CurrentUser):
         try:
             mode = s.get("margin_calc_mode") or "times"
             if _recompute_overnight_holding(p.product_type, mode):
-                lot_size = max(1, int(p.instrument.lot_size or 1))
-                trade_lots = qty / lot_size if lot_size > 0 else qty
-                ovn_fixed = float(s.get("overnight_fixed_margin_per_lot") or 0)
-                if mode == "fixed" and ovn_fixed > 0:
-                    holding_native = ovn_fixed * trade_lots
-                else:
-                    trade_notional = qty * price
-                    ovn_pct = float(s.get("overnight_margin_percentage") or 100.0) / 100.0
-                    ovn_lev = float(s.get("overnight_leverage") or 1.0) or 1.0
-                    holding_native = trade_notional * ovn_pct / ovn_lev
-                # USD → INR same as the order validator does. Skip for
-                # fixed mode where ₹/lot is already admin-entered in INR.
-                if is_usd and not (mode == "fixed" and ovn_fixed > 0):
-                    holding_native *= fx
-                holding_margin_inr = round(holding_native, 2)
+                mark = position_service.exit_mark(p.quantity, None, ltp, p.ltp, price)
+                holding_margin_inr = float(
+                    position_service.overnight_margin(s, qty, mark, p.instrument.lot_size, is_usd)
+                )
         except Exception:
             holding_margin_inr = used_margin_inr
 
@@ -1486,19 +1466,10 @@ async def list_active_trades(user: CurrentUser):
         try:
             mode = s.get("margin_calc_mode") or "times"
             if _recompute_overnight_holding(p.product_type, mode):
-                lot_size = max(1, int(p.instrument.lot_size or 1))
-                pos_lots = qty / lot_size if lot_size > 0 else qty
-                ovn_fixed = float(s.get("overnight_fixed_margin_per_lot") or 0)
-                if mode == "fixed" and ovn_fixed > 0:
-                    holding_native = ovn_fixed * pos_lots
-                else:
-                    notional = qty * price
-                    ovn_pct = float(s.get("overnight_margin_percentage") or 100.0) / 100.0
-                    ovn_lev = float(s.get("overnight_leverage") or 1.0) or 1.0
-                    holding_native = notional * ovn_pct / ovn_lev
-                if is_usd and not (mode == "fixed" and ovn_fixed > 0):
-                    holding_native *= fx
-                holding_margin_inr = round(holding_native, 2)
+                mark = position_service.exit_mark(p.quantity, None, ltp, p.ltp, price)
+                holding_margin_inr = float(
+                    position_service.overnight_margin(s, qty, mark, p.instrument.lot_size, is_usd)
+                )
         except Exception:
             holding_margin_inr = used_margin_inr
 

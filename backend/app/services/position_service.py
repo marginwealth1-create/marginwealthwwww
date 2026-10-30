@@ -1355,6 +1355,7 @@ async def list_closed_trade_events_fifo(
                     "entry_price": entry_price,
                     "close_price": price,
                     "qty": qty,
+                    "_order_id": t.order_id,
                     "gross_pnl": gross,
                     "fx_rate": float(str(t.fx_rate)) if getattr(t, "fx_rate", None) is not None else None,
                     "brokerage": close_brk,
@@ -1423,6 +1424,7 @@ async def list_closed_trade_events_fifo(
                 "entry_price": eff_basis,
                 "close_price": price,
                 "qty": consume,
+                "_order_id": t.order_id,
                 "gross_pnl": gross,
                 "fx_rate": float(str(t.fx_rate)) if getattr(t, "fx_rate", None) is not None else None,
                 "brokerage": brk_alloc,
@@ -1472,6 +1474,21 @@ async def list_closed_trade_events_fifo(
                 )
                 if abs((_best[0].replace(tzinfo=None) - _cat.replace(tzinfo=None)).total_seconds()) < 30:
                     ev["close_reason"] = _best[1]
+
+        # A PARTIAL close leaves the position open, so no Position doc carries
+        # its reason — read it off the closing order (e.g. the EOD rollover's
+        # CARRY_FORWARD_PARTIAL).
+        _oids = {ev["_order_id"] for ev in events if not ev.get("close_reason") and ev.get("_order_id")}
+        if _oids:
+            from app.models.order import Order as _Order
+
+            _reasons = {
+                o.id: o.close_reason
+                for o in await _Order.find({"_id": {"$in": list(_oids)}, "close_reason": {"$ne": None}}).to_list()
+            }
+            for ev in events:
+                if not ev.get("close_reason") and ev.get("_order_id") in _reasons:
+                    ev["close_reason"] = _reasons[ev["_order_id"]]
 
     # Newest-close first. Sort explicitly because the list mixes trade-derived
     # events with inline settlement events that were emitted at their own
@@ -1580,78 +1597,234 @@ async def list_holdings(user_id: str | PydanticObjectId) -> list[Holding]:
 
 
 # ── Intraday → carryforward auto-rollover ───────────────────────────
-def plan_carry_cuts(
-    items: list[tuple[Any, Decimal, Decimal, Decimal, Decimal, Decimal]],
-    need: Decimal,
-    capacity: Decimal,
-) -> dict[Any, Decimal]:
-    """Units to square off so the rest of a user's book can carry overnight.
+def _positive(v: Any) -> Decimal | None:
+    if v is None:
+        return None
+    try:
+        d = to_decimal(v)
+    except (TypeError, ValueError, ArithmeticError):
+        return None
+    return d if d > 0 else None
 
-    `items` = (key, open_qty, lot_size, delta, locked_margin, pnl), worst
-    P&L first. `need` is the extra overnight margin of the whole book,
-    `capacity` the free funds. Cutting part of a position drops its share of
-    `need` AND hands its locked margin ± P&L back to `capacity`, so a user
-    keeps exactly what the funds cover (operator: "jitna fund utna hold")
-    instead of losing the whole position. Whole lots only (a share for
-    equity); a position that frees nothing by being cut is closed in full.
+
+def exit_mark(qty: Any, quote: dict | None, ltp: Any = None, last_mark: Any = None, avg: Any = None) -> Decimal:
+    """Price a position would EXIT at: the bid for a long, the ask for a
+    short. A missing or crossed book (bid > ask) falls back to live LTP →
+    the position's last stored mark → avg price. The carry is never priced
+    at the entry when anything live exists."""
+    q = quote or {}
+    bid, ask = _positive(q.get("bid")), _positive(q.get("ask"))
+    if bid and ask and bid > ask:
+        bid = ask = None
+    side = bid if to_decimal(qty) > 0 else ask
+    for v in (side, ltp, last_mark, avg):
+        d = _positive(v)
+        if d is not None:
+            return d
+    return Decimal(0)
+
+
+def overnight_margin(settings: dict, qty: Any, mark: Any, lot_size: Any, is_usd: bool = False) -> Decimal:
+    """Overnight (carry-forward) margin for `qty` units at `mark` — the ONE
+    formula the EOD rollover and the positions page ("CF Required") use.
+
+      • fixed mode with an overnight ₹/lot → ₹/lot × lots (already INR);
+      • otherwise → qty × mark × overnight % ÷ overnight leverage, × USD→INR
+        for USD-quoted instruments (this branch only).
+
+    `mark` is the exit-side price (exit_mark). This platform has no
+    strike-% margin mode, so written options use the same two branches.
     """
-    import math
+    q = abs(to_decimal(qty))
+    ovn_fixed = to_decimal(settings.get("overnight_fixed_margin_per_lot") or 0)
+    if settings.get("margin_calc_mode") == "fixed" and ovn_fixed > 0:
+        return quantize_money(ovn_fixed * q / to_decimal(max(1, int(lot_size or 1))))
+    pct = to_decimal(settings.get("overnight_margin_percentage") or 100) / Decimal(100)
+    lev = to_decimal(settings.get("overnight_leverage") or 1)
+    if lev <= 0:
+        lev = Decimal(1)
+    m = q * to_decimal(mark) * pct / lev
+    if is_usd:
+        from app.services.market_data_service import get_usd_inr_rate
 
-    cuts: dict[Any, Decimal] = {}
-    for key, qty, lot, delta, old, pnl in items:
-        if need <= capacity:
+        m *= to_decimal(get_usd_inr_rate())
+    return quantize_money(m)
+
+
+def carry_step(min_lot: Any, lot_size: Any) -> Decimal:
+    """Smallest quantity the rollover trims to: one min-lot when that is a
+    fraction of a unit (crypto / forex), otherwise one whole unit."""
+    m = to_decimal(min_lot or 0) * to_decimal(lot_size or 1)
+    return m if 0 < m < 1 else Decimal(1)
+
+
+def floor_to_step(x: Decimal, step: Decimal) -> Decimal:
+    from decimal import ROUND_FLOOR
+
+    return (x / step).to_integral_value(rounding=ROUND_FLOOR) * step
+
+
+def plan_carry(
+    items: list[tuple[Any, Decimal, Decimal, Decimal, Decimal]],
+    available: Decimal,
+) -> dict[Any, Decimal]:
+    """Portfolio-FIFO carry plan for one user's book → {key: carriable qty}.
+
+    `items` = (key, qty, overnight_margin, square_brokerage, step), OLDEST
+    first. `available` = free cash + the margin these positions lock + the
+    floating P&L (credit limit not counted). If the whole book's overnight
+    margin fits, everything carries in full. Otherwise the oldest positions
+    are squared first — each frees its overnight margin LESS the brokerage
+    its square books — and the position where the shortfall closes carries
+    only the part the funds cover (floored to its step). Every newer
+    position carries in full.
+    """
+    plan = {key: qty for key, qty, *_ in items}
+    need = sum((it[2] for it in items), Decimal(0))
+    if need <= available:
+        return plan
+    released = Decimal(0)
+    for key, qty, margin, brokerage, step in items:
+        gap = (need - available) - released
+        if gap <= 0:
             break
-        lots = qty / lot
-        if lots <= 0:
+        net = max(margin - brokerage, Decimal(0))
+        if margin <= 0 or net <= gap:
+            plan[key] = Decimal(0)
+            released += net
             continue
-        gain_per_lot = (max(delta, Decimal(0)) + old + pnl) / lots
-        k = Decimal(math.ceil((need - capacity) / gain_per_lot)) if gain_per_lot > 0 else lots
-        share = min(k, lots) / lots
-        cuts[key] = qty if k >= lots else k * lot
-        need -= max(delta, Decimal(0)) * share
-        capacity += (old + pnl) * share
-    return cuts
+        keep = floor_to_step(qty * (net - gap) / net, step)
+        plan[key] = keep
+        released += (qty - keep) / qty * net
+    return plan
+
+
+def rollover_fire_time(close: Any, delay_min: int) -> Any:
+    """close + delay as a wall-clock time, clamped to 23:59. divmod, because
+    a naive minute add ("15:66") never matches and silently skips the day."""
+    from datetime import time as _time
+
+    h, m = divmod(close.hour * 60 + close.minute + delay_min, 60)
+    return _time(23, 59) if h > 23 else _time(h, m)
+
+
+async def _tokens_expiring_today(positions: list) -> set[str]:
+    """Tokens among `positions` whose contract expires today (IST) — from the
+    Instrument doc, else parsed from the symbol."""
+    from datetime import datetime as _dt
+
+    from app.models.instrument import Instrument as _Instr
+    from app.services.expiry_cleanup import parse_symbol_expiry as _parse
+    from app.utils.time_utils import now_ist as _now_ist
+
+    today = _now_ist().date()
+    tokens = list({str(p.instrument.token) for p in positions if p.instrument.token})
+    exp_by_token: dict[str, Any] = {}
+    try:
+        for i in await _Instr.find({"token": {"$in": tokens}}).to_list():
+            e = getattr(i, "expiry", None)
+            exp_by_token[str(i.token)] = e.date() if isinstance(e, _dt) else e
+    except Exception:  # noqa: BLE001
+        logger.exception("expiry_day_instrument_lookup_failed")
+    out: set[str] = set()
+    for p in positions:
+        tok = str(p.instrument.token or "")
+        e = exp_by_token.get(tok) or _parse(getattr(p.instrument, "symbol", None))
+        if e == today:
+            out.add(tok)
+    return out
+
+
+async def _square_brokerage(p: Position, mark: Decimal) -> Decimal:
+    """Brokerage a market square of the whole position would book now."""
+    from app.services import brokerage_calculator, netting_service
+
+    try:
+        close_action = OrderAction.SELL if p.quantity > 0 else OrderAction.BUY
+        netting = await netting_service.get_effective_settings(
+            p.user_id,
+            p.instrument.segment,
+            action=close_action.value,
+            product_type=p.product_type.value,
+            symbol=p.instrument.symbol,
+        )
+        charges = await brokerage_calculator.calculate(
+            segment_type=p.instrument.segment,
+            action=close_action,
+            product_type=p.product_type,
+            qty=abs(float(p.quantity)),
+            price=mark,
+            lot_size=int(p.instrument.lot_size or 1),
+            netting_override=netting.get("settings"),
+            is_closing=True,
+            charge_on=netting.get("settings", {}).get("charge_on"),
+        )
+        return to_decimal(charges.total)
+    except Exception:  # noqa: BLE001
+        logger.warning("cf_square_brokerage_estimate_failed", extra={"position_id": str(p.id)})
+        return Decimal(0)
+
+
+async def _floating_pnl(user_id: Any) -> Decimal:
+    """Live floating P&L of the user's whole open book, marked at the exit
+    side by refresh_unrealized_pnl — the same helper the risk enforcer and
+    the positions page use (the stored field can be stale)."""
+    from app.services.market_data_service import get_ltp
+
+    total = Decimal(0)
+    for p in await Position.find(
+        Position.user_id == user_id, Position.status == PositionStatus.OPEN
+    ).to_list():
+        try:
+            await refresh_unrealized_pnl(p, await get_ltp(p.instrument.token))
+        except Exception:  # noqa: BLE001
+            pass
+        total += to_decimal(p.unrealized_pnl or 0)
+    return total
 
 
 async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> dict[str, int]:
-    """At market close for a segment group, flip every open MIS position in
-    that group to NRML. For each position we re-resolve the NRML margin
-    against the user's effective segment settings; if the wallet can't
-    afford the overnight delta, just enough quantity is squared off before
-    the type flip that the rest is covered (never NRML while under-margined).
+    """EOD rollover for one segment group: carry what each user's funds
+    cover, square the rest, flip carried MIS positions to NRML.
 
-    Also sweeps already-open NRML positions in the group: any whose wallet
-    can't cover the (correctly-resolved) carry margin is force-closed too.
-    This catches carry positions that slipped through under-funded earlier
-    (e.g. the option_type=None margin bug) and flattens them at the next EOD.
-    Affordable NRML positions are left untouched.
+    1. Contracts expiring today are left to the expiry job. Positions the
+       user didn't opt in to carry (per-position toggle) and segments with
+       `selling_overnight=false` are squared whole.
+    2. Per user a portfolio-FIFO plan (plan_carry) sizes what carries:
+       funds = free cash + margin the group locks + floating P&L (credit
+       limit NOT counted); need = Σ overnight margin at the exit-side mark.
+    3. Squares are MARKET is_squareoff orders filled at the exit-side mark
+       (the feed is often dead at the close). A carried MIS position locks
+       the overnight-margin delta and flips to NRML; a flip that can't be
+       funded retries once after the user's other squares, then squares
+       whole. Every carried position pays the segment's carry charge once.
+    4. used_margin is reconciled per user; anything still MIS is logged.
 
-    Returns a small summary dict for logging / audit:
-        {"converted": N, "force_closed": M, "skipped": K}
-
-    Used by the `intraday_to_carry_loop` lifespan task. The loop calls this
-    once per IST day per segment group, right after the exchange's close
-    minute.
+    Returns {converted, force_closed, trimmed, skipped, charged, left_in_mis}.
     """
+    from app.core.exceptions import InsufficientFundsError
     from app.core.redis_client import cache_delete_pattern
-    from app.models._base import ProductType as _PT
+    from app.models._base import OrderType as _OT, ProductType as _PT
     from app.models.audit_log import AuditAction
+    from app.models.transaction import TransactionType
+    from app.models.user import User as _User
     from app.services import (
         audit_service,
         netting_service,
         order_service,
+        user_service,
         wallet_service,
     )
-    from app.services.market_data_service import position_is_usd
+    from app.services.market_data_service import (
+        get_quote,
+        get_usd_inr_rate,
+        position_is_usd,
+    )
 
+    out = {"converted": 0, "force_closed": 0, "trimmed": 0, "skipped": 0, "charged": 0, "left_in_mis": 0}
     if not segment_set:
-        return {"converted": 0, "force_closed": 0, "skipped": 0}
+        return out
 
-    # Fetch BOTH MIS and NRML positions in this segment group. MIS rows
-    # get the normal rollover treatment; NRML rows are only touched when
-    # admin has set `allowOvernight=false` on the segment, in which case
-    # we force-close them too (the segment-spec says nothing can carry
-    # past close).
     rows = await Position.find(
         {
             "status": PositionStatus.OPEN.value,
@@ -1660,9 +1833,8 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
         }
     ).to_list()
 
-    # Snapshot each affected user's settlement_outstanding BEFORE closing
-    # anything, so the post-batch close-ordering correction nets only the
-    # phantom this rollover books — not pre-existing / genuine shortfall.
+    # Settlement snapshot BEFORE closing anything, so the post-sweep
+    # close-ordering correction nets only the phantom this rollover books.
     phantom_before: dict = {}
     for _uid in {p.user_id for p in rows}:
         try:
@@ -1671,410 +1843,289 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
         except Exception:  # noqa: BLE001
             pass
 
-    converted = 0
-    force_closed = 0
-    trimmed = 0  # partly squared off, the rest carried
-    skipped = 0
-    # Users whose positions were flipped MIS→NRML in-place below. After the
-    # loop we consolidate each one's OPEN book so a freshly-converted NRML
-    # position nets/merges into any PRE-EXISTING NRML position on the same
-    # (token, product) instead of sitting as a duplicate row.
+    expiring = await _tokens_expiring_today(rows)
     converted_user_ids: set = set()
-    # Per-user carry buckets: uid -> [(pos, overnight_new_margin, old_margin,
-    # delta), ...]. Filled in the resolve/analysis pass below, drained in the
-    # per-user aggregate carry-decision pass after it.
-    by_user: dict = {}
+    touched_users: set = set()
+    carry_feature: dict = {}
 
-    # Per-user cache of "does this pool have the per-position Carry-Forward
-    # toggle enabled" so we resolve the admin cascade once per user, not per
-    # position.
-    _carry_feat_cache: dict = {}
-
-    for pos in rows:
-        # ── Per-position user Carry-Forward opt-out ──────────────────────
-        # When the owning admin enabled the toggle feature, a position the user
-        # did NOT flip ON (default) is squared off at EOD — only opted-in
-        # positions carry overnight. Feature OFF for the pool ⇒ skip this gate
-        # entirely and the platform's normal auto-carry (below) runs unchanged.
-        try:
-            from app.models.user import User as _UserCF
-            from app.services import user_service as _usvc_cf
-
-            _uid = pos.user_id
-            if _uid not in _carry_feat_cache:
-                _ud = await _UserCF.get(_uid)
-                _carry_feat_cache[_uid] = bool(
-                    _ud and await _usvc_cf.carry_toggle_enabled_for(_ud)
-                )
-            if _carry_feat_cache[_uid] and not bool(getattr(pos, "user_carry_forward", False)):
-                from app.models._base import OrderAction as _OAcf, OrderType as _OTcf
-
-                _udoc = await _UserCF.get(pos.user_id)
-                if _udoc is not None:
-                    _qty_open = abs(pos.quantity)
-                    _lots_open = max(0.01, _qty_open / max(1, pos.instrument.lot_size or 1))
-                    _act = _OAcf.SELL if pos.quantity > 0 else _OAcf.BUY
-                    await order_service.place_order(
-                        user=_udoc,
-                        payload={
-                            "token": pos.instrument.token,
-                            "action": _act.value,
-                            "order_type": _OTcf.MARKET.value,
-                            "product_type": pos.product_type.value,
-                            "lots": _lots_open,
-                            "force_quantity": _qty_open,
-                            "is_squareoff": True,
-                            "placed_from": "CARRY_FORWARD_OFF_CLOSE",
-                        },
-                    )
-                    try:
-                        _ref = await Position.get(pos.id)
-                        if _ref and _ref.status == PositionStatus.CLOSED and not _ref.close_reason:
-                            _ref.close_reason = "CARRY_FORWARD_OFF"
-                            await _ref.save()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    force_closed += 1
-                continue
-        except Exception:  # noqa: BLE001
-            logger.exception("carry_forward_optout_close_failed", extra={"pos_id": str(pos.id)})
-
-        # Resolve NRML-side margin via the same resolver that runs at
-        # order-placement time. Single source of truth — admin's segment
-        # override stack is honoured.
-        try:
-            # Derive CE/PE from the symbol (the Position's InstrumentRef
-            # snapshot has no option_type field) so the resolver applies the
-            # admin's per-side option overrides (e.g. Opt Sell Mode=Fixed,
-            # Opt Sell Overnight=₹15000) instead of silently falling back to
-            # the generic segment Times/% margin. Without this the carry
-            # margin is massively UNDER-computed (~20% of notional vs the
-            # configured ₹15000/lot), so `delta` looks affordable and an
-            # under-funded option position is NEVER force-closed at EOD —
-            # it rolls into NRML uncovered. Mirrors the positions endpoint.
-            _osym = (pos.instrument.symbol or "").upper()
-            _otype = (
-                ("CE" if _osym.endswith("CE") else "PE" if _osym.endswith("PE") else None)
-                if len(_osym) >= 3 and _osym[-3].isdigit()
-                else None
-            )
-            resolved = await netting_service.get_effective_settings(
-                pos.user_id,
-                pos.instrument.segment,
-                action="BUY" if pos.quantity >= 0 else "SELL",
-                option_type=_otype,
-                product_type="NRML",
-                symbol=pos.instrument.symbol,
-            )
-        except Exception:  # noqa: BLE001
-            skipped += 1
-            continue
-        s = resolved.get("settings") or {}
-
-        # Hard close-out path: admin disabled overnight carrying for this
-        # segment (`allowOvernight=false`). Nothing carries past close —
-        # squareoff every open position regardless of product type. Runs
-        # before the type-flip / margin-recompute below so we don't bother
-        # locking new margin on a position we're about to close.
-        allow_overnight = bool(s.get("selling_overnight", True))
-        if not allow_overnight:
-            from app.models._base import OrderAction as _OA, OrderType as _OT
-            from app.models.user import User as _User
-
-            try:
-                user_doc = await _User.get(pos.user_id)
-                if user_doc is None:
-                    skipped += 1
-                    continue
-                qty_open = abs(pos.quantity)
-                lots_open = max(0.01, qty_open / max(1, pos.instrument.lot_size or 1))
-                action = _OA.SELL if pos.quantity > 0 else _OA.BUY
-                await order_service.place_order(
-                    user=user_doc,
-                    payload={
-                        "token": pos.instrument.token,
-                        "action": action.value,
-                        "order_type": _OT.MARKET.value,
-                        "product_type": pos.product_type.value,
-                        "lots": lots_open,
-                        "force_quantity": qty_open,
-                        "is_squareoff": True,
-                        "placed_from": "OVERNIGHT_DISABLED_CLOSE",
-                    },
-                )
-                # Stamp a specific close_reason so the user sees WHY the
-                # position closed.  "EOD_OVERNIGHT_DISABLED" — segment
-                # doesn't allow carry-forward at all (intraday-only
-                # product).  More informative than the legacy "AUTO".
-                try:
-                    refreshed = await Position.get(pos.id)
-                    if refreshed and refreshed.status == PositionStatus.CLOSED and not refreshed.close_reason:
-                        refreshed.close_reason = "EOD_OVERNIGHT_DISABLED"
-                        await refreshed.save()
-                except Exception:  # noqa: BLE001
-                    pass
-                force_closed += 1
-            except Exception:  # noqa: BLE001
-                skipped += 1
-            continue
-
-        # `allowOvernight=true`: compute the overnight requirement for BOTH
-        # MIS and already-open NRML positions. A MIS position converts to NRML
-        # when affordable; ANY position (MIS or NRML) whose wallet can't cover
-        # the carry is force-closed in the branch below. Extending the check to
-        # NRML squares off under-funded carry positions that slipped through
-        # earlier (e.g. the option_type=None margin bug let them roll in
-        # uncovered) at the next EOD instead of leaving them stuck open. An
-        # already-NRML position that IS affordable is left exactly as-is (no
-        # type flip, no re-lock) — see the MIS-only gate before the flip.
-
-        # Compute the overnight margin requirement against the same
-        # notional that's currently locked. Mirrors order_validator's
-        # fixed-mode vs percent-vs-times logic — BUT we read the
-        # `overnight_*` triple, not the product-aware `leverage` /
-        # `margin_percentage` / `fixed_margin_per_lot`. In Times mode the
-        # resolver deliberately keeps those product-aware fields on the
-        # INTRADAY value (the "symmetric-Times patch"), so reading them
-        # here returned 500× for an MCX FUT row whose admin had set
-        # 500× intraday / 70× overnight — and the loop computed
-        # delta=0 and silently skipped force-close. Reading the
-        # explicit overnight fields gives the rollover the right
-        # requirement so a wallet that can't cover the carry actually
-        # triggers the force-squareoff branch below.
-        cur_avg = to_decimal(pos.avg_price)
-        cur_qty_abs = to_decimal(abs(pos.quantity))
-        notional = cur_avg * cur_qty_abs
-
-        ovn_fixed_per_lot = to_decimal(s.get("overnight_fixed_margin_per_lot") or 0)
-        if (s.get("margin_calc_mode") == "fixed") and ovn_fixed_per_lot > 0:
-            lot_size = max(1, int(pos.instrument.lot_size or 1))
-            lots = cur_qty_abs / to_decimal(lot_size)
-            new_margin = ovn_fixed_per_lot * lots
-        else:
-            ovn_margin_pct = to_decimal(s.get("overnight_margin_percentage") or 100.0) / to_decimal(100)
-            ovn_leverage = to_decimal(s.get("overnight_leverage") or 1.0) or to_decimal(1)
-            new_margin = notional * ovn_margin_pct / ovn_leverage
-
-        # USD-quoted instruments lock margin in INR; same conversion as
-        # order_validator.validate. Skipped for fixed-per-lot (already INR).
-        if position_is_usd(pos):
-            if not ((s.get("margin_calc_mode") == "fixed") and ovn_fixed_per_lot > 0):
-                from app.services.market_data_service import get_usd_inr_rate
-
-                new_margin = new_margin * to_decimal(get_usd_inr_rate())
-
-        new_margin = quantize_money(new_margin)
-        old_margin = to_decimal(pos.margin_used)
-        delta = new_margin - old_margin
-
-        # Defer the carry / force-close decision to the per-user aggregate
-        # pass after this loop. Collect (position, overnight requirement,
-        # currently-locked intraday margin, delta) per user so affordability is
-        # judged against the user's WHOLE overnight book at once — and, when a
-        # wallet can't cover it, only the worst positions are squared off
-        # (partial), the rest carried. `delta` = overnight requirement −
-        # intraday (700×) lock; it is ONLY the affordability yardstick and is
-        # never re-locked (USED stays at the intraday lock through the carry).
-        by_user.setdefault(pos.user_id, []).append(
-            (pos, new_margin, old_margin, delta)
-        )
-
-    # ── Per-user aggregate carry decision ───────────────────────────────────
-    # For each user, compare the TOTAL additional margin needed to back the
-    # overnight (CF) carry of their whole open book against what the wallet can
-    # cover (available + credit). If it fits, everything carries. If not, square
-    # off only the QUANTITY the funds can't carry, worst P&L first (see
-    # plan_carry_cuts) — the rest of each position carries.
-    # USED is NEVER re-locked to the overnight amount: the MIS→NRML flip is
-    # margin-neutral (the intraday 700× lock stays put), CF is purely a gate.
-    from app.models._base import OrderAction as _OA, OrderType as _OT
-    from app.models.user import User as _User
-
-    async def _force_close_carry(pos, qty_close=None) -> bool:
-        """Square off `qty_close` units of `pos` (default: all of it) at market
-        (opposite-side `is_squareoff` MARKET order) and stamp
-        close_reason=CARRY_FORWARD_FAIL if that flattened it. Returns True on
-        success. Mirrors the risk_enforcer squareoff primitive — hold-time
-        guards bypassed."""
+    async def _square(pos: Position, qty_close: Decimal, reason: str, mark: Decimal) -> bool:
+        """Square `qty_close` units at the exit-side mark; stamp `reason` on
+        the order, and on the position if that flattened it."""
         user_doc = await _User.get(pos.user_id)
         if user_doc is None:
             return False
-        qty_open = abs(pos.quantity) if qty_close is None else float(qty_close)
-        lots_open = max(0.01, qty_open / max(1, pos.instrument.lot_size or 1))
-        action = _OA.SELL if pos.quantity > 0 else _OA.BUY
-        await order_service.place_order(
-            user=user_doc,
-            payload={
-                "token": pos.instrument.token,
-                "action": action.value,
-                "order_type": _OT.MARKET.value,
-                "product_type": pos.product_type.value,
-                "lots": lots_open,
-                "force_quantity": qty_open,
-                "is_squareoff": True,
-                "placed_from": "INTRADAY_ROLLOVER",
-            },
-        )
-        # "Carry-forward failed (insufficient funds)" on the Closed-tab card
-        # rather than a generic "Auto" chip — the wallet couldn't cover the
-        # overnight requirement, so the platform flattened before EOD.
+        q = float(qty_close)
+        payload: dict[str, Any] = {
+            "token": pos.instrument.token,
+            "action": (OrderAction.SELL if pos.quantity > 0 else OrderAction.BUY).value,
+            "order_type": _OT.MARKET.value,
+            "product_type": pos.product_type.value,
+            "lots": max(0.01, q / max(1, pos.instrument.lot_size or 1)),
+            "force_quantity": q,
+            "is_squareoff": True,
+            "placed_from": "INTRADAY_ROLLOVER",
+            "close_reason": reason,
+        }
+        if mark > 0:
+            payload["expected_price"] = str(mark)
+        await order_service.place_order(user=user_doc, payload=payload)
         try:
-            refreshed = await Position.get(pos.id)
-            if refreshed and refreshed.status == PositionStatus.CLOSED and not refreshed.close_reason:
-                refreshed.close_reason = "CARRY_FORWARD_FAIL"
-                await refreshed.save()
+            ref = await Position.get(pos.id)
+            if ref and ref.status == PositionStatus.CLOSED and not ref.close_reason:
+                ref.close_reason = reason
+                await ref.save()
         except Exception:  # noqa: BLE001
             pass
         return True
 
-    for _uid, items in by_user.items():
+    async def _square_whole(pos: Position, reason: str, mark: Decimal) -> None:
         try:
-            wallet = await wallet_service.get_or_create(_uid)
-            capacity = to_decimal(wallet.available_balance) + to_decimal(wallet.credit_limit)
+            if await _square(pos, to_decimal(abs(pos.quantity)), reason, mark):
+                out["force_closed"] += 1
+                return
         except Exception:  # noqa: BLE001
-            skipped += len(items)
-            continue
+            logger.exception("cf_square_failed", extra={"position_id": str(pos.id), "reason": reason})
+        out["skipped"] += 1
 
-        # Total additional margin the user needs to back the overnight carry of
-        # their whole book (only genuine shortfalls — delta > 0 — count).
-        need = sum((it[3] for it in items if it[3] > 0), to_decimal(0))
-
-        # Short of funds → cut only the quantity the funds can't carry, worst
-        # P&L first (plan_carry_cuts); the rest of each position carries.
-        cuts: dict = {}
-        if need > capacity:
-            from app.services.market_data_service import get_ltp
-
-            plan = []
-            for pos_i, _nm, old_i, delta_i in items:
+    async def _carry(pos: Position, s: dict, mark: Decimal) -> bool:
+        """Flip a carried MIS position to NRML at its overnight margin
+        (block / release the delta) and charge the carry fee once. False =
+        the margin delta couldn't be funded (yet)."""
+        if pos.product_type == _PT.MIS:
+            new_margin = overnight_margin(s, pos.quantity, mark, pos.instrument.lot_size, position_is_usd(pos))
+            old_margin = to_decimal(pos.margin_used)
+            delta = new_margin - old_margin
+            if delta > 0:
                 try:
-                    ltp = to_decimal(await get_ltp(pos_i.instrument.token) or 0)
-                except Exception:  # noqa: BLE001
-                    ltp = to_decimal(0)
-                pnl = (
-                    (ltp - to_decimal(pos_i.avg_price)) * to_decimal(pos_i.quantity)
-                    if ltp > 0
-                    else to_decimal(pos_i.unrealized_pnl or 0)
+                    await wallet_service.block_margin(pos.user_id, delta)
+                except InsufficientFundsError:
+                    return False
+            elif delta < 0:
+                await wallet_service.release_margin(pos.user_id, -delta)
+            pos.margin_used = Decimal128(str(new_margin))
+            pos.product_type = _PT.NRML
+            await pos.save()
+            await _recompute_tracker(
+                user_id=pos.user_id, segment_type=pos.segment_type, token=pos.instrument.token
+            )
+            try:
+                await audit_service.log_event(
+                    action=AuditAction.UPDATE,
+                    entity_type="Position",
+                    entity_id=pos.id,
+                    actor_id=None,
+                    target_user_id=pos.user_id,
+                    metadata={
+                        "kind": "INTRADAY_TO_CARRY_CONVERSION",
+                        "symbol": pos.instrument.symbol,
+                        "qty": str(pos.quantity),
+                        "mark": str(mark),
+                        "margin_before": str(old_margin),
+                        "margin_after": str(new_margin),
+                    },
                 )
-                plan.append((
-                    pos_i.id,
-                    to_decimal(abs(pos_i.quantity)),
-                    to_decimal(max(1, int(pos_i.instrument.lot_size or 1))),
-                    delta_i,
-                    old_i,
-                    pnl,
-                ))
-            plan.sort(key=lambda it: it[5])
-            cuts = plan_carry_cuts(plan, need, capacity)
+            except Exception:  # noqa: BLE001
+                pass
+            out["converted"] += 1
+            converted_user_ids.add(pos.user_id)
 
-        for pos_i, new_margin, old_margin, delta in items:
-            # ── Under-funded → square off the part the funds can't carry ──
-            cut = cuts.get(pos_i.id)
-            if cut is not None:
+        pct = to_decimal(s.get("carry_forward_charge_percent") or 0)
+        if pct > 0:
+            price = mark if mark > 0 else to_decimal(pos.avg_price)
+            fee = pct / Decimal(100) * to_decimal(abs(pos.quantity)) * price
+            if position_is_usd(pos):
+                fee *= to_decimal(get_usd_inr_rate())
+            fee = quantize_money(fee)
+            if fee > 0:
+                await wallet_service.adjust(
+                    pos.user_id,
+                    -fee,
+                    transaction_type=TransactionType.ADJUSTMENT,
+                    narration=f"Carry-forward charge {float(pct):g}% · {pos.instrument.symbol}",
+                    reference_type="Position",
+                    reference_id=str(pos.id),
+                )
+                out["charged"] += 1
+        return True
+
+    # ── 1. Per-position gates; collect what's left per user ────────────────
+    by_user: dict = {}
+    for pos in rows:
+        tok = str(pos.instrument.token)
+        if tok in expiring:
+            continue  # the expiry job settles it at the proper price
+        touched_users.add(pos.user_id)
+        try:
+            quote = await get_quote(tok) or {}
+        except Exception:  # noqa: BLE001
+            quote = {}
+        mark = exit_mark(pos.quantity, quote, quote.get("ltp"), pos.ltp, pos.avg_price)
+
+        # Per-position Carry-Forward opt-out: when the user's pool has the
+        # toggle feature on, a position the user did NOT flip ON is squared.
+        try:
+            if pos.user_id not in carry_feature:
+                _ud = await _User.get(pos.user_id)
+                carry_feature[pos.user_id] = bool(_ud and await user_service.carry_toggle_enabled_for(_ud))
+            if carry_feature[pos.user_id] and not bool(getattr(pos, "user_carry_forward", False)):
+                await _square_whole(pos, "CARRY_FORWARD_OFF", mark)
+                continue
+        except Exception:  # noqa: BLE001
+            logger.exception("carry_forward_optout_close_failed", extra={"pos_id": str(pos.id)})
+
+        # NRML settings with the option type, so per-side option overrides
+        # apply (without it option-writing carry margin is under-computed).
+        sym = (pos.instrument.symbol or "").upper()
+        otype = ("CE" if sym.endswith("CE") else "PE" if sym.endswith("PE") else None) if len(sym) >= 3 and sym[-3].isdigit() else None
+        try:
+            resolved = await netting_service.get_effective_settings(
+                pos.user_id,
+                pos.instrument.segment,
+                action="BUY" if pos.quantity >= 0 else "SELL",
+                option_type=otype,
+                product_type="NRML",
+                symbol=pos.instrument.symbol,
+            )
+        except Exception:  # noqa: BLE001
+            out["skipped"] += 1
+            continue
+        s = resolved.get("settings") or {}
+
+        if not bool(s.get("selling_overnight", True)):
+            await _square_whole(pos, "EOD_OVERNIGHT_DISABLED", mark)
+            continue
+        by_user.setdefault(pos.user_id, []).append((pos, s, mark))
+
+    # ── 2-3. Plan + execute per user ───────────────────────────────────────
+    for uid, items in by_user.items():
+        items.sort(key=lambda it: it[0].opened_at.timestamp() if it[0].opened_at else float("-inf"))
+        try:
+            wallet = await wallet_service.get_or_create(uid)
+            floating = await _floating_pnl(uid)
+        except Exception:  # noqa: BLE001
+            logger.exception("cf_funds_read_failed", extra={"user_id": str(uid)})
+            out["skipped"] += len(items)
+            continue
+        locked = sum((to_decimal(p.margin_used) for p, _s, _m in items), Decimal(0))
+        available = to_decimal(wallet.available_balance) + locked + floating
+
+        plan_items = []
+        for pos, s, mark in items:
+            qty = to_decimal(abs(pos.quantity))
+            plan_items.append((
+                pos.id,
+                qty,
+                overnight_margin(s, qty, mark, pos.instrument.lot_size, position_is_usd(pos)),
+                await _square_brokerage(pos, mark),
+                carry_step(s.get("min_lot"), pos.instrument.lot_size),
+            ))
+        try:
+            plan = plan_carry(plan_items, available)
+            short_reason = "CARRY_FORWARD_TRIM"
+        except Exception:  # noqa: BLE001
+            logger.exception("cf_plan_failed_per_position_fallback", extra={"user_id": str(uid)})
+            free = max(available, Decimal(0))
+            plan = {
+                k: (min(q, floor_to_step(q * free / m, st)) if m > 0 else q)
+                for k, q, m, _b, st in plan_items
+            }
+            short_reason = "CARRY_FORWARD_FAIL"
+        logger.info(
+            "cf_plan",
+            extra={
+                "user_id": str(uid),
+                "available": str(available),
+                "need": str(sum((it[2] for it in plan_items), Decimal(0))),
+                "plan": {str(k): str(v) for k, v in plan.items()},
+            },
+        )
+
+        # Squares first, so the cash they free is there for the flips.
+        carry_list = []
+        for (pos, s, mark), (_k, qty, _m, _b, step) in zip(items, plan_items):
+            keep = plan.get(pos.id, qty)
+            if keep < qty and keep < step:
+                await _square_whole(pos, short_reason, mark)
+                continue
+            if keep < qty:
                 try:
-                    ok = await _force_close_carry(pos_i, cut)
+                    ok = await _square(pos, qty - keep, "CARRY_FORWARD_PARTIAL", mark)
                 except Exception:  # noqa: BLE001
+                    logger.exception("cf_partial_square_failed", extra={"position_id": str(pos.id)})
                     ok = False
                 if not ok:
-                    skipped += 1
+                    out["skipped"] += 1
                     continue
-                if cut >= to_decimal(abs(pos_i.quantity)):
-                    force_closed += 1
+                out["trimmed"] += 1
+                # The partial close changed qty / margin — never save the stale doc.
+                pos = await Position.get(pos.id)
+                if pos is None or pos.status != PositionStatus.OPEN:
                     continue
-                trimmed += 1
-                # The partial close changed qty/margin — never save the stale doc.
-                pos_i = await Position.get(pos_i.id)
-                if pos_i is None or pos_i.status != PositionStatus.OPEN:
-                    continue
+            carry_list.append((pos, s, mark))
 
-            # ── Survivor already NRML → carries as-is (no re-lock) ──
-            if pos_i.product_type != _PT.MIS:
-                continue
-
-            # ── Survivor MIS → NRML: MARGIN-NEUTRAL flip ──
-            # Keep the intraday (700×) lock exactly as-is — do NOT block/release
-            # to the overnight amount. USED must always display the intraday
-            # lock; the overnight requirement was only the affordability gate
-            # above. Just flip the product book and re-split the tracker.
+        deferred = []
+        for pos, s, mark in carry_list:
             try:
-                pos_i.product_type = _PT.NRML
-                await pos_i.save()
-
-                # Recompute (don't increment) — after product_type flips
-                # MIS→NRML, _recompute_tracker reads the new state and rewrites
-                # the (intraday_lots, holding_lots) split exactly.
-                await _recompute_tracker(
-                    user_id=pos_i.user_id,
-                    segment_type=pos_i.segment_type,
-                    token=pos_i.instrument.token,
-                )
-
-                try:
-                    await audit_service.log_event(
-                        action=AuditAction.UPDATE,
-                        entity_type="Position",
-                        entity_id=pos_i.id,
-                        actor_id=None,
-                        target_user_id=pos_i.user_id,
-                        metadata={
-                            "kind": "INTRADAY_TO_CARRY_CONVERSION",
-                            "symbol": pos_i.instrument.symbol,
-                            "margin_used": str(old_margin),
-                            "overnight_requirement": str(new_margin),
-                            "margin_neutral": True,
-                        },
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-
-                converted += 1
-                converted_user_ids.add(pos_i.user_id)
+                if not await _carry(pos, s, mark):
+                    deferred.append((pos, s, mark))
             except Exception:  # noqa: BLE001
-                skipped += 1
+                logger.exception("cf_carry_failed", extra={"position_id": str(pos.id)})
+                deferred.append((pos, s, mark))
+        # Retry once (cash may have been locked by legs squared after it);
+        # still unfunded → square whole. Never leave a position MIS overnight
+        # at intraday leverage with half the margin it needs.
+        for pos, s, mark in deferred:
+            ok = False
+            fresh = None
+            try:
+                fresh = await Position.get(pos.id)
+                ok = fresh is None or fresh.status != PositionStatus.OPEN or await _carry(fresh, s, mark)
+            except Exception:  # noqa: BLE001
+                logger.exception("cf_carry_retry_failed", extra={"position_id": str(pos.id)})
+            if not ok:
+                await _square_whole(fresh or pos, "CARRY_FORWARD_FAIL", mark)
 
-    # Per-user effective-settings cache no longer matches reality (the
-    # product_type changed); wipe so the next read re-resolves.
+    # ── 4. Reconcile + verify ──────────────────────────────────────────────
+    for uid in touched_users:
+        try:
+            await wallet_service.recompute_used_margin(uid)
+        except Exception:  # noqa: BLE001
+            logger.exception("cf_used_margin_reconcile_failed", extra={"user_id": str(uid)})
+
     try:
         await cache_delete_pattern("netting_eff:*")
     except Exception:  # noqa: BLE001
         pass
 
-    # Close-ordering correction: net any phantom settlement the force-close
-    # branches above booked while a sibling position's margin was still
-    # locked (same fix as the risk_enforcer stop-out path). Self-correcting
-    # — no-op for users with no phantom; genuine capital-exhausted shortfall
-    # is left intact. Only runs when something was actually force-closed.
-    if force_closed and phantom_before:
+    if (out["force_closed"] or out["trimmed"]) and phantom_before:
         try:
             await wallet_service.net_phantom_settlement_for_users(phantom_before)
         except Exception:  # noqa: BLE001
             pass
 
-    # Anti-fragmentation: the MIS→NRML flip above changes product_type
-    # IN-PLACE, so a freshly-converted NRML position can now collide with a
-    # PRE-EXISTING open NRML position for the SAME (user, token) — e.g. a
-    # carry-forward leg from a prior settlement PLUS today's intraday leg that
-    # just rolled overnight. `apply_fill` correctly kept them separate while
-    # one was MIS and the other NRML (different product books), but once both
-    # are NRML they must net into ONE row. Without this they sit as two OPEN
-    # rows (the "same symbol do baar dikh raha / BUY+SELL dono open" bug).
-    # `consolidate_open_positions` folds each user's OPEN book to one per
-    # (token, product): same-side lots weighted-average into one; an opposing
-    # BUY/SELL nets and realises the offset P&L exactly like a close. Reuses
-    # the same helper the weekly-settlement reopen uses. Best-effort per user
-    # — one user's failure never blocks the rollover.
+    # Same (user, token) can now hold two NRML rows (an older carry + today's
+    # flipped leg) — fold them into one, exactly like the weekly reopen does.
     for _uid in converted_user_ids:
         try:
             await consolidate_open_positions(_uid)
         except Exception:  # noqa: BLE001
             logger.exception("intraday_to_carry_consolidate_failed user=%s", _uid)
 
-    return {
-        "converted": converted,
-        "force_closed": force_closed,
-        "trimmed": trimmed,
-        "skipped": skipped,
-    }
+    left = await Position.find(
+        {
+            "status": PositionStatus.OPEN.value,
+            "product_type": _PT.MIS.value,
+            "instrument.segment": {"$in": list(segment_set)},
+        }
+    ).to_list()
+    left = [p for p in left if str(p.instrument.token) not in expiring]
+    out["left_in_mis"] = len(left)
+    for p in left:
+        logger.warning(
+            "cf_left_in_mis",
+            extra={"position_id": str(p.id), "user_id": str(p.user_id), "symbol": p.instrument.symbol},
+        )
+    return out
 
 
 # Module-level kill switch + state — same pattern as risk_enforcer_loop.
@@ -2098,15 +2149,10 @@ async def settle_expiring_today(segment_group: frozenset[str] | set[str]) -> dic
     idempotent). Returns counts.
     """
     import logging as _logging
-    from datetime import datetime as _dt
 
-    from app.models.instrument import Instrument as _Instr
     from app.services import market_data_service as _mds
-    from app.services.expiry_cleanup import parse_symbol_expiry as _parse
-    from app.utils.time_utils import now_ist as _now_ist
 
     _log = _logging.getLogger(__name__)
-    today = _now_ist().date()
     seg = list(segment_group)
 
     open_pos = await Position.find(
@@ -2115,26 +2161,7 @@ async def settle_expiring_today(segment_group: frozenset[str] | set[str]) -> dic
     if not open_pos:
         return {"settled": 0, "instruments": 0}
 
-    tokens = list({str(p.instrument.token) for p in open_pos if p.instrument.token})
-    # Resolve each token's expiry from the Instrument doc, else the symbol parse.
-    exp_by_token: dict[str, object] = {}
-    try:
-        for i in await _Instr.find({"token": {"$in": tokens}}).to_list():
-            e = getattr(i, "expiry", None)
-            if isinstance(e, _dt):
-                e = e.date()
-            exp_by_token[str(i.token)] = e
-    except Exception:  # noqa: BLE001
-        _log.exception("expiry_day_instrument_lookup_failed")
-
-    expiring: set[str] = set()
-    for p in open_pos:
-        tok = str(p.instrument.token or "")
-        e = exp_by_token.get(tok)
-        if e is None:
-            e = _parse(getattr(p.instrument, "symbol", None))
-        if e == today:
-            expiring.add(tok)
+    expiring = await _tokens_expiring_today(open_pos)
     if not expiring:
         return {"settled": 0, "instruments": 0}
 
@@ -2161,28 +2188,30 @@ async def settle_expiring_today(segment_group: frozenset[str] | set[str]) -> dic
 
 
 async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
-    """Wake every minute; at each segment group's close minute (once per
-    IST day), run `convert_intraday_to_carry` against that group.
+    """Wake every minute; once per IST day per segment group, at its sweep
+    time, run `convert_intraday_to_carry` against that group.
 
-    Segment groups + close times come from time_utils:
-        • Indian equity + F&O → 15:30 IST
-        • MCX                 → 23:55 IST
-        • Forex (CDS) + crypto → no close, skipped entirely
+        • NSE/BSE/F&O → close 15:30 + 12 min = 15:42 (the session's last
+          bid/ask arrives and users can still square off after the bell)
+        • MCX         → close + 1 min
+        • Forex / crypto / international → no daily close, never rolled
 
-    Weekends are skipped (Indian exchanges are closed). The per-day
-    bookkeeping `_last_rollover_day` ensures we only fire once per group
-    even if the loop sleeps drift slightly past the close-minute mark.
+    Weekends and the exchange's full-day holidays are skipped. The "done
+    today" marker is persisted in Redis as well as memory, so a restart
+    after the close never sweeps the same book a second time.
     """
     import asyncio as _asyncio
     import logging as _logging
+    from datetime import time as _time
 
+    from app.core.redis_client import cache_get, cache_set
     from app.models._base import Exchange as _Exchange
     from app.models.holiday import TradingHoliday as _TradingHoliday
     from app.utils.time_utils import (
         INDIAN_EQUITY_FNO_SEGMENTS,
+        MCX_CLOSE,
         MCX_SEGMENTS,
         is_weekend,
-        market_close_time_for_segment,
         now_ist,
     )
 
@@ -2191,9 +2220,27 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
     _intraday_loop_stop = False
 
     groups = (
-        ("INDIAN_EQUITY_FNO", INDIAN_EQUITY_FNO_SEGMENTS),
-        ("MCX", MCX_SEGMENTS),
+        ("INDIAN_EQUITY_FNO", INDIAN_EQUITY_FNO_SEGMENTS, rollover_fire_time(_time(15, 30), 12)),
+        ("MCX", MCX_SEGMENTS, rollover_fire_time(MCX_CLOSE, 1)),
     )
+
+    async def _done(group: str, day: str) -> bool:
+        if _last_rollover_day.get(group) == day:
+            return True
+        try:
+            if await cache_get(f"cf_rollover_done:{group}:{day}"):
+                _last_rollover_day[group] = day
+                return True
+        except Exception:  # noqa: BLE001
+            _log.exception("cf_rollover_marker_read_failed", extra={"group": group})
+        return False
+
+    async def _mark_done(group: str, day: str) -> None:
+        _last_rollover_day[group] = day
+        try:
+            await cache_set(f"cf_rollover_done:{group}:{day}", {"done": True}, ttl_sec=3 * 86400)
+        except Exception:  # noqa: BLE001
+            _log.exception("cf_rollover_marker_write_failed", extra={"group": group})
     # Primary exchange per group, for the full-day-holiday guard below.
     _group_exchange = {
         "INDIAN_EQUITY_FNO": _Exchange.NSE,
@@ -2205,59 +2252,52 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
             now = now_ist()
             if not is_weekend(now.date()):
                 day_key = now.strftime("%Y%m%d")
-                for group_name, group_set in groups:
-                    if _last_rollover_day.get(group_name) == day_key:
+                for group_name, group_set, fire_at in groups:
+                    if now.time() < fire_at or await _done(group_name, day_key):
                         continue
-                    close_t = market_close_time_for_segment(next(iter(group_set)))
-                    if close_t is None:
-                        continue
-                    # Fire the minute after close — gives any straggler
-                    # orders one tick to settle before we sweep.
-                    fire_after = (close_t.hour, close_t.minute + 1)
-                    if (now.hour, now.minute) >= fire_after:
-                        # Full-day exchange holiday → market never opened, so
-                        # nothing should roll or be squared off today. Mark the
-                        # day done so we don't re-check every minute. FAIL-OPEN:
-                        # any lookup error proceeds with the rollover so a guard
-                        # bug can never suppress a real EOD sweep.
+                    # Full-day exchange holiday → market never opened, so
+                    # nothing should roll or be squared off today. Mark the
+                    # day done so we don't re-check every minute. FAIL-OPEN:
+                    # any lookup error proceeds with the rollover so a guard
+                    # bug can never suppress a real EOD sweep.
+                    holiday = None
+                    try:
+                        _exch = _group_exchange.get(group_name)
+                        if _exch is not None:
+                            holiday = await _TradingHoliday.find_one(
+                                _TradingHoliday.holiday_date == now.date(),
+                                _TradingHoliday.exchange == _exch,
+                                _TradingHoliday.is_full_day == True,  # noqa: E712
+                            )
+                    except Exception:  # noqa: BLE001
                         holiday = None
-                        try:
-                            _exch = _group_exchange.get(group_name)
-                            if _exch is not None:
-                                holiday = await _TradingHoliday.find_one(
-                                    _TradingHoliday.holiday_date == now.date(),
-                                    _TradingHoliday.exchange == _exch,
-                                    _TradingHoliday.is_full_day == True,  # noqa: E712
-                                )
-                        except Exception:  # noqa: BLE001
-                            holiday = None
-                        if holiday is not None:
-                            _last_rollover_day[group_name] = day_key
-                            _log.info(
-                                "intraday_to_carry_skipped_holiday",
-                                extra={"group": group_name, "date": day_key},
-                            )
-                            continue
-                        # Expiry-day settlement FIRST — close every open position
-                        # on an instrument expiring TODAY at its close/clearing
-                        # price, so an expiring contract is never carried forward.
-                        try:
-                            exp_summary = await settle_expiring_today(group_set)
-                            if exp_summary.get("settled"):
-                                _log.info(
-                                    "expiry_day_settled_group",
-                                    extra={"group": group_name, **exp_summary},
-                                )
-                        except Exception:  # noqa: BLE001
-                            _log.exception(
-                                "expiry_day_settle_failed", extra={"group": group_name}
-                            )
-                        summary = await convert_intraday_to_carry(group_set)
-                        _last_rollover_day[group_name] = day_key
+                    if holiday is not None:
+                        await _mark_done(group_name, day_key)
                         _log.info(
-                            "intraday_to_carry_rolled",
-                            extra={"group": group_name, **summary},
+                            "intraday_to_carry_skipped_holiday",
+                            extra={"group": group_name, "date": day_key},
                         )
+                        continue
+                    # Expiry-day settlement FIRST — close every open position
+                    # on an instrument expiring TODAY at its close/clearing
+                    # price, so an expiring contract is never carried forward.
+                    try:
+                        exp_summary = await settle_expiring_today(group_set)
+                        if exp_summary.get("settled"):
+                            _log.info(
+                                "expiry_day_settled_group",
+                                extra={"group": group_name, **exp_summary},
+                            )
+                    except Exception:  # noqa: BLE001
+                        _log.exception(
+                            "expiry_day_settle_failed", extra={"group": group_name}
+                        )
+                    summary = await convert_intraday_to_carry(group_set)
+                    await _mark_done(group_name, day_key)
+                    _log.info(
+                        "intraday_to_carry_rolled",
+                        extra={"group": group_name, **summary},
+                    )
         except Exception:  # noqa: BLE001
             _log.exception("intraday_to_carry_loop_failed")
         try:

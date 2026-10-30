@@ -1,51 +1,104 @@
-"""EOD carry-forward keeps what the funds cover instead of closing everything.
+"""EOD carry-forward: overnight margin, exit-side mark, FIFO carry plan,
+sweep time maths.
 
     pytest -q backend/tests/test_carry_cuts.py
 """
 
+from datetime import time
 from decimal import Decimal as D
 
-from app.services.position_service import plan_carry_cuts
+from app.services import market_data_service as mds
+from app.services.position_service import (
+    carry_step,
+    exit_mark,
+    overnight_margin,
+    plan_carry,
+    rollover_fire_time,
+)
+
+TIMES = {"margin_calc_mode": "times", "overnight_leverage": 10, "overnight_margin_percentage": 100}
+FIXED = {"margin_calc_mode": "fixed", "overnight_fixed_margin_per_lot": 15000, "overnight_margin_percentage": 0}
 
 
-def test_stock_keeps_the_quantity_the_fund_covers():
-    # ₹1L fund, 500 shares @1000 bought at 5x (₹1L locked, nothing free).
-    # Overnight needs 1x = ₹5L → extra ₹4L. Keep ₹1L worth = 100 shares.
-    items = [("A", D(500), D(1), D(400000), D(100000), D(0))]
-    assert plan_carry_cuts(items, D(400000), D(0)) == {"A": D(400)}
+# ── overnight_margin ───────────────────────────────────────────────────────
+
+def test_times_margin_is_notional_over_overnight_leverage():
+    assert overnight_margin(TIMES, 100, D("1000"), 1) == D("10000.00")
 
 
-def test_losing_position_keeps_less():
-    # Same, but price fell to 950: equity ₹75k → 78 shares at 1x.
-    items = [("A", D(500), D(1), D(400000), D(100000), D(-25000))]
-    cut = plan_carry_cuts(items, D(400000), D(0))["A"]
-    assert cut == D(422)
-    kept = D(500) - cut
-    assert kept * 950 <= 75000
+def test_fixed_margin_is_per_lot_and_ignores_price():
+    assert overnight_margin(FIXED, 130, D("99999"), 65) == D("30000.00")  # 2 lots
 
 
-def test_fno_cuts_whole_lots():
-    # 10 lots × 65, extra ₹10k/lot overnight, ₹2k/lot locked, ₹25k free.
-    items = [("F", D(650), D(65), D(100000), D(20000), D(0))]
-    # each lot cut frees 10k + 2k = 12k; short by 75k → 7 lots (84k)
-    assert plan_carry_cuts(items, D(100000), D(25000)) == {"F": D(455)}
+def test_usd_converted_only_in_times(monkeypatch):
+    monkeypatch.setitem(mds._usd_inr_cache, "rate", 90.0)
+    assert overnight_margin(TIMES, 1, D("100"), 1, is_usd=True) == D("900.00")
+    assert overnight_margin(FIXED, 65, D("100"), 65, is_usd=True) == D("15000.00")
 
 
-def test_worst_position_cut_first_and_the_rest_untouched():
-    items = [
-        ("LOSER", D(100), D(1), D(50000), D(10000), D(-5000)),
-        ("WINNER", D(100), D(1), D(50000), D(10000), D(3000)),
-    ]
-    # short 20k; each LOSER share frees 500+100-50 = 550 → 37 shares
-    assert plan_carry_cuts(items, D(100000), D(80000)) == {"LOSER": D(37)}
+def test_short_position_qty_sign_does_not_matter():
+    assert overnight_margin(TIMES, -100, D("1000"), 1) == D("10000.00")
 
 
-def test_fits_already_cuts_nothing():
-    items = [("A", D(10), D(1), D(5000), D(1000), D(0))]
-    assert plan_carry_cuts(items, D(5000), D(6000)) == {}
+# ── exit_mark ──────────────────────────────────────────────────────────────
+
+def test_long_exits_at_bid_short_at_ask():
+    q = {"bid": 99, "ask": 101}
+    assert exit_mark(10, q, 100) == D(99)
+    assert exit_mark(-10, q, 100) == D(101)
 
 
-def test_position_that_frees_nothing_is_closed_in_full():
-    # Loss bigger than margin + requirement: cutting it can't help → close.
-    items = [("A", D(100), D(1), D(1000), D(1000), D(-5000))]
-    assert plan_carry_cuts(items, D(1000), D(0)) == {"A": D(100)}
+def test_crossed_or_missing_book_falls_back_ltp_then_mark_then_avg():
+    assert exit_mark(10, {"bid": 105, "ask": 101}, 100) == D(100)
+    assert exit_mark(10, {}, None, D("98"), D("90")) == D(98)
+    assert exit_mark(10, {}, 0, None, D("90")) == D(90)
+
+
+# ── plan_carry (items oldest first: key, qty, margin, square brokerage, step) ─
+
+BOOK = [
+    ("A", D(100), D(60000), D(1000), D(1)),  # oldest
+    ("B", D(50), D(50000), D(500), D(1)),
+    ("C", D(10), D(20000), D(0), D(1)),      # newest
+]
+
+
+def test_everything_fits_everything_carries():
+    assert plan_carry(BOOK, D(130000)) == {"A": D(100), "B": D(50), "C": D(10)}
+
+
+def test_shortfall_trims_the_oldest_and_carries_the_rest_in_full():
+    # short 30k: A frees (60k − 1k brokerage) per 100 → keep 49, B / C full.
+    assert plan_carry(BOOK, D(100000)) == {"A": D(49), "B": D(50), "C": D(10)}
+
+
+def test_big_shortfall_squares_oldest_whole_and_boundary_partial():
+    assert plan_carry(BOOK, D(20000)) == {"A": D(0), "B": D(0), "C": D(9)}
+
+
+def test_square_brokerage_is_counted():
+    no_brk = [("A", D(100), D(60000), D(0), D(1))] + BOOK[1:]
+    assert plan_carry(no_brk, D(100000))["A"] == D(50)  # vs 49 with brokerage
+
+
+def test_more_funds_from_floating_profit_keeps_more():
+    assert plan_carry(BOOK, D(110000))["A"] > plan_carry(BOOK, D(100000))["A"]
+
+
+def test_crypto_trims_in_fractional_steps():
+    items = [("X", D("0.5"), D(10000), D(0), D("0.01"))]
+    assert plan_carry(items, D(2345)) == {"X": D("0.11")}
+
+
+def test_carry_step():
+    assert carry_step(0.01, 1) == D("0.01")   # crypto / forex
+    assert carry_step(1, 65) == D(1)          # F&O: whole units
+    assert carry_step(0, 1) == D(1)
+
+
+# ── sweep time ─────────────────────────────────────────────────────────────
+
+def test_fire_time_divmod_and_clamp():
+    assert rollover_fire_time(time(15, 30), 12) == time(15, 42)
+    assert rollover_fire_time(time(15, 55), 10) == time(16, 5)
+    assert rollover_fire_time(time(23, 55), 10) == time(23, 59)
