@@ -1759,8 +1759,21 @@ async def _tokens_expiring_today(positions: list) -> set[str]:
     return out
 
 
+def _option_type(symbol: str | None) -> str | None:
+    """CE / PE from an option trading symbol (strike digit before the
+    suffix), else None — so the resolver applies per-side option settings."""
+    sym = (symbol or "").upper()
+    if len(sym) >= 3 and sym[-3].isdigit() and sym.endswith(("CE", "PE")):
+        return sym[-2:]
+    return None
+
+
 async def _square_brokerage(p: Position, mark: Decimal) -> Decimal:
-    """Brokerage a market square of the whole position would book now."""
+    """Brokerage a market square of the whole position would book now.
+    Resolved WITH the option type: without it an option square was priced
+    at the generic segment commission (₹20/lot vs the ₹100/lot option
+    brokerage actually charged), the plan came up short by exactly that and
+    a planned carry failed its margin block (30-Oct J4MP6E)."""
     from app.services import brokerage_calculator, netting_service
 
     try:
@@ -1769,6 +1782,7 @@ async def _square_brokerage(p: Position, mark: Decimal) -> Decimal:
             p.user_id,
             p.instrument.segment,
             action=close_action.value,
+            option_type=_option_type(p.instrument.symbol),
             product_type=p.product_type.value,
             symbol=p.instrument.symbol,
         )
@@ -1999,8 +2013,7 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
 
         # NRML settings with the option type, so per-side option overrides
         # apply (without it option-writing carry margin is under-computed).
-        sym = (pos.instrument.symbol or "").upper()
-        otype = ("CE" if sym.endswith("CE") else "PE" if sym.endswith("PE") else None) if len(sym) >= 3 and sym[-3].isdigit() else None
+        otype = _option_type(pos.instrument.symbol)
         try:
             resolved = await netting_service.get_effective_settings(
                 pos.user_id,
