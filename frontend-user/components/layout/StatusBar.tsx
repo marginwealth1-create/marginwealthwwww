@@ -10,7 +10,7 @@ function isMarketOpen(date = new Date()): boolean {
   const day = ist.getUTCDay();
   if (day === 0 || day === 6) return false;
   const minutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  return minutes >= 9 * 60 + 15 && minutes <= 15 * 60 + 30;
+  return minutes >= 9 * 60 + 15 && minutes <= 15 * 60 + 41; // platform NSE close 15:41
 }
 
 function formatIST(date: Date) {

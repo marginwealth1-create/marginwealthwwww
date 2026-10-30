@@ -111,13 +111,13 @@ export function isInstrumentMarketOpen(
     return min >= 9 * 60 && min <= 23 * 60 + 30;
   }
 
-  // NSE / BSE equity, F&O — Mon-Fri 09:15-15:30 IST.
+  // NSE / BSE equity, F&O — Mon-Fri 09:15-15:41 IST (platform close, operator-set).
   // Catch-all: anything we couldn't classify falls into this bucket,
   // which is safer than defaulting to "open" because Indian equity is
   // the dominant segment and a wrong "closed" is better than a wrong
   // "open" (the backend rejects either way; we just avoid the flicker).
   if (!weekday) return false;
-  return min >= 9 * 60 + 15 && min <= 15 * 60 + 30;
+  return min >= 9 * 60 + 15 && min <= 15 * 60 + 41;
 }
 
 /** Friendly label used in the "Market is closed" toast. */
