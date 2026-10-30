@@ -1359,9 +1359,10 @@ async def list_closed_trade_events_fifo(
                     "gross_pnl": gross,
                     "fx_rate": float(str(t.fx_rate)) if getattr(t, "fx_rate", None) is not None else None,
                     "brokerage": close_brk,
-                    # No surviving opening-fill timestamp for a reopened cycle
-                    # — fall back to the close time so the row still renders.
+                    # No surviving opening fill — the position's own
+                    # opened_at is filled in below; close time is the last resort.
                     "opened_at": t.executed_at,
+                    "_open_unknown": True,
                     "closed_at": t.executed_at,
                     "instrument_token": t.instrument.token,
                 })
@@ -1489,6 +1490,29 @@ async def list_closed_trade_events_fifo(
             for ev in events:
                 if not ev.get("close_reason") and ev.get("_order_id") in _reasons:
                     ev["close_reason"] = _reasons[ev["_order_id"]]
+
+    # Rows whose opening fill the FIFO walk couldn't find (consumed by an
+    # earlier close, or a reopened cycle) showed the CLOSE time as the open
+    # time ("opened 08:26 pm → closed 08:26 pm"). Use the opened_at of the
+    # position that was open on that instrument when the close happened.
+    _unknown = [ev for ev in events if ev.get("_open_unknown")]
+    if _unknown:
+        _all_pos = closed_pos + await Position.find(
+            Position.user_id == PydanticObjectId(user_id),
+            Position.status == PositionStatus.OPEN,
+        ).to_list()
+        for ev in _unknown:
+            _cat = _naive(ev["closed_at"])
+            _cands = [
+                _p.opened_at
+                for _p in _all_pos
+                if _p.instrument.token == ev["instrument_token"]
+                and _p.opened_at
+                and _naive(_p.opened_at) <= _cat
+                and (not _p.closed_at or _naive(_p.closed_at) >= _cat)
+            ]
+            if _cands:
+                ev["opened_at"] = max(_cands, key=_naive)
 
     # Newest-close first. Sort explicitly because the list mixes trade-derived
     # events with inline settlement events that were emitted at their own
