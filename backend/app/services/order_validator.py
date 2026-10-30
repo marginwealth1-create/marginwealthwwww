@@ -1313,7 +1313,7 @@ async def validate(
                 if not (_t(9, 0) <= ist.time() <= _t(23, 30)):
                     raise MarketClosedError("MCX is closed. Place AMO instead.")
             else:
-                # NSE / BSE equities + F&O: 09:15 – 15:30 IST
+                # NSE / BSE equities + F&O: 09:15 – MARKET_CLOSE_TIME (15:41) IST
                 open_t = parse_hhmm(cfg.MARKET_OPEN_TIME)
                 close_t = parse_hhmm(cfg.MARKET_CLOSE_TIME)
                 if not (open_t <= ist.time() <= close_t):

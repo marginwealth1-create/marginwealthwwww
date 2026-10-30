@@ -2215,8 +2215,7 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
     """Wake every minute; once per IST day per segment group, at its sweep
     time, run `convert_intraday_to_carry` against that group.
 
-        • NSE/BSE/F&O → close 15:30 + 12 min = 15:42 (the session's last
-          bid/ask arrives and users can still square off after the bell)
+        • NSE/BSE/F&O → 15:41, the platform's NSE close (operator-set)
         • MCX         → close + 1 min
         • Forex / crypto / international → no daily close, never rolled
 
@@ -2234,6 +2233,7 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
     from app.utils.time_utils import (
         INDIAN_EQUITY_FNO_SEGMENTS,
         MCX_CLOSE,
+        NSE_BSE_CLOSE,
         MCX_SEGMENTS,
         is_weekend,
         now_ist,
@@ -2244,7 +2244,7 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
     _intraday_loop_stop = False
 
     groups = (
-        ("INDIAN_EQUITY_FNO", INDIAN_EQUITY_FNO_SEGMENTS, rollover_fire_time(_time(15, 30), 12)),
+        ("INDIAN_EQUITY_FNO", INDIAN_EQUITY_FNO_SEGMENTS, rollover_fire_time(NSE_BSE_CLOSE, 0)),
         ("MCX", MCX_SEGMENTS, rollover_fire_time(MCX_CLOSE, 1)),
     )
 

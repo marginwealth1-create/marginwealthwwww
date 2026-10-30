@@ -328,7 +328,7 @@ class Settings(BaseSettings):
     # ── Trading ──────────────────────────────────────────────────────
     DEFAULT_TIMEZONE: str = "Asia/Kolkata"
     MARKET_OPEN_TIME: str = "09:15"
-    MARKET_CLOSE_TIME: str = "15:30"
+    MARKET_CLOSE_TIME: str = "15:41"  # operator: NSE/BSE/F&O close
     MUHURAT_OPEN_TIME: str = "18:15"
     MUHURAT_CLOSE_TIME: str = "19:15"
 

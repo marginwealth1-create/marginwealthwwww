@@ -86,7 +86,7 @@ def add_business_days(d: date, n: int) -> date:
 # NOTE: these ONLY affect the rollover + `is_after_close` (pending-order
 # firing / risk-EOD) — NEW order acceptance is gated by live-feed staleness,
 # so moving these does not open a stale-price trading window.
-NSE_BSE_CLOSE: time = time(16, 0)
+NSE_BSE_CLOSE: time = time(15, 41)  # operator: market close + CF rollover
 MCX_CLOSE: time = time(23, 40)
 # Session OPEN times — symmetric to the close times above. Needed so the
 # risk enforcer recognises the PRE-OPEN window (weekday midnight → open)

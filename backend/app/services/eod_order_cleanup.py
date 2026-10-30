@@ -21,7 +21,7 @@ time the row is swept once per IST day:
     unprotected until the user sets them again.
 
 A row with **no time set** falls back to its market's close
-(``default_cutoff``): NSE/BSE/NFO/BFO 15:30, MCX 23:55, everything that
+(``default_cutoff``): NSE/BSE/NFO/BFO 15:41 (platform close), MCX 23:55, everything that
 trades round the clock (forex, crypto, COMEX, US stocks/indices) midnight IST.
 SL/TP clearing on carried positions still runs only for rows with a time set.
 
@@ -109,7 +109,9 @@ def default_cutoff(segment: str | None) -> _dtime:
     closes 23:30), midnight IST for round-the-clock markets."""
     seg = (segment or "").upper()
     if seg.startswith(_INDIAN):
-        return _dtime(15, 30)
+        from app.utils.time_utils import NSE_BSE_CLOSE
+
+        return NSE_BSE_CLOSE
     if seg.startswith("MCX"):
         return _dtime(23, 55)
     return _dtime(0, 0)

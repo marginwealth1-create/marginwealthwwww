@@ -102,25 +102,25 @@ def _ist(day, hh, mm):  # Oct 2026: 29 Thu, 30 Fri, 31 Sat, 2 Nov Mon
     return datetime(2026, 10 if day > 2 else 11, day, hh, mm, tzinfo=IST)
 
 
-def test_nse_order_placed_today_expires_at_1530_same_day():
+def test_nse_order_placed_today_expires_at_the_1541_close_same_day():
     # The old sweep only expired orders from BEFORE today → they lived 1-2 days.
     placed = _ist(29, 10, 0)
-    assert not order_expired("NFO_OPTION", placed, _ist(29, 15, 29), None)
-    assert order_expired("NFO_OPTION", placed, _ist(29, 15, 31), None)
-    assert order_expired("NSE_EQUITY", placed, _ist(29, 15, 31), None)
+    assert not order_expired("NFO_OPTION", placed, _ist(29, 15, 40), None)
+    assert order_expired("NFO_OPTION", placed, _ist(29, 15, 41), None)
+    assert order_expired("NSE_EQUITY", placed, _ist(29, 15, 42), None)
 
 
 def test_order_placed_after_close_gets_the_next_session():
     placed = _ist(29, 16, 0)
     assert not order_expired("NSE_INDEX_OPTION_SELL", placed, _ist(30, 15, 0), None)
-    assert order_expired("NSE_INDEX_OPTION_SELL", placed, _ist(30, 15, 31), None)
+    assert order_expired("NSE_INDEX_OPTION_SELL", placed, _ist(30, 15, 42), None)
 
 
 def test_friday_evening_order_survives_the_weekend():
     placed = _ist(30, 18, 0)
     assert not order_expired("NFO_FUTURE", placed, _ist(31, 16, 0), None)
     assert not order_expired("NFO_FUTURE", placed, _ist(2, 10, 0), None)
-    assert order_expired("NFO_FUTURE", placed, _ist(2, 15, 31), None)
+    assert order_expired("NFO_FUTURE", placed, _ist(2, 15, 42), None)
 
 
 def test_mcx_expires_after_the_mcx_close():
