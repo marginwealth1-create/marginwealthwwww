@@ -573,9 +573,16 @@ async def validate(
     #   • An open position exists with an `opened_at` timestamp we can
     #     compare against.
     # Zero means "no minimum" — opt out per segment.
+    #
+    # The user's own Exit / Close buttons ALSO send is_squareoff=True (from
+    # "WEB") to reuse the close path, so `not is_squareoff` let every app exit
+    # skip both hold timers (30-Oct TJZTD4: 2-min hold set, BTCUSD closed at
+    # 60 s). Exempt only system closes (risk / rollover / admin) and parked
+    # SL/TP legs — those fire later via the poller, not now.
+    user_close = not is_squareoff or (placed_from == "WEB" and order_type == OrderType.MARKET)
     if (
         is_reducing
-        and not is_squareoff
+        and user_close
         and is_expiry_day_now
         and open_position is not None
         and getattr(open_position, "opened_at", None) is not None
@@ -622,7 +629,7 @@ async def validate(
     # squareoff. Zero = feature off.
     if (
         is_reducing
-        and not is_squareoff
+        and user_close
         and open_position is not None
         and getattr(open_position, "opened_at", None) is not None
     ):
