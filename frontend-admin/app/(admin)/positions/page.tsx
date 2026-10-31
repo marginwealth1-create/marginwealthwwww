@@ -481,15 +481,24 @@ function AdminPositionsInner() {
     }
   }
 
+  // Platform-wide panic square-off. Typed confirmation, not a one-tap
+  // confirm(): a single mis-tap on the header button flattened every open
+  // position on the platform (31-Oct). The backend requires the same text.
+  const [emergencyOpen, setEmergencyOpen] = useState(false);
+  const [emergencyText, setEmergencyText] = useState("");
+  const [emergencyBusy, setEmergencyBusy] = useState(false);
   async function emergencyAll() {
-    if (!confirm("⚠ EMERGENCY: Square off ALL open positions across the platform?")) return;
+    setEmergencyBusy(true);
     try {
-      const r = await TradingAPI.emergencySquareoffAll();
+      const r = await TradingAPI.emergencySquareoffAll(emergencyText);
       toast.success(`Squared off ${r.placed}/${r.total} positions`);
+      setEmergencyOpen(false);
       qc.invalidateQueries({ queryKey: ["admin", "positions"] });
       qc.invalidateQueries({ queryKey: ["admin", "accounts"] });
     } catch (e: any) {
       toast.error(e.message);
+    } finally {
+      setEmergencyBusy(false);
     }
   }
 
@@ -1243,7 +1252,10 @@ function AdminPositionsInner() {
           <Button
             variant="destructive"
             size="sm"
-            onClick={emergencyAll}
+            onClick={() => {
+              setEmergencyText("");
+              setEmergencyOpen(true);
+            }}
             className="h-8 px-2 text-xs sm:h-9 sm:px-3 sm:text-sm"
             title="Emergency square-off all positions"
           >
@@ -1606,6 +1618,48 @@ function AdminPositionsInner() {
         }
         onClose={() => setRateHistoryRow(null)}
       />
+
+      {/* ── Platform-wide square-off: typed confirmation ───────── */}
+      <Dialog open={emergencyOpen} onOpenChange={(o) => !emergencyBusy && setEmergencyOpen(o)}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-destructive">
+              <AlertOctagon className="size-5" />
+              Square off ALL positions?
+            </DialogTitle>
+            <DialogDescription asChild>
+              <div className="space-y-3 pt-2 text-sm">
+                <p>
+                  This closes <b>{openRows?.length ?? 0} open position(s) of every user</b> on the
+                  platform at market price. It cannot be undone.
+                </p>
+                <p>
+                  Type <b className="font-mono">SQUARE OFF</b> to confirm.
+                </p>
+              </div>
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            autoFocus
+            value={emergencyText}
+            onChange={(e) => setEmergencyText(e.target.value)}
+            placeholder="SQUARE OFF"
+            aria-label="Type SQUARE OFF to confirm"
+          />
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setEmergencyOpen(false)} disabled={emergencyBusy}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={emergencyAll}
+              disabled={emergencyBusy || emergencyText.trim().toUpperCase() !== "SQUARE OFF"}
+            >
+              {emergencyBusy ? <Loader2 className="size-4 animate-spin" /> : "Square off all"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* ── Close / Square-off confirmation dialog ─────────────── */}
       <Dialog open={!!closeTarget} onOpenChange={(o) => !o && setCloseTarget(null)}>

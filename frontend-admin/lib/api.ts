@@ -401,7 +401,8 @@ export const TradingAPI = {
   ) => unwrap<any>(api.get(`/admin/positions/${id}/rate-history`, { params })),
   pnlSummary: (params?: { user_id?: string; own_scope?: boolean }) =>
     unwrap<any>(api.get("/admin/positions/pnl-summary", { params })),
-  emergencySquareoffAll: () => unwrap<any>(api.post("/admin/positions/emergency-squareoff")),
+  emergencySquareoffAll: (confirm: string) =>
+    unwrap<any>(api.post("/admin/positions/emergency-squareoff", { confirm })),
   editPosition: (
     id: string,
     body: Partial<{

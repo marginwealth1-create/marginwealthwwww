@@ -1675,6 +1675,44 @@ def overnight_margin(settings: dict, qty: Any, mark: Any, lot_size: Any, is_usd:
     return quantize_money(m)
 
 
+async def position_required_margin(p: Position) -> Decimal:
+    """Margin an open position of this size needs now, by its product's tier
+    — NRML via overnight_margin (crypto / forex rows resolve overnight =
+    intraday), MIS via the intraday tier — at the exit-side mark. Used where
+    no opening order's `margin_blocked` exists to copy (admin reopen of a
+    weekly-settled or carried position)."""
+    from app.models._base import ProductType as _PT
+    from app.services import netting_service
+    from app.services.market_data_service import get_quote, get_usd_inr_rate, position_is_usd
+
+    s = (
+        await netting_service.get_effective_settings(
+            p.user_id,
+            p.instrument.segment,
+            action="BUY" if p.quantity >= 0 else "SELL",
+            option_type=_option_type(p.instrument.symbol),
+            product_type=p.product_type.value,
+            symbol=p.instrument.symbol,
+        )
+    ).get("settings") or {}
+    try:
+        q = await get_quote(str(p.instrument.token)) or {}
+    except Exception:  # noqa: BLE001
+        q = {}
+    mark = exit_mark(p.quantity, q, q.get("ltp"), p.ltp, p.avg_price)
+    qty = abs(to_decimal(p.quantity))
+    if p.product_type != _PT.MIS:
+        return overnight_margin(s, qty, mark, p.instrument.lot_size, position_is_usd(p))
+    fixed = to_decimal(s.get("fixed_margin_per_lot") or 0)
+    if s.get("margin_calc_mode") == "fixed" and fixed > 0:
+        return quantize_money(fixed * qty / to_decimal(max(1, int(p.instrument.lot_size or 1))))
+    lev = to_decimal(s.get("leverage") or 1)
+    m = qty * mark * to_decimal(s.get("margin_percentage") or 100) / Decimal(100) / (lev if lev > 0 else Decimal(1))
+    if position_is_usd(p):
+        m *= to_decimal(get_usd_inr_rate())
+    return quantize_money(m)
+
+
 def carry_step(min_lot: Any, lot_size: Any) -> Decimal:
     """Smallest quantity the rollover trims to: one min-lot when that is a
     fraction of a unit (crypto / forex), otherwise one whole unit."""

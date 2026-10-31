@@ -1249,6 +1249,86 @@ async def list_positions(
     return APIResponse(data=out)
 
 
+async def _fill_products(p: Position, lo: datetime, hi: datetime) -> list[str]:
+    """Product books whose fills belong to `p` over [lo, hi]. A carried
+    position was opened as MIS and flipped to NRML at the EOD rollover, so its
+    opening (and pre-rollover partial-close) fills are MIS while the doc says
+    NRML — count those too, unless a separate MIS position on the same token
+    overlaps the window (then they're that position's fills)."""
+    from app.models._base import ProductType as _PT
+
+    products = [p.product_type.value]
+    if p.product_type == _PT.NRML:
+        other = await Position.find_one(
+            {
+                "_id": {"$ne": p.id},
+                "user_id": p.user_id,
+                "instrument.token": p.instrument.token,
+                "product_type": _PT.MIS.value,
+                "opened_at": {"$lte": hi},
+                "$or": [{"closed_at": None}, {"closed_at": {"$gte": lo}}],
+            }
+        )
+        if other is None:
+            products.append(_PT.MIS.value)
+    return products
+
+
+async def _supersede_settlement_pnl(p: Position) -> None:
+    """A WEEKLY_SETTLEMENT close books its P&L as a wallet PNL row (no Trade
+    row), which the P&L card sums directly. Reopen / delete reverse that P&L
+    in the wallet, so flag the row the same way their fills are flagged —
+    otherwise the card kept showing a deleted position's P&L."""
+    if p.close_reason != "WEEKLY_SETTLEMENT":
+        return
+    from app.models.position_settlement import PositionSettlement
+    from app.models.transaction import WalletTransaction as _WTs
+
+    recs = await PositionSettlement.find(PositionSettlement.old_position_id == p.id).to_list()
+    if recs:
+        await _WTs.get_motor_collection().update_many(
+            {"reference_type": "POSITION_SETTLEMENT", "reference_id": {"$in": [str(r.id) for r in recs]}},
+            {"$set": {"superseded_by_reopen": True}},
+        )
+
+
+async def _net_delete_outstanding(user_id: PydanticObjectId) -> None:
+    """A delete's reversal debit that found no free cash (it was locked as
+    margin) is floored to 0 and parked in settlement_outstanding. Net that
+    delete-born due against cash that's free now — e.g. after an open
+    position's margin is released by a later delete in the same cleanup —
+    so balance + due end where the trades never happened (31-Oct V548MQ:
+    ₹12,485 balance with ₹5,060 hidden due instead of ₹7,425). Genuine
+    stop-out shortfall is left untouched."""
+    from app.models.transaction import TransactionType as _TTn, WalletTransaction as _WTn
+    from app.services import wallet_service as _wsn
+    from app.utils.decimal_utils import to_decimal as _tdn
+
+    booked_rows = await _WTn.find(
+        _WTn.user_id == user_id,
+        _WTn.transaction_type == _TTn.SETTLEMENT_OUTSTANDING_BOOKED,
+        {"narration": {"$regex": "^Delete "}},
+    ).to_list()
+    netted_rows = await _WTn.find(
+        _WTn.user_id == user_id,
+        _WTn.transaction_type == _TTn.SETTLEMENT_OUTSTANDING_RECOVERY,
+        {"reference_type": "DELETE_NETTING"},
+    ).to_list()
+    pending = sum((abs(_tdn(r.amount)) for r in booked_rows), _tdn(0)) - sum(
+        (abs(_tdn(r.amount)) for r in netted_rows), _tdn(0)
+    )
+    if pending <= 0:
+        return
+    w = await _wsn.get_or_create(user_id)
+    before = max(_tdn(0), _tdn(w.settlement_outstanding) - pending)
+    await _wsn.net_phantom_settlement(
+        user_id,
+        before,
+        reference_type="DELETE_NETTING",
+        narration="Delete reversal that was parked as due, taken now from freed cash",
+    )
+
+
 def _pos_oid(position_id: str) -> PydanticObjectId:
     """Path ``position_id`` → ObjectId, raising a clean 400 (never a 500) when
     it isn't a real position id. The admin Closed tab's FIFO per-fill view
@@ -1983,6 +2063,11 @@ async def admin_reopen_position(
     except Exception:
         logger.exception("reopen_supersede_trades_failed", extra={"pos_id": str(p.id)})
 
+    try:
+        await _supersede_settlement_pnl(p)
+    except Exception:
+        logger.exception("reopen_supersede_settlement_failed", extra={"pos_id": str(p.id)})
+
     p.status = PositionStatus.OPEN
     p.quantity = opening_qty * sign
     p.closed_at = None
@@ -2045,14 +2130,13 @@ async def admin_reopen_position(
                 # Partial slice of this order's margin.
                 total_margin += order_margin * need / order_qty
                 qty_covered = target_qty
-        if total_margin > 0:
-            p.margin_used = Decimal128(str(total_margin))
-        else:
-            # No opening orders found — set to 0 and let the
-            # downstream `recompute_used_margin` reconcile from the
-            # canonical Position docs. Better to under-block than to
-            # accidentally double-lock notional.
-            p.margin_used = Decimal128("0")
+        if total_margin <= 0:
+            # No matching opening order — a weekly-settlement reopen or a
+            # carried (MIS→NRML) position has none for its product. Price it
+            # with the platform's own margin formula instead of leaving 0
+            # (31-Oct: 9 reopened positions sat open with ₹0 margin).
+            total_margin = await _ps.position_required_margin(p)
+        p.margin_used = Decimal128(str(total_margin))
     except Exception:  # pragma: no cover
         # Defensive — never let a margin recompute failure block the
         # reopen itself. The next reconcile pass cleans up.
@@ -2370,6 +2454,7 @@ async def positions_pnl_summary(
             "transaction_type": _TT.PNL.value,
             "reference_type": "POSITION_SETTLEMENT",
             "created_at": {"$gte": window_start},
+            "superseded_by_reopen": {"$ne": True},
         }
         if window_end is not None:
             settle_q["created_at"]["$lt"] = window_end
@@ -2856,6 +2941,49 @@ async def delete_position(
                 await wallet_service.release_margin(user_id, margin_locked)
         except Exception:
             pass
+
+        # Partial closes already booked P&L + brokerage, and the opening fills
+        # paid brokerage. A delete leaves no trace, so reverse those too
+        # (31-Oct V548MQ: a deleted open KPITTECH kept its rollover partial
+        # close's -₹6,519.82 and that closed row could never be deleted).
+        from datetime import timedelta as _td_open
+        from app.models.trade import Trade as _TradeOpenDel
+        from app.utils.time_utils import now_utc as _now_open
+
+        _olo = (p.opened_at or _now_open()) - _td_open(seconds=5)
+        _fills = await _TradeOpenDel.find(
+            {
+                "user_id": p.user_id,
+                "instrument.token": p.instrument.token,
+                "product_type": {"$in": await _fill_products(p, _olo, _now_open())},
+                "executed_at": {"$gte": _olo},
+                "superseded_by_reopen": {"$ne": True},
+            }
+        ).to_list()
+        open_charges = sum(
+            (to_decimal(t.total_charges or t.brokerage or 0) for t in _fills), _Decimal("0")
+        )
+        cash_refund = realized - open_charges
+        if cash_refund != _Decimal("0"):
+            try:
+                await wallet_service.adjust(
+                    user_id,
+                    -cash_refund,
+                    transaction_type=TransactionType.REVERSAL,
+                    narration=(
+                        f"Delete {p.instrument.symbol} (open) — reverse partial-close P&L "
+                        f"₹{realized} + brokerage ₹{open_charges} (deleted by {admin.user_code})"
+                    ),
+                    reference_type="Position",
+                    reference_id=str(p.id),
+                    actor_id=admin.id,
+                )
+                reversed_amount = realized
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Wallet reversal failed; position not deleted: {e}",
+                )
     else:
         # ── Full wallet reversal for closed position ─────────────────
         # The close booked up to THREE wallet debits that must all be
@@ -3002,7 +3130,7 @@ async def delete_position(
                     {
                         "user_id": p.user_id,
                         "instrument.token": p.instrument.token,
-                        "product_type": p.product_type.value,
+                        "product_type": {"$in": await _fill_products(p, _olo, _ohi)},
                         "pnl_inr": None,  # opening fills carry no realized P&L
                         "executed_at": {"$gte": _olo, "$lte": _ohi},
                     }
@@ -3060,15 +3188,19 @@ async def delete_position(
         from datetime import timedelta as _td_sup
         from app.models.trade import Trade as _TradeSup
         from app.models.order import Order as _OrderSup
+        from app.utils.time_utils import now_utc as _now_sup
+
         _lo = (p.opened_at or p.closed_at)
-        if p.closed_at is not None and _lo is not None:
+        _hi = p.closed_at or _now_sup()  # OPEN delete: every fill up to now
+        await _supersede_settlement_pnl(p)
+        if _lo is not None:
             _sup_q: dict[str, Any] = {
                 "user_id": p.user_id,
                 "instrument.token": p.instrument.token,
-                "product_type": p.product_type.value,
+                "product_type": {"$in": await _fill_products(p, _lo - _td_sup(seconds=5), _hi)},
                 "executed_at": {
                     "$gte": _lo - _td_sup(seconds=5),
-                    "$lte": p.closed_at + _td_sup(seconds=3),
+                    "$lte": _hi + _td_sup(seconds=3),
                 },
             }
             # Collect the fills' parent orders BEFORE flagging, so we can wipe
@@ -3127,6 +3259,10 @@ async def delete_position(
         await _ws.recompute_used_margin(user_id)
     except Exception:
         pass
+    try:
+        await _net_delete_outstanding(user_id)
+    except Exception:
+        logger.exception("delete_net_outstanding_failed", extra={"user_id": str(user_id)})
 
     # Audit trail. The OPEN-delete path is a sharper edge than a
     # closed-row delete (it releases locked margin without a closing
@@ -3302,13 +3438,24 @@ async def reconcile_trackers(admin: SuperAdmin):
     return APIResponse(data={"ok": True, **summary})
 
 
+class EmergencySquareoffRequest(BaseModel):
+    confirm: str = ""
+
+
 @router.post("/positions/emergency-squareoff", response_model=APIResponse[dict])
-async def emergency_squareoff_all(admin: SuperAdmin):
+async def emergency_squareoff_all(admin: SuperAdmin, payload: EmergencySquareoffRequest | None = None):
     """Panic button — squares off every open position across the platform.
 
     Super-admin only: this is a platform-wide kill switch and must not be
-    available to scoped sub-admins.
+    available to scoped sub-admins. The caller must send
+    ``{"confirm": "SQUARE OFF"}`` — one mis-tap on the header button
+    flattened all 29 open positions on 31-Oct.
     """
+    if (payload.confirm if payload else "").strip().upper() != "SQUARE OFF":
+        raise HTTPException(
+            status_code=400,
+            detail="Type SQUARE OFF to confirm squaring off every open position on the platform",
+        )
     rows = await Position.find(Position.status == PositionStatus.OPEN).to_list()
     # Snapshot each affected user's settlement_outstanding BEFORE flattening
     # anything, so the post-batch close-ordering correction nets only the

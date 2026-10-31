@@ -1030,6 +1030,9 @@ async def release_margin(user_id: str | PydanticObjectId, amount: Decimal | floa
 async def net_phantom_settlement(
     user_id: str | PydanticObjectId,
     settlement_before: Decimal | float | int | str,
+    *,
+    reference_type: str = "STOP_OUT",
+    narration: str | None = None,
 ) -> WalletTransaction | None:
     """Reverse close-ordering *phantom* settlement after a multi-position
     force-close (stop-out).
@@ -1102,8 +1105,9 @@ async def net_phantom_settlement(
         amount=Decimal128(str(-recover)),
         balance_before=Decimal128(str(avail)),
         balance_after=Decimal128(str(new_avail)),
-        reference_type="STOP_OUT",
-        narration=(
+        reference_type=reference_type,
+        narration=narration
+        or (
             f"Phantom settlement ₹{recover} netted against margin freed in the "
             f"same stop-out close (close-ordering correction)"
         ),
