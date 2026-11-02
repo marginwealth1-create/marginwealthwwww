@@ -1066,6 +1066,14 @@ async def net_phantom_settlement(
     the exact race that let the phantom survive uncorrected before.
     """
     sb = to_decimal(settlement_before)
+    # Release any margin still locked for positions that are already gone
+    # before netting, or the due survives next to cash a later reconcile
+    # frees (2-Nov 4WDYC6: ₹546.88 came back minutes after the stop-out's
+    # netting ran, leaving ₹382.46 phantom due beside it).
+    try:
+        await recompute_used_margin(user_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("net_phantom_reconcile_failed user=%s", user_id)
     coll = Wallet.get_motor_collection()
     avail = outstanding = recover = new_avail = new_out = ZERO
     for _ in range(8):

@@ -111,6 +111,8 @@ _rest_call_in_progress: bool = False
 # price (which persists) is accepted after 3 ticks (~0.75 s).
 _OUTLIER_TICK_PCT = Decimal("0.35")   # >35% one-tick jump from last-good = suspect
 _OUTLIER_CONFIRM_TICKS = 3            # consecutive ticks before a suspect is accepted
+# Close-brokerage estimate per position: pos_id -> (qty, monotonic ts, ₹).
+_close_brk_cache: dict[str, tuple[float, float, Decimal]] = {}
 _last_good_ltp: dict[str, float] = {}              # token -> last accepted LTP
 _outlier_pending: dict[str, tuple[float, int]] = {}  # token -> (suspect price, count)
 
@@ -799,10 +801,13 @@ async def _enforce_for_user(
             return Decimal("0")
         try:
             close_action = _OA.SELL if p.quantity > 0 else _OA.BUY
+            from app.services.position_service import _option_type
+
             netting = await netting_service.get_effective_settings(
                 user.id,
                 p.instrument.segment,
                 action=close_action.value,
+                option_type=_option_type(p.instrument.symbol),
                 product_type=p.product_type.value,
                 symbol=p.instrument.symbol,
             )
@@ -850,7 +855,27 @@ async def _enforce_for_user(
     # now decide stop-out on the raw floating loss alone. Effect: a stop-out
     # fires a hair LATER (by brokerage's share of balance) — conservative and
     # safe; the close still charges full brokerage when it actually fires.
+    #
+    # Re-added (2-Nov): the close brokerage IS part of what a stop-out books —
+    # options pay ₹100/lot on the close — and without it books stopped at
+    # 85–92% still crossed 100% at the close and parked the rest as due
+    # (4WDYC6 ₹626, S4UZTU ₹186, X4P3CE ₹123). Cheap now: we only get here
+    # once the raw loss is past the lowest threshold (fast exit above), and
+    # each position's estimate is cached for 60 s.
     estimated_close_brokerage = Decimal("0")
+    _now_brk = time.monotonic()
+    if len(_close_brk_cache) > 5000:
+        _close_brk_cache.clear()
+    for p in open_positions:
+        if not p.quantity:
+            continue
+        _hit = _close_brk_cache.get(str(p.id))
+        if _hit and _hit[0] == float(p.quantity) and _now_brk - _hit[1] < 60:
+            estimated_close_brokerage += _hit[2]
+            continue
+        _v = await _estimate_one(p)
+        _close_brk_cache[str(p.id)] = (float(p.quantity), _now_brk, _v)
+        estimated_close_brokerage += _v
 
     # Stop-out: floating loss as % of total balance.
     #
