@@ -170,7 +170,8 @@ export function DepositsPanel() {
         // 21-May). Surface the dues figure as a passive informational
         // chip without the "will be recovered" tooltip that promised
         // auto-deduction the backend no longer does.
-        const settlement = Number(r.user_settlement_outstanding ?? 0);
+        // Settlement (outstanding) isn't shown to admins (operator).
+        const settlement = 0;
         if (settlement <= 0) return formatINR(r.amount);
         return (
           <div className="flex flex-col items-end leading-tight">
@@ -499,7 +500,7 @@ function DepositMobileCard({
   const isPending = r.status === "PENDING";
   const isApproved = r.status === "APPROVED";
   const isRejected = r.status === "REJECTED";
-  const settlement = Number(r.user_settlement_outstanding ?? 0);
+  const settlement = 0; // settlement (outstanding) hidden from admins (operator)
 
   // Color the left edge of the card by status so an operator can scan
   // a long list and instantly spot PENDING vs APPROVED vs REJECTED.
