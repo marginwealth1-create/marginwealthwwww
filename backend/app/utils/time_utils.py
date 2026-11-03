@@ -87,7 +87,8 @@ def add_business_days(d: date, n: int) -> date:
 # firing / risk-EOD) — NEW order acceptance is gated by live-feed staleness,
 # so moving these does not open a stale-price trading window.
 NSE_BSE_CLOSE: time = time(15, 41)  # operator: market close + CF rollover
-MCX_CLOSE: time = time(23, 40)
+MCX_CLOSE: time = time(23, 55)  # operator 2026-11-03; also order_validator, user positions exit
+# guard, zerodha _feed_expected_now, frontend-user lib/marketHours.ts — change together
 # Session OPEN times — symmetric to the close times above. Needed so the
 # risk enforcer recognises the PRE-OPEN window (weekday midnight → open)
 # as "market closed". Without these, is_after_close() alone returns False

@@ -1329,11 +1329,12 @@ async def validate(
             from app.core.config import settings as cfg
 
             if is_mcx:
-                # MCX: 09:00 – 23:30 IST (winter) / 23:55 IST (summer evening session)
-                # We use a generous 09:00 – 23:30 window.
+                # MCX: 09:00 – 23:55 IST (operator-set; = time_utils.MCX_CLOSE).
+                # The live-tick freshness gate below still blocks once the real
+                # feed stops (winter close 23:30).
                 from datetime import time as _t
 
-                if not (_t(9, 0) <= ist.time() <= _t(23, 30)):
+                if not (_t(9, 0) <= ist.time() <= _t(23, 55)):
                     raise MarketClosedError("MCX is closed. Place AMO instead.")
             else:
                 # NSE / BSE equities + F&O: 09:15 – MARKET_CLOSE_TIME (15:41) IST

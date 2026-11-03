@@ -2783,7 +2783,7 @@ class ZerodhaService:
             n = now_ist()
             if is_weekend(n.date()):
                 return False
-            return _dtime(9, 0) <= n.time() <= _dtime(23, 30)
+            return _dtime(9, 0) <= n.time() <= _dtime(23, 55)  # MCX close (time_utils.MCX_CLOSE)
         except Exception:
             return True  # fail-safe: keep the tick check active
 

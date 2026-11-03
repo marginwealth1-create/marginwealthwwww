@@ -112,7 +112,7 @@ def _is_segment_market_open_now(segment_type: str | None) -> bool:
         return False
     mins = now2.hour * 60 + now2.minute
     if seg.startswith("MCX"):
-        return 9 * 60 <= mins <= 23 * 60 + 30
+        return 9 * 60 <= mins <= 23 * 60 + 55  # = time_utils.MCX_CLOSE
     # NSE / BSE equity + F&O fallback
     return 9 * 60 + 15 <= mins <= 15 * 60 + 30
 

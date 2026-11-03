@@ -416,7 +416,7 @@ export class CustomDatafeed {
       // MCX metals/energy trade till 11:30 PM IST — use extended MCX session.
       const exch = (inst.exchange || "").toUpperCase();
       const isMCX = exch === "MCX";
-      const indianSession = isMCX ? "0900-2330:23456" : "0915-1530:23456";
+      const indianSession = isMCX ? "0900-2355:23456" : "0915-1530:23456";
       onResolve({
         name: inst.symbol,
         description: inst.name || inst.symbol,
