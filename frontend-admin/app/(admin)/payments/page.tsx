@@ -46,8 +46,7 @@ const TABS: TabDef[] = [
   // settlement_outstanding (the auto-mode flow lives in wallet_service).
   // Reuses the `deposits` permission key — same operator group already
   // owns the cash-flow approvals queue.
-  // Settlement Requests tab hidden (operator: no settlement anywhere; no user
-  // runs auto_settlement = false). Panel stays wired below for re-enabling.
+  { id: "settlements", label: "Settlement Requests", description: "Pending settlements from auto-OFF users awaiting admin approval. Approve floors the balance to ₹0 and books the shortfall.", perm: "deposits" },
   { id: "history", label: "History", description: "Unified ledger of every deposit and withdrawal across all users — filterable by type, status, user or UTR." },
   { id: "rejected", label: "Rejected", description: "Read-only history of all rejected deposits and withdrawals with the reason given." },
   { id: "banks", label: "Bank Accounts", description: "Bank accounts, UPI IDs and QR codes shown to users on the deposit form.", perm: "banks" },

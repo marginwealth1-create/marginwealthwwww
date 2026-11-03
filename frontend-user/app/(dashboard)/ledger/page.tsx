@@ -22,8 +22,7 @@ type LedgerRow = {
 };
 
 // The user ledger is deliberately restricted to real cash movements the user
-// made — Deposit and Withdrawal. Settlement (outstanding) rows are hidden from
-// users per the operator; they're still recorded and shown to admins. Everything
+// made — Deposit, Withdrawal, and Settlement (booked + recovered). Everything
 // else (Trade, Brokerage / Charges, Realised P&L, P&L-sharing, Adjustment,
 // Bonus, …) is hidden per the operator: the ledger is a money-in / money-out /
 // settlement record, NOT a trade or P&L statement. The summary tiles (opening /
@@ -31,6 +30,8 @@ type LedgerRow = {
 const VISIBLE_TYPES = new Set<string>([
   "DEPOSIT",
   "WITHDRAWAL",
+  "SETTLEMENT_OUTSTANDING_BOOKED",
+  "SETTLEMENT_OUTSTANDING_RECOVERY",
   // Admin manual wallet changes — the backend relabels these to
   // "Deposit by admin" / "Withdrawal by admin" by direction.
   "ADJUSTMENT",
@@ -78,7 +79,7 @@ export default function UserLedgerPage() {
       <PageHeader
         back
         title="Ledger"
-        description={`${visibleRows.length} ${visibleRows.length === 1 ? "entry" : "entries"} — deposits & withdrawals`}
+        description={`${visibleRows.length} ${visibleRows.length === 1 ? "entry" : "entries"} — deposits, withdrawals & settlements`}
       />
 
       {isFetching && !data ? (
@@ -87,7 +88,7 @@ export default function UserLedgerPage() {
         </div>
       ) : pagedRows.length === 0 ? (
         <div className="rounded-lg border border-border p-8 text-center text-xs text-muted-foreground">
-          No deposits or withdrawals yet.
+          No deposits, withdrawals or settlements yet.
         </div>
       ) : (
         <>
