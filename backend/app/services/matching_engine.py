@@ -622,53 +622,74 @@ async def execute_market_order(
     if freed_margin > 0:
         await wallet_service.release_margin(order.user_id, freed_margin)
 
-    await wallet_service.adjust(
-        order.user_id,
-        -charges.total,
-        transaction_type=TransactionType.CHARGES,
-        narration=f"Charges for {order.action.value} {order.instrument.symbol} x{order.quantity}",
-        reference_type="ORDER",
-        reference_id=str(order.id),
-    )
-
-    # Realized P&L (signed, INR, already FX-converted for USD segments
-    # at line ~200) — credited on closing fills only. Uses `raw_pnl_inr_dec`
-    # (NOT the brokerage-folded `pnl_inr_dec`) because the closing-leg
-    # brokerage is already debited separately via the CHARGES line above —
-    # using `pnl_inr_dec` here would double-debit it. `pnl_inr_dec` is
-    # kept only for `Trade.pnl_inr` (History tab display).
-    if raw_pnl_inr_dec is not None and raw_pnl_inr_dec != 0:
-        pnl_narration = (
-            f"Realized {'profit' if raw_pnl_inr_dec > 0 else 'loss'} "
-            f"on {order.instrument.symbol} close"
+    async def _book_charges() -> None:
+        await wallet_service.adjust(
+            order.user_id,
+            -charges.total,
+            transaction_type=TransactionType.CHARGES,
+            narration=f"Charges for {order.action.value} {order.instrument.symbol} x{order.quantity}",
+            reference_type="ORDER",
+            reference_id=str(order.id),
+            draw_margin=True,
         )
-        try:
-            await wallet_service.adjust(
-                order.user_id,
-                raw_pnl_inr_dec,
-                transaction_type=TransactionType.PNL,
-                narration=pnl_narration,
-                reference_type="ORDER",
-                reference_id=str(order.id),
+
+    async def _book_pnl() -> None:
+        # Realized P&L (signed, INR, already FX-converted for USD segments
+        # at line ~200) — credited on closing fills only. Uses `raw_pnl_inr_dec`
+        # (NOT the brokerage-folded `pnl_inr_dec`) because the closing-leg
+        # brokerage is already debited separately via the CHARGES line above —
+        # using `pnl_inr_dec` here would double-debit it. `pnl_inr_dec` is
+        # kept only for `Trade.pnl_inr` (History tab display).
+        if raw_pnl_inr_dec is not None and raw_pnl_inr_dec != 0:
+            pnl_narration = (
+                f"Realized {'profit' if raw_pnl_inr_dec > 0 else 'loss'} "
+                f"on {order.instrument.symbol} close"
             )
-        except InsufficientFundsError:
-            # Forced-close path (risk_enforcer stop-out, auto-squareoff): the
-            # position MUST close even if the realized loss exceeds available
-            # balance + credit_limit. Fall back to `force_debit` which debits
-            # what we can and books the overflow to `settlement_outstanding`.
-            # Voluntary user closes (`is_squareoff` falsy) keep raising so the
-            # user can't silently rack up dues from their own actions.
-            if getattr(order, "is_squareoff", False) and raw_pnl_inr_dec < 0:
-                await wallet_service.force_debit(
+            try:
+                await wallet_service.adjust(
                     order.user_id,
-                    -raw_pnl_inr_dec,
+                    raw_pnl_inr_dec,
                     transaction_type=TransactionType.PNL,
-                    narration=f"{pnl_narration} (stop-out: shortfall booked to outstanding)",
+                    narration=pnl_narration,
                     reference_type="ORDER",
                     reference_id=str(order.id),
+                    draw_margin=True,
                 )
-            else:
-                raise
+            except InsufficientFundsError:
+                # Forced-close path (risk_enforcer stop-out, auto-squareoff): the
+                # position MUST close even if the realized loss exceeds available
+                # balance + credit_limit. Fall back to `force_debit` which debits
+                # what we can and books the overflow to `settlement_outstanding`.
+                # Voluntary user closes (`is_squareoff` falsy) keep raising so the
+                # user can't silently rack up dues from their own actions.
+                if getattr(order, "is_squareoff", False) and raw_pnl_inr_dec < 0:
+                    await wallet_service.force_debit(
+                        order.user_id,
+                        -raw_pnl_inr_dec,
+                        transaction_type=TransactionType.PNL,
+                        narration=f"{pnl_narration} (stop-out: shortfall booked to outstanding)",
+                        reference_type="ORDER",
+                        reference_id=str(order.id),
+                    )
+                else:
+                    raise
+
+    # A profit lands before its own close brokerage is debited, so a
+    # profitable close never books a due for the charge (3-Nov X4P3CE
+    # BAJAJFINSV: ₹906 "unpaid brokerage" a second before +₹3,150 profit).
+    if raw_pnl_inr_dec is not None and raw_pnl_inr_dec > 0:
+        await _book_pnl()
+        await _book_charges()
+    else:
+        await _book_charges()
+        await _book_pnl()
+
+    # A due this (or an earlier) non-stop-out fill booked only because cash was
+    # locked as margin elsewhere is netted as soon as cash is free again.
+    try:
+        await wallet_service.net_fill_dues(order.user_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("net_fill_dues_failed", extra={"user_id": str(order.user_id)})
 
     return trade
 
