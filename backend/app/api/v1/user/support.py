@@ -221,6 +221,14 @@ async def get_promo_button(user: CurrentUser):
     )
 
 
+@router.get("/market-hours", response_model=APIResponse[dict])
+async def get_market_hours_for_user():
+    """Return the active market-wise trading hours (IST) configured by admin."""
+    from app.services.market_hours_service import get_market_hours
+
+    return APIResponse(data={"hours": await get_market_hours()})
+
+
 @router.get("", response_model=APIResponse[dict])
 async def get_support_contacts(user: CurrentUser):
     """Returns the effective WhatsApp + email for THIS user. WhatsApp

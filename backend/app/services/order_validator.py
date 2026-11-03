@@ -1281,18 +1281,24 @@ async def validate(
     # authenticated, scope-checked operator action, unlike a user's WEB order
     # which stays gated (the stale-price fairness guard below is for USERS).
     _is_admin_placed = (placed_from or "WEB").upper() == "ADMIN"
+    if not is_amo and not _is_force_close and not _is_admin_placed:
+        ist = now_ist()
+        from app.services.market_hours_service import (
+            get_market_hours,
+            is_market_open_by_config,
+        )
+
+        _mh_map = await get_market_hours()
+        _mh_open, _mh_msg = is_market_open_by_config(
+            _mh_map, segment_type, exch_upper, ist
+        )
+        if not _mh_open:
+            raise MarketClosedError(_mh_msg)
+
     if not is_amo and not is_24x7 and not _is_force_close and not _is_admin_placed:
         ist = now_ist()
 
-        # 24×5 (forex / metals / energy): closed only on weekends (Sat full-day;
-        # Sun close before 17:30 ET ≈ 03:00 IST Mon)
-        if is_24x5:
-            wd = ist.weekday()  # Mon=0 ... Sun=6
-            if wd == 5 or (wd == 6 and ist.hour < 4):
-                raise MarketClosedError("Forex market is closed for the weekend.")
-        else:
-            if is_weekend(ist.date()):
-                raise MarketClosedError("Market is closed (weekend). Place AMO instead.")
+        if not is_24x5:
             # holiday lookup (only Indian exchanges)
             h = await TradingHoliday.find_one(
                 TradingHoliday.holiday_date == ist.date(),
@@ -1325,23 +1331,6 @@ async def validate(
                     raise MarketClosedError(
                         f"{h.description}: session closed at {h.close_time} IST."
                     )
-
-            from app.core.config import settings as cfg
-
-            if is_mcx:
-                # MCX: 09:00 – 23:55 IST (operator-set; = time_utils.MCX_CLOSE).
-                # The live-tick freshness gate below still blocks once the real
-                # feed stops (winter close 23:30).
-                from datetime import time as _t
-
-                if not (_t(9, 0) <= ist.time() <= _t(23, 55)):
-                    raise MarketClosedError("MCX is closed. Place AMO instead.")
-            else:
-                # NSE / BSE equities + F&O: 09:15 – MARKET_CLOSE_TIME (15:41) IST
-                open_t = parse_hhmm(cfg.MARKET_OPEN_TIME)
-                close_t = parse_hhmm(cfg.MARKET_CLOSE_TIME)
-                if not (open_t <= ist.time() <= close_t):
-                    raise MarketClosedError("Market is closed. Place AMO instead.")
 
         # ── 11a-2) Open settle-buffer (stale-first-tick protection) ──────
         # We're confirmed in-session above (not weekend/holiday, inside the

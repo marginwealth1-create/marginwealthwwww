@@ -1118,6 +1118,26 @@ export const SettingsAPI = {
   getCarryToggle: () => unwrap<{ enabled: boolean }>(api.get("/admin/settings/carry-forward-toggle")),
   setCarryToggle: (enabled: boolean) =>
     unwrap<{ enabled: boolean }>(api.put("/admin/settings/carry-forward-toggle", { enabled })),
+  // Market-wise trading hours (IST).
+  getMarketHours: () =>
+    unwrap<{
+      hours: Record<
+        string,
+        { enabled: boolean; start: string; end: string; days: string }
+      >;
+    }>(api.get("/admin/settings/market-hours")),
+  setMarketHours: (
+    hours: Record<
+      string,
+      { enabled: boolean; start: string; end: string; days: string }
+    >,
+  ) =>
+    unwrap<{
+      hours: Record<
+        string,
+        { enabled: boolean; start: string; end: string; days: string }
+      >;
+    }>(api.put("/admin/settings/market-hours", { hours })),
   // Weekly mark-to-market settlement engine (super-admin only).
   weeklySettlementRun: () =>
     unwrap<{ week_key?: string; batch_id?: string; total?: number; settled?: number; skipped?: number; failed?: number; skipped_reason?: string }>(

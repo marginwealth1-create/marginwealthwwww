@@ -1,79 +1,180 @@
 /**
- * Frontend market-hours guard — used so the UI doesn't fire close / new
- * orders when the backend will obviously reject them with MARKET_CLOSED.
- *
- * Why: previously, clicking "Close" on a position outside market hours
- * triggered the same optimistic-remove pipeline as any other close — the
- * row disappeared for ~1 s, then the backend rejected and the row came
- * back with a tiny error toast. Traders kept thinking the close worked
- * for a moment and then "got reversed." Pre-checking here means we show
- * one clear "Market is closed" message and the position stays put.
- *
- * Segment hours mirror the backend's `app/utils/time_utils.py` schedule.
- * If the backend ever queues after-hours closes as AMO orders, flip the
- * relevant branch to `true` here.
+ * Frontend market-hours guard — backed by the admin-configured Market Trading
+ * Hours (`GET /api/v1/user/support/market-hours`) so any change made in
+ * Admin → Platform Settings → Market Trading Hours is enforced immediately
+ * when a user places or closes a trade.
  */
+
+import { API_URL } from "@/lib/constants";
+
+export type MarketKey = "NSE" | "BSE" | "MCX" | "FOREX" | "CRYPTO";
+
+export interface MarketHourEntry {
+  enabled: boolean;
+  start: string;
+  end: string;
+  days: string;
+}
+
+export type MarketHoursMap = Record<MarketKey, MarketHourEntry>;
+
+export const DEFAULT_MARKET_HOURS: MarketHoursMap = {
+  NSE: {
+    enabled: true,
+    start: "09:15",
+    end: "15:30",
+    days: "Mon - Fri",
+  },
+  BSE: {
+    enabled: true,
+    start: "09:15",
+    end: "15:30",
+    days: "Mon - Fri",
+  },
+  MCX: {
+    enabled: true,
+    start: "09:00",
+    end: "23:55",
+    days: "Mon - Fri",
+  },
+  FOREX: {
+    enabled: true,
+    start: "00:00",
+    end: "23:59",
+    days: "Mon - Fri",
+  },
+  CRYPTO: {
+    enabled: true,
+    start: "00:00",
+    end: "23:59",
+    days: "24/7 (Mon - Sun)",
+  },
+};
+
+const STORAGE_KEY = "mw.market_hours";
+let _hoursCache: MarketHoursMap = { ...DEFAULT_MARKET_HOURS };
+let _lastFetchMs = 0;
+let _inFlight: Promise<MarketHoursMap> | null = null;
+const _FETCH_INTERVAL_MS = 15_000;
+
+function _mergeHours(raw: unknown): MarketHoursMap {
+  const out: MarketHoursMap = {
+    NSE: { ...DEFAULT_MARKET_HOURS.NSE },
+    BSE: { ...DEFAULT_MARKET_HOURS.BSE },
+    MCX: { ...DEFAULT_MARKET_HOURS.MCX },
+    FOREX: { ...DEFAULT_MARKET_HOURS.FOREX },
+    CRYPTO: { ...DEFAULT_MARKET_HOURS.CRYPTO },
+  };
+  if (!raw || typeof raw !== "object") return out;
+  const r = raw as Record<string, any>;
+  (Object.keys(out) as MarketKey[]).forEach((k) => {
+    const item = r[k];
+    if (item && typeof item === "object") {
+      out[k] = {
+        enabled: item.enabled !== undefined ? Boolean(item.enabled) : out[k].enabled,
+        start: typeof item.start === "string" && item.start.includes(":") ? item.start : out[k].start,
+        end: typeof item.end === "string" && item.end.includes(":") ? item.end : out[k].end,
+        days: typeof item.days === "string" && item.days ? item.days : out[k].days,
+      };
+    }
+  });
+  return out;
+}
+
+if (typeof window !== "undefined") {
+  try {
+    const saved = window.localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      _hoursCache = _mergeHours(JSON.parse(saved));
+    }
+  } catch {
+    // ignore storage read errors
+  }
+}
+
+export async function refreshMarketHours(force = false): Promise<MarketHoursMap> {
+  if (typeof window === "undefined") return _hoursCache;
+  const now = Date.now();
+  if (!force && now - _lastFetchMs < _FETCH_INTERVAL_MS) {
+    return _hoursCache;
+  }
+  if (_inFlight) return _inFlight;
+  _inFlight = (async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/v1/user/support/market-hours`, {
+        method: "GET",
+        cache: "no-store",
+      });
+      if (res.ok) {
+        const json = await res.json();
+        const raw = json?.data?.hours ?? json?.hours;
+        if (raw) {
+          _hoursCache = _mergeHours(raw);
+          _lastFetchMs = Date.now();
+          try {
+            window.localStorage.setItem(STORAGE_KEY, JSON.stringify(_hoursCache));
+          } catch {
+            // ignore storage write errors
+          }
+        }
+      }
+    } catch {
+      // keep existing cache on transient network error
+    } finally {
+      _inFlight = null;
+    }
+    return _hoursCache;
+  })();
+  return _inFlight;
+}
+
+if (typeof window !== "undefined") {
+  void refreshMarketHours(true);
+  window.addEventListener("focus", () => {
+    void refreshMarketHours(true);
+  });
+  setInterval(() => {
+    void refreshMarketHours(false);
+  }, _FETCH_INTERVAL_MS);
+}
 
 /** Minutes since IST midnight for the given JS Date (no tz library needed). */
 function _istMinutes(date: Date): number {
-  // toLocaleString → "Asia/Kolkata" gives us H:M without DST headaches.
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Asia/Kolkata",
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
   }).formatToParts(date);
-  const h = Number(parts.find((p) => p.type === "hour")?.value ?? "0");
+  const h = Number(parts.find((p) => p.type === "hour")?.value ?? "0") % 24;
   const m = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
   return h * 60 + m;
 }
 
-/** IST day-of-week (0 = Sun, 6 = Sat). */
+/** IST day-of-week (0 = Sun, 1 = Mon, ..., 5 = Fri, 6 = Sat). */
 function _istDay(date: Date): number {
-  // `getDay()` on a UTC date returns UTC weekday — for IST we shift the
-  // epoch forward by 5h30m, then read it back as a UTC weekday. Avoids
-  // tz-aware Date construction.
   const ist = new Date(date.getTime() + (5 * 60 + 30) * 60_000);
   return ist.getUTCDay();
 }
 
-/**
- * Returns true when the segment's exchange is currently accepting trades.
- *
- * `segment_type` is the canonical Position.segment_type value the backend
- * sends; `exchange` is a fallback when segment_type is empty (legacy
- * positions). Both are uppercased before matching.
- */
-export function isInstrumentMarketOpen(
+function _parseHhMm(hhmm: string, fallbackMin: number): number {
+  const parts = (hhmm || "").trim().split(":");
+  if (parts.length < 2) return fallbackMin;
+  const h = Number(parts[0]);
+  const m = Number(parts[1]);
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return fallbackMin;
+  return h * 60 + m;
+}
+
+export function resolveMarketKey(
   segmentType?: string | null,
   exchange?: string | null,
-  now: Date = new Date(),
-): boolean {
+): MarketKey {
   const seg = (segmentType || "").toUpperCase();
   const exch = (exchange || "").toUpperCase();
-  const min = _istMinutes(now);
-  const day = _istDay(now);
-  const weekday = day !== 0 && day !== 6;
-
-  // Crypto trades 24/7. AllTick/Infoway feed never closes, the matching
-  // engine accepts orders at any time.
-  if (seg.includes("CRYPTO") || exch === "CRYPTO" || exch === "BINANCE") return true;
-
-  // International FX / spot metals (XAUUSD, XAGUSD…) / energy / global
-  // equities / indices — all Infoway-mirrored and trade on the OTC forex
-  // clock, which is anchored to New York time and DST-aware: the market
-  // runs Sun 17:00 ET → Fri 17:00 ET with a daily 17:00–18:00 ET
-  // maintenance break. We compute ET DIRECTLY (not a hard-coded IST
-  // offset) so summer/winter DST never drifts. In IST this lands as
-  // ~Mon 03:30 → Sat 02:30 with a ~02:30–03:30 daily break in summer,
-  // shifting +1h in winter — handled automatically.
-  //
-  // Prior bug this replaces: the WHOLE of Saturday (IST) was treated as
-  // closed from midnight, but Friday's session actually runs until
-  // ~02:30 IST Saturday — so a trader holding XAUUSD at ~01:00 IST
-  // Saturday could NOT close a live, in-profit position (the market was
-  // still open). The ET clock fixes that exactly, and also stops the old
-  // wrong "open" it showed on Sunday evenings IST.
+  if (seg.includes("CRYPTO") || exch === "CRYPTO" || exch === "BINANCE") {
+    return "CRYPTO";
+  }
   if (
     seg === "FOREX" ||
     seg === "STOCKS" ||
@@ -81,46 +182,69 @@ export function isInstrumentMarketOpen(
     seg === "COMMODITIES" ||
     seg.includes("FOREX") ||
     seg.includes("FX") ||
+    seg.startsWith("CDS") ||
     exch === "CDS"
   ) {
-    const etParts = new Intl.DateTimeFormat("en-GB", {
-      timeZone: "America/New_York",
-      weekday: "short",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    }).formatToParts(now);
-    const etDay = etParts.find((p) => p.type === "weekday")?.value ?? "";
-    // en-GB can render midnight as "24" — normalise to 0 so 00:00–00:59 ET
-    // isn't mis-bucketed.
-    const etH = Number(etParts.find((p) => p.type === "hour")?.value ?? "0") % 24;
-    const etM = Number(etParts.find((p) => p.type === "minute")?.value ?? "0");
-    const etMin = etH * 60 + etM;
-    const CLOSE = 17 * 60; // 17:00 ET — daily close + Friday weekly close
-    const REOPEN = 18 * 60; // 18:00 ET — daily reopen (also Sunday open)
-    if (etDay === "Sat") return false; // weekend — fully closed
-    if (etDay === "Sun") return etMin >= CLOSE; // reopens Sun 17:00 ET
-    if (etDay === "Fri") return etMin < CLOSE; // weekly close Fri 17:00 ET
-    // Mon–Thu: open except the 17:00–18:00 ET daily maintenance break.
-    return !(etMin >= CLOSE && etMin < REOPEN);
+    return "FOREX";
   }
-
-  // MCX commodities: Mon-Fri 09:00-23:55 IST (platform close = backend MCX_CLOSE).
   if (seg.startsWith("MCX") || exch === "MCX") {
-    if (!weekday) return false;
-    return min >= 9 * 60 && min <= 23 * 60 + 55;
+    return "MCX";
   }
-
-  // NSE / BSE equity, F&O — Mon-Fri 09:15-15:41 IST (platform close, operator-set).
-  // Catch-all: anything we couldn't classify falls into this bucket,
-  // which is safer than defaulting to "open" because Indian equity is
-  // the dominant segment and a wrong "closed" is better than a wrong
-  // "open" (the backend rejects either way; we just avoid the flicker).
-  if (!weekday) return false;
-  return min >= 9 * 60 + 15 && min <= 15 * 60 + 41;
+  if (seg.startsWith("BSE") || seg.startsWith("BFO") || exch === "BSE" || exch === "BFO") {
+    return "BSE";
+  }
+  return "NSE";
 }
 
-/** Friendly label used in the "Market is closed" toast. */
+export function getMarketHourConfig(
+  segmentType?: string | null,
+  exchange?: string | null,
+): MarketHourEntry & { key: MarketKey } {
+  if (typeof window !== "undefined" && Date.now() - _lastFetchMs >= _FETCH_INTERVAL_MS) {
+    void refreshMarketHours(false);
+  }
+  const key = resolveMarketKey(segmentType, exchange);
+  const cfg = _hoursCache[key] ?? DEFAULT_MARKET_HOURS[key];
+  return { key, ...cfg };
+}
+
+/**
+ * Returns true when the segment's exchange is currently accepting trades
+ * according to the admin-configured Market Trading Hours (IST).
+ */
+export function isInstrumentMarketOpen(
+  segmentType?: string | null,
+  exchange?: string | null,
+  now: Date = new Date(),
+): boolean {
+  const cfg = getMarketHourConfig(segmentType, exchange);
+  if (!cfg.enabled) return false;
+
+  const min = _istMinutes(now);
+  const day = _istDay(now); // 0 = Sun, 1..5 = Mon..Fri, 6 = Sat
+  const startMin = _parseHhMm(cfg.start, 0);
+  const endMin = _parseHhMm(cfg.end, 23 * 60 + 59);
+  const is24x7Days =
+    cfg.key === "CRYPTO" || cfg.days.includes("24/7") || cfg.days.includes("Sun");
+
+  if (startMin <= endMin) {
+    if (!is24x7Days && (day === 0 || day === 6)) {
+      return false;
+    }
+    return min >= startMin && min <= endMin;
+  } else {
+    // Overnight session crossing midnight (e.g. 03:30 -> 02:30 IST)
+    if (is24x7Days) {
+      return min >= startMin || min <= endMin;
+    }
+    // Mon-Fri overnight:
+    // - Mon..Fri (1..5): open from startMin..23:59
+    // - Tue..Sat (2..6): open from 00:00..endMin (tail of previous weekday)
+    return (day >= 1 && day <= 5 && min >= startMin) || (day >= 2 && day <= 6 && min <= endMin);
+  }
+}
+
+/** Friendly label used in the "Market is closed" alert/toast. */
 export function marketLabel(segmentType?: string | null, exchange?: string | null): string {
   const seg = (segmentType || "").toUpperCase();
   const exch = (exchange || "").toUpperCase();
@@ -130,6 +254,19 @@ export function marketLabel(segmentType?: string | null, exchange?: string | nul
   if (seg === "STOCKS") return "Global stocks";
   if (seg === "INDICES") return "Global indices";
   if (seg.startsWith("MCX") || exch === "MCX") return "MCX";
-  if (seg.startsWith("BSE") || exch === "BSE") return "BSE";
+  if (seg.startsWith("BSE") || seg.startsWith("BFO") || exch === "BSE" || exch === "BFO") return "BSE";
   return "NSE";
+}
+
+/** Detailed alert message shown when an order is attempted while the market is closed. */
+export function getMarketClosedMessage(
+  segmentType?: string | null,
+  exchange?: string | null,
+): string {
+  const label = marketLabel(segmentType, exchange);
+  const cfg = getMarketHourConfig(segmentType, exchange);
+  if (!cfg.enabled) {
+    return `${label} market is currently closed by admin. Orders are not accepted right now.`;
+  }
+  return `${label} market is closed. Trading hours: ${cfg.start} – ${cfg.end} IST (${cfg.days}).`;
 }

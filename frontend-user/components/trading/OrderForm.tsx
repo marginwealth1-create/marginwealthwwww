@@ -7,7 +7,7 @@ import { OrderAPI, WalletAPI } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { isInstrumentMarketOpen, marketLabel } from "@/lib/marketHours";
+import { getMarketClosedMessage, isInstrumentMarketOpen } from "@/lib/marketHours";
 import { cn, formatINR } from "@/lib/utils";
 
 interface Props {
@@ -77,13 +77,13 @@ export function OrderForm({ instrument, ltp }: Props) {
         instrument.exchange as string | undefined,
       )
     ) {
-      const label = marketLabel(
-        instrument.segment as string | undefined,
-        instrument.exchange as string | undefined,
+      toast.error(
+        getMarketClosedMessage(
+          instrument.segment as string | undefined,
+          instrument.exchange as string | undefined,
+        ),
+        { duration: 5000 },
       );
-      toast.error(`${label} market is closed. Try placing an AMO instead.`, {
-        duration: 5000,
-      });
       return;
     }
     setSubmitting(true);

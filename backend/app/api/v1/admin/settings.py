@@ -210,6 +210,43 @@ async def set_terms(payload: _TermsPayload, admin: CurrentAdmin):
     )
 
 
+# ── Market Trading Hours (IST) ───────────────────────────────────────
+class _MarketHoursPayload(BaseModel):
+    hours: dict[str, Any]
+
+
+@router.get("/settings/market-hours", response_model=APIResponse[dict])
+async def get_market_hours_setting(admin: CurrentAdmin):
+    """Return the configured market-wise trading hours (IST)."""
+    from app.services.market_hours_service import get_market_hours
+
+    hours = await get_market_hours(force_refresh=True)
+    return APIResponse(data={"hours": hours})
+
+
+@router.put("/settings/market-hours", response_model=APIResponse[dict])
+async def set_market_hours_setting(payload: _MarketHoursPayload, admin: CurrentAdmin):
+    """Save the configured market-wise trading hours (IST)."""
+    _require_admin_or_super(admin)
+    from app.services.market_hours_service import (
+        MARKET_HOURS_SETTING_KEY,
+        save_market_hours,
+    )
+
+    saved = await save_market_hours(payload.hours)
+    await log_event(
+        action=AuditAction.SETTING_CHANGE,
+        entity_type="PlatformSetting",
+        entity_id=MARKET_HOURS_SETTING_KEY,
+        actor_id=admin.id,
+        new_values={"market_hours": saved},
+    )
+    return APIResponse(
+        data={"hours": saved},
+        message="Market trading hours saved.",
+    )
+
+
 # ── Platform settings ────────────────────────────────────────────────
 @router.get("/settings/platform", response_model=APIResponse[list])
 async def list_platform_settings(admin: CurrentAdmin, category: str | None = None):

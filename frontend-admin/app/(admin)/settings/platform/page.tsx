@@ -7,9 +7,11 @@ import {
   BellOff,
   CalendarClock,
   Check,
+  Clock,
   CreditCard,
   FileText,
   IndianRupee,
+  Info,
   KeyRound,
   Loader2,
   Mail,
@@ -17,6 +19,7 @@ import {
   Moon,
   Palette,
   Play,
+  RotateCcw,
   ShieldCheck,
   Sun,
   User,
@@ -81,6 +84,7 @@ export default function PlatformSettingsPage() {
         <NotificationsCard />
         <WeeklySettlementCard />
         <UsdInrRateCard />
+        <MarketTradingHoursCard />
         <PromoButtonCard />
         <PaymentGatewayCard />
         <CarryForwardToggleCard />
@@ -1042,6 +1046,304 @@ function ChangePasswordCard() {
         >
           {saving ? "Saving…" : "Change password"}
         </Button>
+      </CardContent>
+    </Card>
+  );
+}
+
+// ── Market Trading Hours (IST) ───────────────────────────────────────
+type MarketHourEntry = {
+  enabled: boolean;
+  start: string;
+  end: string;
+  days: string;
+};
+
+type MarketHoursMap = Record<string, MarketHourEntry>;
+
+const MARKET_ROWS_META: Array<{
+  key: string;
+  badge: string;
+  badgeClass: string;
+  title: string;
+  subtitle: string;
+  defaultStart: string;
+  defaultEnd: string;
+  days: string;
+}> = [
+  {
+    key: "NSE",
+    badge: "NSE",
+    badgeClass: "bg-blue-500/15 text-blue-400 ring-1 ring-blue-500/30",
+    title: "NSE (Equity & F&O)",
+    subtitle: "National Stock Exchange equity, futures, and options",
+    defaultStart: "09:15",
+    defaultEnd: "15:30",
+    days: "Mon - Fri",
+  },
+  {
+    key: "BSE",
+    badge: "BSE",
+    badgeClass: "bg-indigo-500/15 text-indigo-400 ring-1 ring-indigo-500/30",
+    title: "BSE (Equity & F&O)",
+    subtitle: "Bombay Stock Exchange equity, Sensex futures, and options",
+    defaultStart: "09:15",
+    defaultEnd: "15:30",
+    days: "Mon - Fri",
+  },
+  {
+    key: "MCX",
+    badge: "MCX",
+    badgeClass: "bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/30",
+    title: "MCX (Commodities)",
+    subtitle: "Multi Commodity Exchange: Gold, Silver, Crude Oil, Natural Gas",
+    defaultStart: "09:00",
+    defaultEnd: "23:55",
+    days: "Mon - Fri",
+  },
+  {
+    key: "FOREX",
+    badge: "FOREX",
+    badgeClass: "bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/30",
+    title: "Forex & Global (24/5)",
+    subtitle: "Foreign exchange currencies, global indices, and commodities",
+    defaultStart: "00:00",
+    defaultEnd: "23:59",
+    days: "Mon - Fri",
+  },
+  {
+    key: "CRYPTO",
+    badge: "CRYPTO",
+    badgeClass: "bg-purple-500/15 text-purple-400 ring-1 ring-purple-500/30",
+    title: "Crypto (24/7)",
+    subtitle: "Cryptocurrency 24/7 spot and futures markets",
+    defaultStart: "00:00",
+    defaultEnd: "23:59",
+    days: "24/7 (Mon - Sun)",
+  },
+];
+
+function buildDefaultMarketHours(): MarketHoursMap {
+  const out: MarketHoursMap = {};
+  for (const row of MARKET_ROWS_META) {
+    out[row.key] = {
+      enabled: true,
+      start: row.defaultStart,
+      end: row.defaultEnd,
+      days: row.days,
+    };
+  }
+  return out;
+}
+
+function MarketTradingHoursCard() {
+  const admin = useAdminAuthStore((s) => s.admin);
+  const role = String(admin?.role || "");
+  const canSee = role === "SUPER_ADMIN" || role === "ADMIN";
+  const [hours, setHours] = useState<MarketHoursMap>(() => buildDefaultMarketHours());
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!canSee) return;
+    let alive = true;
+    SettingsAPI.getMarketHours()
+      .then((res) => {
+        if (!alive) return;
+        if (res?.hours && typeof res.hours === "object") {
+          const merged = buildDefaultMarketHours();
+          for (const row of MARKET_ROWS_META) {
+            const item = res.hours[row.key];
+            if (item && typeof item === "object") {
+              merged[row.key] = {
+                enabled: item.enabled !== undefined ? Boolean(item.enabled) : true,
+                start: item.start || row.defaultStart,
+                end: item.end || row.defaultEnd,
+                days: item.days || row.days,
+              };
+            }
+          }
+          setHours(merged);
+        }
+        setLoaded(true);
+      })
+      .catch(() => {
+        if (alive) setLoaded(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [canSee]);
+
+  if (!canSee) return null;
+
+  function updateRow(key: string, patch: Partial<MarketHourEntry>) {
+    setHours((prev) => ({
+      ...prev,
+      [key]: {
+        ...(prev[key] ?? buildDefaultMarketHours()[key]),
+        ...patch,
+      },
+    }));
+  }
+
+  function resetDefaults() {
+    setHours(buildDefaultMarketHours());
+    toast.message("Defaults restored", {
+      description: "Click 'Save Market Hours' to apply the default schedule.",
+    });
+  }
+
+  async function saveHours() {
+    setSaving(true);
+    try {
+      const res = await SettingsAPI.setMarketHours(hours);
+      if (res?.hours) {
+        setHours((prev) => ({ ...prev, ...res.hours }));
+      }
+      toast.success("Market trading hours saved", {
+        description: "Updated trading session hours (IST) are now active.",
+      });
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to save market trading hours");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card className="overflow-hidden lg:col-span-3">
+      <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="space-y-1">
+          <CardTitle className="flex items-center gap-2 text-base">
+            <Clock className="size-4 text-primary" /> Market Trading Hours
+          </CardTitle>
+          <CardDescription>
+            Configure market-wise start time and end time (IST). When a user places a trade in the trading window, orders outside these configured hours will be rejected.
+          </CardDescription>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={resetDefaults}
+            disabled={!loaded || saving}
+            className="gap-1.5"
+          >
+            <RotateCcw className="size-3.5" /> Defaults
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            onClick={saveHours}
+            disabled={!loaded || saving}
+            className="gap-1.5 bg-blue-600 text-white hover:bg-blue-500"
+          >
+            {saving ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <Check className="size-3.5" />
+            )}
+            Save Market Hours
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="overflow-x-auto rounded-lg border border-border bg-background/40">
+          <table className="w-full min-w-[640px] border-collapse text-sm">
+            <thead>
+              <tr className="border-b border-border bg-muted/30 text-left text-xs font-medium text-muted-foreground">
+                <th className="px-4 py-3 font-medium">Market</th>
+                <th className="px-4 py-3 font-medium">Trading Session (IST)</th>
+                <th className="px-4 py-3 font-medium">Days</th>
+                <th className="px-4 py-3 text-right font-medium">Status</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border">
+              {MARKET_ROWS_META.map((meta) => {
+                const row = hours[meta.key] ?? {
+                  enabled: true,
+                  start: meta.defaultStart,
+                  end: meta.defaultEnd,
+                  days: meta.days,
+                };
+                return (
+                  <tr key={meta.key} className="transition-colors hover:bg-muted/10">
+                    <td className="px-4 py-3.5 align-middle">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={cn(
+                            "inline-flex items-center rounded px-2 py-0.5 text-[11px] font-bold tracking-wide",
+                            meta.badgeClass,
+                          )}
+                        >
+                          {meta.badge}
+                        </span>
+                        <span className="font-semibold text-foreground">{meta.title}</span>
+                      </div>
+                      <div className="mt-1 text-xs text-muted-foreground">{meta.subtitle}</div>
+                    </td>
+                    <td className="px-4 py-3.5 align-middle">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs text-muted-foreground">Start</span>
+                        <input
+                          type="time"
+                          value={row.start}
+                          disabled={!loaded || saving}
+                          onChange={(e) => updateRow(meta.key, { start: e.target.value })}
+                          className="h-9 rounded-md border border-border bg-background px-3 font-mono text-xs font-semibold text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40 disabled:opacity-50"
+                        />
+                        <span className="text-xs text-muted-foreground">&rarr; End</span>
+                        <input
+                          type="time"
+                          value={row.end}
+                          disabled={!loaded || saving}
+                          onChange={(e) => updateRow(meta.key, { end: e.target.value })}
+                          className="h-9 rounded-md border border-border bg-background px-3 font-mono text-xs font-semibold text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40 disabled:opacity-50"
+                        />
+                      </div>
+                    </td>
+                    <td className="px-4 py-3.5 align-middle text-xs font-medium text-muted-foreground">
+                      {row.days}
+                    </td>
+                    <td className="px-4 py-3.5 text-right align-middle">
+                      <div className="inline-flex flex-col items-end">
+                        <button
+                          type="button"
+                          onClick={() => updateRow(meta.key, { enabled: !row.enabled })}
+                          disabled={!loaded || saving}
+                          aria-pressed={row.enabled}
+                          aria-label={`${meta.title} status`}
+                          className={cn(
+                            "relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full transition-colors disabled:opacity-50",
+                            row.enabled ? "bg-emerald-500" : "bg-muted",
+                          )}
+                        >
+                          <span
+                            className={cn(
+                              "inline-block size-4 transform rounded-full bg-white shadow transition-transform",
+                              row.enabled ? "translate-x-6" : "translate-x-1",
+                            )}
+                          />
+                        </button>
+                        <span className="mt-1 text-[11px] text-muted-foreground">
+                          {row.enabled ? "Open" : "Closed"}
+                        </span>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <p className="flex items-start gap-1.5 text-[11px] leading-relaxed text-muted-foreground">
+          <Info className="mt-0.5 size-3.5 shrink-0 text-muted-foreground/80" />
+          <span>
+            Times are configured in Indian Standard Time (IST). When a user places an order on web or mobile, the trading window verifies whether the selected market is currently within its configured start and end time. Outside these hours, orders are blocked with an informative message.
+          </span>
+        </p>
       </CardContent>
     </Card>
   );

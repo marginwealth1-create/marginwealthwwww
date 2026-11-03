@@ -79,42 +79,20 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "0.0.0.0"
 
 
-def _is_segment_market_open_now(segment_type: str | None) -> bool:
+async def _is_segment_market_open_now(segment_type: str | None) -> bool:
     """Server-side mirror of the apk's `isInstrumentMarketOpen`. Reject
     user-initiated squareoff calls when the segment's market is closed
-    — bypasses are only available via admin force-close. Crypto + Forex
-    always return True (24/7 / 24×5 segments).
+    — bypasses are only available via admin force-close. Uses the
+    admin-configured market trading hours (IST).
     """
-    from datetime import datetime as _dt
-    from app.utils.time_utils import now_ist
+    from app.services.market_hours_service import (
+        get_market_hours,
+        is_market_open_by_config,
+    )
 
-    seg = (segment_type or "").upper()
-    if "CRYPTO" in seg:
-        return True
-    if (
-        seg == "FOREX"
-        or seg == "STOCKS"
-        or seg == "INDICES"
-        or seg == "COMMODITIES"
-        or "FOREX" in seg
-        or seg.startswith("CDS")
-    ):
-        now: _dt = now_ist()
-        wd = now.weekday()  # Mon=0 … Sun=6
-        if wd == 5:  # Saturday
-            return False
-        if wd == 6 and now.hour < 21:  # Sunday before 21:00 IST
-            return False
-        return True
-    now2 = now_ist()
-    wd2 = now2.weekday()
-    if wd2 >= 5:  # Weekend
-        return False
-    mins = now2.hour * 60 + now2.minute
-    if seg.startswith("MCX"):
-        return 9 * 60 <= mins <= 23 * 60 + 55  # = time_utils.MCX_CLOSE
-    # NSE / BSE equity + F&O fallback
-    return 9 * 60 + 15 <= mins <= 15 * 60 + 30
+    hours_map = await get_market_hours()
+    is_open, _ = is_market_open_by_config(hours_map, segment_type, None)
+    return is_open
 
 
 def _segment_market_label(segment_type: str | None) -> str:
@@ -641,7 +619,7 @@ async def squareoff(
     # (admin/trading.py) and the risk enforcer keep their own bypass — this
     # gate is user-only and mirrors the squareoff-all endpoint's guard.
     _seg = getattr(p, "segment_type", None) or getattr(p.instrument, "segment", None)
-    if not _is_segment_market_open_now(_seg):
+    if not await _is_segment_market_open_now(_seg):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -2277,7 +2255,7 @@ async def squareoff_all(user: CurrentUser):
         # still enforces it here for web / direct-API callers and so
         # the user can't bypass via curl. Crypto + Forex always pass
         # (24/7 / 24x5).
-        if not _is_segment_market_open_now(r.segment_type):
+        if not await _is_segment_market_open_now(r.segment_type):
             blocked_by_market_closed += 1
             continue
         # Per-row hold-time gate: skip (don't fail the whole batch) when the

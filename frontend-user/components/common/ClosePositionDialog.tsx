@@ -7,7 +7,7 @@ import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { PositionAPI } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { isInstrumentMarketOpen, marketLabel } from "@/lib/marketHours";
+import { getMarketClosedMessage, isInstrumentMarketOpen } from "@/lib/marketHours";
 
 /**
  * Replacement for the browser-native `confirm("Square off this position?")`
@@ -87,7 +87,7 @@ export function ClosePositionDialog({ target, onClose }: Props) {
     // rollback flicker when the exchange is closed. Position stays in
     // place, dialog stays open, single clear toast tells the user why.
     if (!isInstrumentMarketOpen(target.segment_type, target.exchange)) {
-      toast.error(`${marketLabel(target.segment_type, target.exchange)} market is closed — try closing ${target.symbol} during trading hours`, {
+      toast.error(getMarketClosedMessage(target.segment_type, target.exchange), {
         duration: 4000,
       });
       return;
