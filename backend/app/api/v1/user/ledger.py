@@ -167,10 +167,16 @@ async def ledger(
     # DEPOSIT / WITHDRAWAL / SETTLEMENT_* so those rows can't be crowded out of
     # the `limit` window by a busy account's TRADE / BROKERAGE / PNL rows.
     # Backward-compatible: no `types` param → every transaction type as before.
+    # Settlement (outstanding) rows — shortfall booked / recovered — are never
+    # shown to users, on any client (operator). Still recorded; admin-side only.
+    hidden = [
+        TransactionType.SETTLEMENT_OUTSTANDING_BOOKED.value,
+        TransactionType.SETTLEMENT_OUTSTANDING_RECOVERY.value,
+    ]
+    q["transaction_type"] = {"$nin": hidden}
     if types:
-        wanted = [x.strip() for x in types.split(",") if x.strip()]
-        if wanted:
-            q["transaction_type"] = {"$in": wanted}
+        wanted = [x.strip() for x in types.split(",") if x.strip() and x.strip() not in hidden]
+        q["transaction_type"] = {"$in": wanted}
     rows = await WalletTransaction.find(q).sort("+created_at").limit(limit).to_list()
 
     out = []
