@@ -43,7 +43,9 @@ export default function MoneyTransactionsPage() {
   });
 
   const rows = useMemo(() => {
-    const all = data?.users ?? [];
+    // Users whose only movement was settlement (outstanding) are hidden —
+    // settlement isn't shown to admins (operator).
+    const all = (data?.users ?? []).filter((u: any) => u.total_in || u.total_out);
     const q = search.trim().toLowerCase();
     if (!q) return all;
     return all.filter(
@@ -56,13 +58,12 @@ export default function MoneyTransactionsPage() {
 
   // Tiles reflect the VISIBLE rows so they always equal the table column sums.
   const totals = useMemo(() => {
-    const t = { deposit: 0, add_fund: 0, withdraw: 0, deduct: 0, total_in: 0, total_out: 0, net: 0, settled: 0 };
+    const t = { deposit: 0, add_fund: 0, withdraw: 0, deduct: 0, total_in: 0, total_out: 0, net: 0 };
     for (const r of rows) {
       t.deposit += r.deposit;
       t.add_fund += r.add_fund;
       t.withdraw += r.withdraw;
       t.deduct += r.deduct;
-      t.settled += r.settled;
       t.total_in += r.total_in;
       t.total_out += r.total_out;
     }
@@ -98,15 +99,14 @@ export default function MoneyTransactionsPage() {
     { key: "total_in", header: "Total In", align: "right", render: (r) => moneyCell(r.total_in, "in") },
     { key: "total_out", header: "Total Out", align: "right", render: (r) => moneyCell(r.total_out, "out") },
     { key: "net", header: "Net", align: "right", render: (r) => moneyCell(r.net, "net") },
-    { key: "settled", header: "Settled", align: "right", render: (r) => moneyCell(r.settled, "settled") },
   ];
 
   function exportCsv() {
-    const headers = ["User", "Code", "Owner", "Deposit", "Add fund", "Withdraw", "Deduct", "Total In", "Total Out", "Net", "Settled"];
-    const grand = ["GRAND TOTAL", "", "", totals.deposit, totals.add_fund, totals.withdraw, totals.deduct, totals.total_in, totals.total_out, totals.net, totals.settled];
+    const headers = ["User", "Code", "Owner", "Deposit", "Add fund", "Withdraw", "Deduct", "Total In", "Total Out", "Net"];
+    const grand = ["GRAND TOTAL", "", "", totals.deposit, totals.add_fund, totals.withdraw, totals.deduct, totals.total_in, totals.total_out, totals.net];
     const body = rows.map((r: any) => [
       r.full_name, r.user_code, r.owner_kind === "Direct" ? "Direct" : `${r.owner_kind}: ${r.owner_name}`,
-      r.deposit, r.add_fund, r.withdraw, r.deduct, r.total_in, r.total_out, r.net, r.settled,
+      r.deposit, r.add_fund, r.withdraw, r.deduct, r.total_in, r.total_out, r.net,
     ]);
     downloadCSV(`money-transactions_${new Date().toISOString().slice(0, 10)}.csv`, headers, [grand, ...body]);
   }
@@ -151,7 +151,6 @@ export default function MoneyTransactionsPage() {
         <KpiTile label="Total In" value={totals.total_in} tone="in" />
         <KpiTile label="Total Out" value={totals.total_out} tone="out" />
         <KpiTile label="Net" value={totals.net} tone="net" />
-        <KpiTile label="Settled" value={totals.settled} tone="settled" />
       </div>
 
       <DataTable
