@@ -64,7 +64,7 @@ function downloadCSV(entities: AccountEntity[], grandTotal?: AccountEntity) {
     "Name", "Role", "Users", "Deposits", "Withdrawals", "Net Deposit",
     "Realized P&L", "Unrealized P&L", "Net P&L", "Brokerage",
     "Total Trades", "Profit Trades", "Loss Trades", "Win Rate %",
-    "Volume", "Balance", "Equity", "Open Positions",
+    "Volume", "Balance", "Equity", "Open Positions", "Settlement",
   ];
   const csvRows = [
     headers.join(","),
@@ -74,6 +74,7 @@ function downloadCSV(entities: AccountEntity[], grandTotal?: AccountEntity) {
         e.net_deposit, e.realized_pnl, e.unrealized_pnl, e.net_pnl,
         e.brokerage, e.total_trades, e.profit_trades, e.loss_trades,
         e.win_rate, e.volume, e.balance, e.equity, e.open_positions,
+        e.settlement_outstanding,
       ].join(",")
     ),
   ];
@@ -635,7 +636,16 @@ function BrokerTotalsCard({
             LOSS (negative) → green. Negate before `color` to flip it. Matches
             the Positions page Total-of-Both cards. */}
         <KpiTile label="Total of Both" value={fmt(data.total_of_both)} valueClass={color(String(-Number(data.total_of_both)))} hint="PNL + BKG" />
-        {/* Settlement (outstanding) tile hidden — not shown to admins (operator). */}
+        {/* Settlement is an outflow the broker settles to clients — a LOSS to
+            the broker. Operator request: show it in red when it's a loss
+            (positive settlement = broker pays out). Inverted tint like
+            "Total of Both": positive → red, negative (recovery) → green. */}
+        <KpiTile
+          label="Settlement"
+          value={fmt(data.settlement)}
+          valueClass={color(String(-Number(data.settlement)))}
+          hint="Booked − Recovered in window (lifetime snapshot if no filter). Red = loss to broker."
+        />
       </div>
 
       {/* ── Sharing + cash flow + user count ──────────────────

@@ -239,6 +239,23 @@ export default function AdminUsersPage() {
       },
     },
     {
+      key: "settlement",
+      header: "Settlement",
+      align: "right",
+      render: (r) => {
+        const v = Number(r.wallet?.settlement_outstanding ?? 0);
+        if (v <= 0) return <span className="text-sm text-muted-foreground">—</span>;
+        return (
+          <span
+            className="text-sm font-semibold tabular-nums text-destructive"
+            title="Loss the wallet couldn't cover (went below ₹0) — settlement outstanding"
+          >
+            ₹{v.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </span>
+        );
+      },
+    },
+    {
       key: "actions",
       header: "",
       align: "right",
@@ -537,6 +554,7 @@ function UserMobileCard({
   onStats: () => void;
 }) {
   const weeklyPnl = Number(r.wallet?.weekly_closed_pnl ?? 0);
+  const settlementDue = Number(r.wallet?.settlement_outstanding ?? 0);
 
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-gradient-to-br from-card to-card/60 p-3 shadow-sm transition-shadow hover:shadow-md">
@@ -600,6 +618,21 @@ function UserMobileCard({
           <span className="font-semibold tabular-nums">
             {weeklyPnl > 0 ? "+" : "−"}₹
             {Math.abs(weeklyPnl).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          </span>
+        </div>
+      )}
+
+      {/* Loss / charges the wallet couldn't cover when they were booked —
+          outside Balance and Weekly P&L (informational; not auto-recovered
+          from deposits). */}
+      {settlementDue > 0 && (
+        <div
+          className="mt-1.5 flex items-center justify-between rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-600 dark:text-amber-400"
+          title="Loss or charges the wallet couldn't cover at the time (settlement outstanding)"
+        >
+          <span>Settlement due</span>
+          <span className="font-semibold tabular-nums">
+            ₹{settlementDue.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </span>
         </div>
       )}

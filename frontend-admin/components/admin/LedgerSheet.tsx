@@ -101,9 +101,10 @@ export function LedgerSheet({ open, onClose, user }: Props) {
 
   const txns: any[] = (data?.items ?? []).filter((t: any) => {
     const tt = String(t?.transaction_type ?? "").toUpperCase();
-    // Money in / out only. Settlement (outstanding) rows — shortfall booked /
-    // recovered, incl. unpaid brokerage — are hidden per the operator: they
-    // confused admins. Still recorded; display only.
+    // Hide weekly-settlement churn + admin reopen/delete reversals — these
+    // are bookkeeping rollovers, not real money movement. Genuine daily
+    // SL/TP/stop-out shortfall bookings ("Realized loss … close — shortfall")
+    // stay visible.
     const narration = String(t?.narration ?? "").toLowerCase();
     if (narration.includes("weekly settlement") || narration.includes("settlement unbooked")) {
       return false;
@@ -111,6 +112,8 @@ export function LedgerSheet({ open, onClose, user }: Props) {
     return (
       tt === "DEPOSIT" ||
       tt === "WITHDRAWAL" ||
+      tt === "SETTLEMENT_OUTSTANDING_BOOKED" ||
+      tt === "SETTLEMENT_OUTSTANDING_RECOVERY" ||
       tt === "ADJUSTMENT" ||
       tt === "BONUS" ||
       tt === "PENALTY" ||

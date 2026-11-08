@@ -325,6 +325,13 @@ export default function UserDetailPage() {
               <Stat label="Realized P&L" value={formatINR(u.wallet?.realized_pnl)} />
               <Stat label="Deposits" value={formatINR(u.wallet?.total_deposits)} />
               <Stat label="Withdrawals" value={formatINR(u.wallet?.total_withdrawals)} />
+              {Number(u.wallet?.settlement_outstanding ?? 0) > 0 && (
+                <Stat
+                  label="Settlement"
+                  value={formatINR(u.wallet?.settlement_outstanding)}
+                  highlighted
+                />
+              )}
             </div>
             <div className="space-y-2 border-t border-border pt-3">
               <Label className="text-xs uppercase tracking-wider text-muted-foreground">Manual adjust</Label>
