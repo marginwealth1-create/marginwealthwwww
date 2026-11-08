@@ -77,6 +77,9 @@ def muhurat_open(seg: str | None, at: datetime | None = None, grace_sec: int = 0
 def is_market_open(at: datetime | None = None) -> bool:
     """Naive check — does NOT consider holidays. The HolidayService overlays that."""
     now = to_ist(at or now_ist())
+    mu = muhurat_open("NSE", now)
+    if mu is not None:
+        return mu
     if is_weekend(now.date()):
         return False
     return market_open_time() <= now.time() <= market_close_time()
