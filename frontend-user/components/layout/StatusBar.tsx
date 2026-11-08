@@ -3,8 +3,11 @@
 import { useEffect, useState } from "react";
 import { Circle } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { muhuratOpen } from "@/lib/marketHours";
 
 function isMarketOpen(date = new Date()): boolean {
+  const mu = muhuratOpen("NSE", date);
+  if (mu !== null) return mu;
   // IST is UTC+5:30
   const ist = new Date(date.getTime() + (5 * 60 + 30) * 60_000);
   const day = ist.getUTCDay();

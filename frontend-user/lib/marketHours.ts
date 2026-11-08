@@ -151,6 +151,28 @@ function _istMinutes(date: Date): number {
   return h * 60 + m;
 }
 
+/**
+ * Special sessions (Diwali Muhurat): on these IST dates NSE / BSE / MCX trade
+ * ONLY inside this window (minutes since IST midnight), weekend or not.
+ * Mirror of backend `time_utils.MUHURAT_SESSIONS` — edit both together.
+ */
+const MUHURAT_SESSIONS: Record<string, [number, number]> = {
+  "2026-11-08": [14 * 60 + 20, 15 * 60 + 40],
+};
+
+function _istDateKey(date: Date): string {
+  return new Date(date.getTime() + (5 * 60 + 30) * 60_000).toISOString().slice(0, 10);
+}
+
+/** null = not a muhurat day / not an Indian market (normal rules); else open?. */
+export function muhuratOpen(key: string, now: Date = new Date()): boolean | null {
+  if (key !== "NSE" && key !== "BSE" && key !== "MCX") return null;
+  const w = MUHURAT_SESSIONS[_istDateKey(now)];
+  if (!w) return null;
+  const min = _istMinutes(now);
+  return min >= w[0] && min <= w[1];
+}
+
 /** IST day-of-week (0 = Sun, 1 = Mon, ..., 5 = Fri, 6 = Sat). */
 function _istDay(date: Date): number {
   const ist = new Date(date.getTime() + (5 * 60 + 30) * 60_000);
@@ -219,6 +241,8 @@ export function isInstrumentMarketOpen(
 ): boolean {
   const cfg = getMarketHourConfig(segmentType, exchange);
   if (!cfg.enabled) return false;
+  const mu = muhuratOpen(cfg.key, now);
+  if (mu !== null) return mu;
 
   const min = _istMinutes(now);
   const day = _istDay(now); // 0 = Sun, 1..5 = Mon..Fri, 6 = Sat
@@ -267,6 +291,9 @@ export function getMarketClosedMessage(
   const cfg = getMarketHourConfig(segmentType, exchange);
   if (!cfg.enabled) {
     return `${label} market is currently closed by admin. Orders are not accepted right now.`;
+  }
+  if (muhuratOpen(cfg.key) !== null) {
+    return `${label}: today only the Muhurat session trades, 14:20 – 15:40 IST.`;
   }
   return `${label} market is closed. Trading hours: ${cfg.start} – ${cfg.end} IST (${cfg.days}).`;
 }

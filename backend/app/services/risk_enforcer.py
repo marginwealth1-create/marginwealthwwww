@@ -318,6 +318,11 @@ async def _enforce_for_user(
     def _segment_closed(seg: str | None) -> bool:
         if not seg:
             return False
+        from app.utils.time_utils import muhurat_open
+
+        _mu = muhurat_open(seg, now_now, _OPEN_GRACE_SEC)
+        if _mu is not None:
+            return not _mu
         if is_weekend_now:
             # Indian exchanges + MCX are closed Sat/Sun. is_after_close
             # only handles weekday close-of-day, so OR with a prefix

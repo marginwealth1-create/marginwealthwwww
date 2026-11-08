@@ -201,6 +201,14 @@ def is_market_open_by_config(
         )
 
     ist = to_ist(at) if at is not None else now_ist()
+    from app.utils.time_utils import muhurat_open, muhurat_window
+
+    mu = muhurat_open(key, ist)
+    if mu is not None:
+        if mu:
+            return True, ""
+        o, c = muhurat_window(ist.date()) or (ist.time(), ist.time())
+        return False, f"{key}: today only the Muhurat session trades, {o:%H:%M} – {c:%H:%M} IST."
     wd = ist.weekday()  # Mon=0 .. Fri=4, Sat=5, Sun=6
     cur_min = ist.hour * 60 + ist.minute
     start_min = _hhmm_to_minutes(start_str)

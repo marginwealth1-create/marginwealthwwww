@@ -2359,9 +2359,14 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
     while not _intraday_loop_stop:
         try:
             now = now_ist()
-            if not is_weekend(now.date()):
+            from app.utils.time_utils import muhurat_window as _mw
+
+            _mu = _mw(now.date())  # Muhurat day: roll at the session close
+            if _mu is not None or not is_weekend(now.date()):
                 day_key = now.strftime("%Y%m%d")
                 for group_name, group_set, fire_at in groups:
+                    if _mu is not None:
+                        fire_at = rollover_fire_time(_mu[1], 1)
                     if now.time() < fire_at or await _done(group_name, day_key):
                         continue
                     # Full-day exchange holiday → market never opened, so

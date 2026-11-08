@@ -48,6 +48,32 @@ def is_weekend(d: date) -> bool:
     return d.weekday() >= 5  # Sat=5, Sun=6
 
 
+# Special sessions (Diwali Muhurat): on these IST dates the Indian exchanges
+# (NSE/BSE/NFO/BFO/MCX) trade ONLY inside this window — weekend or not — and
+# are closed the rest of the day. Every market gate consults muhurat_open()
+# FIRST. Mirror: frontend-user/lib/marketHours.ts MUHURAT_SESSIONS.
+MUHURAT_SESSIONS: dict[date, tuple[time, time]] = {
+    date(2026, 11, 8): (time(14, 20), time(15, 40)),
+}
+_MUHURAT_SEGS = ("NSE", "BSE", "NFO", "BFO", "MCX")
+
+
+def muhurat_window(d: date) -> tuple[time, time] | None:
+    return MUHURAT_SESSIONS.get(d)
+
+
+def muhurat_open(seg: str | None, at: datetime | None = None, grace_sec: int = 0) -> bool | None:
+    """None → not a muhurat day or not an Indian segment (normal rules apply).
+    True / False → the muhurat window alone decides. `grace_sec` delays the
+    open (stale-first-tick protection for stop-out / pending fills)."""
+    now = to_ist(at or now_ist())
+    w = MUHURAT_SESSIONS.get(now.date())
+    if w is None or not (seg or "").upper().startswith(_MUHURAT_SEGS):
+        return None
+    start = (datetime.combine(now.date(), w[0]) + timedelta(seconds=grace_sec)).time()
+    return start <= now.time() <= w[1]
+
+
 def is_market_open(at: datetime | None = None) -> bool:
     """Naive check — does NOT consider holidays. The HolidayService overlays that."""
     now = to_ist(at or now_ist())

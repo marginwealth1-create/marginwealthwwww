@@ -135,6 +135,15 @@ def order_expired(
     if created.tzinfo is None:
         created = created.replace(tzinfo=_UTC)
     seg = (segment or "").upper()
+    if seg.startswith(_INDIAN + ("MCX",)):
+        # Placed on a Muhurat day → a DAY order of that special session: it
+        # dies at the session close, never lives into the next trading day.
+        from app.utils.time_utils import muhurat_window
+
+        c_ist = created.astimezone(now.tzinfo)
+        w = muhurat_window(c_ist.date())
+        if w is not None and now >= datetime.combine(c_ist.date(), w[1], tzinfo=now.tzinfo):
+            return True
     cut = configured if configured is not None else default_cutoff(seg)
     return created < last_cutoff(cut, now, seg.startswith(_INDIAN + ("MCX",)))
 
