@@ -7,7 +7,7 @@ from bson import Decimal128
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from app.core.config import settings
-from app.models.transaction import WalletTransaction
+from app.models.transaction import SettlementRequest, WalletTransaction
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 
@@ -18,7 +18,7 @@ async def db():
     test_db = client[f"{settings.MONGODB_DB_NAME}_test_settlement_outstanding"]
     await init_beanie(
         database=test_db,
-        document_models=[User, Wallet, WalletTransaction],
+        document_models=[User, Wallet, WalletTransaction, SettlementRequest],
     )
     yield test_db
     await client.drop_database(test_db.name)
@@ -35,6 +35,7 @@ async def user(db) -> User:
         password_hash="x",
         role=UserRole.CLIENT,
         status=UserStatus.ACTIVE,
+        auto_settlement=True,  # these tests cover the floor-at-0 + settlement branch
     )
     await u.insert()
     return u

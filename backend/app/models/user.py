@@ -315,7 +315,10 @@ class User(TimestampMixin):
     # PENDING request exists the order validator refuses new-opening
     # orders (closing trades still pass through via the existing
     # `is_reducing` exemption).
-    auto_settlement: bool = True
+    # Operator 2026-11-09: OFF for everyone — a loss past the balance takes it
+    # below ₹0 and the next money added (deposit / add fund / profit) pays the
+    # minus back automatically.
+    auto_settlement: bool = False
 
     # Per-user admin trade alert (default OFF). When True, every fill on
     # this user's positions also carries an `alert` block on the

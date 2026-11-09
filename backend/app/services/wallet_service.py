@@ -269,6 +269,7 @@ async def adjust(
         # caller should have rejected the request upfront.
         if (
             transaction_type in (TransactionType.WITHDRAWAL, TransactionType.ADJUSTMENT)
+            and amt < ZERO
             and after < ZERO
         ):
             raise InsufficientFundsError(
@@ -717,7 +718,17 @@ async def has_pending_settlement_request(
         SettlementRequest.user_id == uid,
         SettlementRequest.status == SettlementStatus.PENDING,
     )
-    return existing is not None
+    if existing is None:
+        return False
+    # Money added since (deposit / add fund / profit) already paid the minus
+    # back — the request is moot: close it so the user can trade again.
+    w = await get_or_create(uid)
+    if to_decimal(w.available_balance) >= ZERO:
+        existing.status = SettlementStatus.REJECTED
+        existing.rejected_reason = "Auto-closed: balance back to ₹0 or above (minus recovered from money added)"
+        await existing.save()
+        return False
+    return True
 
 
 async def credit_balance(
