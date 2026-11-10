@@ -397,10 +397,9 @@ export default function WalletPage() {
               <WalletIcon className="size-3.5" /> Available balance
             </div>
             <div className="font-tabular text-3xl font-bold md:text-4xl">
-              {/* Never display a negative balance on the user-facing hero —
-                  any shortfall is surfaced as settlement_outstanding in
-                  the banner below. */}
-              {formatINR(Math.max(0, Number(summary?.available_balance ?? 0)))}
+              {/* Minus mode: a loss past the balance shows here as a negative
+                  balance; the next money added pays it back. */}
+              {formatINR(Number(summary?.available_balance ?? 0))}
             </div>
             <div className="text-[11px] opacity-80">Wallet · {selectedBank?.account_holder ?? "MarginWealth"}</div>
           </div>

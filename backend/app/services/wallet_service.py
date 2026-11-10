@@ -442,24 +442,8 @@ async def adjust(
         )
     )
 
-    # ── Manual-settlement enqueue ─────────────────────────────────────
-    # In auto-OFF mode, a debit that left the wallet in red queues a
-    # pending SettlementRequest. Best-effort: a Mongo hiccup here must
-    # NOT roll back the wallet write — the admin can always re-sync
-    # later from the Payments → Settlement Requests tab (the row is
-    # re-derived from |available_balance| each time).
-    if not auto_settlement_on and after < ZERO:
-        try:
-            await _ensure_pending_settlement_request(
-                user_id=user_id,
-                narration=narration,
-                reference_type=reference_type,
-                reference_id=reference_id,
-            )
-        except Exception:  # pragma: no cover
-            logger.exception(
-                "settlement_request_enqueue_failed user=%s", user_id
-            )
+    # Minus mode (auto-OFF): the minus stays on the balance and the next money
+    # added pays it back — no admin approval request (operator 2026-11-10).
 
     return txn
 
@@ -947,21 +931,6 @@ async def force_debit(
             balance_after=new_balance,
         )
     )
-
-    # Enqueue pending settlement when manual mode left the wallet in red.
-    if not auto_settlement_on and new_balance < ZERO:
-        try:
-            await _ensure_pending_settlement_request(
-                user_id=user_id,
-                narration=narration,
-                reference_type=reference_type,
-                reference_id=reference_id,
-            )
-        except Exception:  # pragma: no cover
-            logger.exception(
-                "settlement_request_enqueue_failed_on_force_debit user=%s",
-                user_id,
-            )
 
     return primary_tx  # type: ignore[return-value]
 
