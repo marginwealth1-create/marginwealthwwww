@@ -58,6 +58,8 @@ from app.utils.time_utils import (
 # — they have no daily bell, so is_within_open_grace() returns False.
 # Keep this in lockstep with risk_enforcer._OPEN_GRACE_SEC.
 _OPEN_SETTLE_BUFFER_SEC = 60
+# Forex / metals / energy: a provider tick older than this = feed down, no trade.
+_INTL_STALE_SEC = 120
 
 
 @dataclass
@@ -1294,6 +1296,27 @@ async def validate(
         )
         if not _mh_open:
             raise MarketClosedError(_mh_msg)
+
+        # 11-intl) Forex / metals / energy trade only on a LIVE price. With the
+        # Binance-futures backup off (operator 2026-11-10: MetaAPI price only),
+        # a MetaAPI outage leaves the last cached price — and the admin spread
+        # would still quote bid/ask around it. Refuse instead of filling stale.
+        if is_24x5:
+            import time as _it
+
+            try:
+                _iq = await market_data_service.get_quote(instrument.token) or {}
+            except Exception:
+                _iq = {}
+            _ifts = _iq.get("feed_ts")
+            _iage = (_it.time() - float(_ifts)) if _ifts else None
+            if _iq.get("source") not in ("metaapi", "infoway", "binance", "binance_futures") or (
+                _iage is not None and _iage > _INTL_STALE_SEC
+            ):
+                raise MarketClosedError(
+                    f"{instrument.symbol}: live price is not coming right now (price feed down). "
+                    "Please try again in a few minutes."
+                )
 
     if not is_amo and not is_24x7 and not _is_force_close and not _is_admin_placed:
         ist = now_ist()
