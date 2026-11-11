@@ -24,7 +24,7 @@ interface Props {
         id: string;
         user_code?: string;
         full_name?: string;
-        wallet?: { available_balance?: string | number };
+        wallet?: { available_balance?: string | number; used_margin?: string | number };
       }
     | null;
 }
@@ -98,6 +98,7 @@ export function LedgerSheet({ open, onClose, user }: Props) {
 
   const liveBalance =
     liveUser?.wallet?.available_balance ?? user?.wallet?.available_balance;
+  const liveUsedMargin = liveUser?.wallet?.used_margin ?? user?.wallet?.used_margin;
 
   const txns: any[] = (data?.items ?? []).filter((t: any) => {
     const tt = String(t?.transaction_type ?? "").toUpperCase();
@@ -170,9 +171,22 @@ export function LedgerSheet({ open, onClose, user }: Props) {
 
         {/* Balance + adjust */}
         <div className="rounded-xl border border-border bg-card p-4 space-y-3">
-          <div>
-            <div className="text-xs text-muted-foreground uppercase tracking-wider">Available Balance</div>
-            <div className="font-mono text-xl sm:text-2xl font-bold mt-1">{formatINR(liveBalance)}</div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <div className="text-xs text-muted-foreground uppercase tracking-wider">Available Balance</div>
+              <div className="font-mono text-xl sm:text-2xl font-bold mt-1">{formatINR(liveBalance)}</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground uppercase tracking-wider">Used Margin</div>
+              <div className="font-mono text-xl sm:text-2xl font-bold mt-1">{formatINR(liveUsedMargin ?? 0)}</div>
+            </div>
+          </div>
+          <div className="text-xs text-muted-foreground">
+            Balance + used margin ={" "}
+            <span className="font-mono font-semibold text-foreground">
+              {formatINR(Number(liveBalance ?? 0) + Number(liveUsedMargin ?? 0))}
+            </span>{" "}
+            (margin is locked in open positions, returns on close)
           </div>
           <div className="grid grid-cols-1 gap-2">
             <div>
