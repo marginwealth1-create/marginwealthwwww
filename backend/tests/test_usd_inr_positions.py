@@ -47,3 +47,10 @@ def test_open_rate_when_not_closed(monkeypatch):
 def test_zero_stamp_falls_through_to_live(monkeypatch):
     monkeypatch.setitem(mds._usd_inr_cache, "rate", 99.0)
     assert position_fx_rate(_pos(open_rate=95, close_rate=0)) == 95
+
+
+def test_rate_1_books_usd_pnl_1_to_1(monkeypatch):
+    # Wallet has no currency: a $156 profit adds 156, not 156 × 97.
+    monkeypatch.setitem(mds._usd_inr_cache, "rate", 1.0)
+    assert str(realized_pnl_inr(_pos(realized="156", open_rate=1))) == "156.00"
+    assert str(realized_pnl_inr(_pos(realized="156", open_rate=1, close_rate=1))) == "156.00"

@@ -757,7 +757,7 @@ async def _apply_spread_only(token: str, quote: dict[str, Any]) -> dict[str, Any
 # Operator-set rate (platform setting), NOT a live FX feed: a rate that moved
 # on its own would move every open client's P&L and margin with it.
 USD_INR_SETTING_KEY = "fx.usd_inr_rate"
-USD_INR_FALLBACK = 97.0  # used only before the setting row is seeded/read
+USD_INR_FALLBACK = 1.0  # used only before the setting row is seeded/read; 1 = wallet has no currency, $ P&L books 1:1
 
 # The risk enforcer marks every open position once a second, so this must not
 # hit Mongo per position. One process-local value, refreshed every 30 s by

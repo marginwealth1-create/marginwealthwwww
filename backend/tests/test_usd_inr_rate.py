@@ -41,9 +41,9 @@ def test_unknown_or_empty_segments_do_not_convert(seg):
     assert mds.is_usd_quoted_segment(seg) is False
 
 
-def test_rate_falls_back_to_97_only_before_the_first_read(monkeypatch):
+def test_rate_falls_back_to_1_only_before_the_first_read(monkeypatch):
     monkeypatch.setitem(mds._usd_inr_cache, "rate", 0.0)
-    assert mds.get_usd_inr_rate() == 97.0
+    assert mds.get_usd_inr_rate() == 1.0
     monkeypatch.setitem(mds._usd_inr_cache, "rate", 88.5)
     assert mds.get_usd_inr_rate() == 88.5
 

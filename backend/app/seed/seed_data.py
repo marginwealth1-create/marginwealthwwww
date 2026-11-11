@@ -134,7 +134,7 @@ async def seed_platform_settings() -> None:
         # worth here. Read via market_data_service.get_usd_inr_rate().
         (
             "fx.usd_inr_rate",
-            97.0,
+            1.0,  # 1 = no conversion: a $156 profit adds 156 to the wallet
             SettingType.FLOAT,
             "trading",
             False,
