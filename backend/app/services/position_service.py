@@ -1714,10 +1714,12 @@ async def position_required_margin(p: Position) -> Decimal:
 
 
 def carry_step(min_lot: Any, lot_size: Any) -> Decimal:
-    """Smallest quantity the rollover trims to: one min-lot when that is a
-    fraction of a unit (crypto / forex), otherwise one whole unit."""
+    """Smallest quantity the rollover trims to: one min-lot in units
+    (min_lot × lot_size — 1,250 for a NATURALGAS lot, 65 for NIFTY, 0.01 for
+    crypto), one share where lots don't apply (min_lot 0). Trimming in single
+    units left carried F&O/MCX at odd sizes (11-Nov: COPPER 369 of a 2,500 lot)."""
     m = to_decimal(min_lot or 0) * to_decimal(lot_size or 1)
-    return m if 0 < m < 1 else Decimal(1)
+    return m if m > 0 else Decimal(1)
 
 
 def floor_to_step(x: Decimal, step: Decimal) -> Decimal:

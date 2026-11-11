@@ -93,8 +93,17 @@ def test_crypto_trims_in_fractional_steps():
 
 def test_carry_step():
     assert carry_step(0.01, 1) == D("0.01")   # crypto / forex
-    assert carry_step(1, 65) == D(1)          # F&O: whole units
-    assert carry_step(0, 1) == D(1)
+    assert carry_step(1, 65) == D(65)         # F&O: whole lots, never odd units
+    assert carry_step(1, 1250) == D(1250)     # MCX NATURALGAS lot
+    assert carry_step("0.1", 1250) == D(125)  # admin-allowed fractional lot
+    assert carry_step(0, 1) == D(1)           # equity: lots don't apply
+
+
+def test_mcx_trim_keeps_whole_lots():
+    # 5 lots of NATURALGAS short, overnight ₹7,765/lot, funds cover ~3.4 lots
+    lot = D(1250)
+    plan = plan_carry([("NG", 5 * lot, D(38825), D(0), carry_step(1, lot))], D(26392))
+    assert plan["NG"] % lot == 0 and plan["NG"] == 3 * lot
 
 
 # ── executor fallback: plan was off, carry what the cash covers ─────────────
