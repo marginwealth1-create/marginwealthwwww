@@ -1075,20 +1075,9 @@ async def validate(
             s["leverage"] = 1.0
             s["fixed_margin_per_lot"] = 0.0
 
-    # 8b) NRML on an exchange segment is held overnight, so it locks the
-    # OVERNIGHT tier now (Times mode otherwise keeps the intraday leverage for
-    # every product). Expiry day: the expiry rules above already chose the
-    # tier. Crypto / forex / international rows have no carry tier — the
-    # resolver hands them intraday values, so their NRML stays intraday.
-    if (
-        product_type == ProductType.NRML
-        and not is_expiry_day_now
-        and str(segment_type).upper().startswith(("NSE", "BSE", "NFO", "BFO", "MCX"))
-    ):
-        s["leverage"] = s.get("overnight_leverage") or s.get("leverage")
-        s["margin_percentage"] = s.get("overnight_margin_percentage") or s.get("margin_percentage")
-        if s.get("margin_calc_mode") == "fixed":
-            s["fixed_margin_per_lot"] = s.get("overnight_fixed_margin_per_lot") or s.get("fixed_margin_per_lot")
+    # (8b removed 2026-11-11, operator: NRML locks the same INTRADAY margin as
+    # MIS — margin never changes for a carry; the overnight tier is only the
+    # EOD rollover's funds check.)
 
     # 9) margin check (all-Decimal arithmetic — never mix Decimal × float)
     margin_pct = to_decimal(s.get("margin_percentage") or 100.0) / to_decimal(100)

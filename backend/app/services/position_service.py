@@ -1701,7 +1701,8 @@ async def position_required_margin(p: Position) -> Decimal:
         q = {}
     mark = exit_mark(p.quantity, q, q.get("ltp"), p.ltp, p.avg_price)
     qty = abs(to_decimal(p.quantity))
-    if p.product_type != _PT.MIS:
+    # MIS and NRML both lock the intraday tier (a carry never re-margins).
+    if p.product_type not in (_PT.MIS, _PT.NRML):
         return overnight_margin(s, qty, mark, p.instrument.lot_size, position_is_usd(p))
     fixed = to_decimal(s.get("fixed_margin_per_lot") or 0)
     if s.get("margin_calc_mode") == "fixed" and fixed > 0:
@@ -1892,7 +1893,6 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
 
     Returns {converted, force_closed, trimmed, skipped, charged, left_in_mis}.
     """
-    from app.core.exceptions import InsufficientFundsError
     from app.core.redis_client import cache_delete_pattern
     from app.models._base import OrderType as _OT, ProductType as _PT
     from app.models.audit_log import AuditAction
@@ -1978,21 +1978,13 @@ async def convert_intraday_to_carry(segment_set: frozenset[str] | set[str]) -> d
         out["skipped"] += 1
 
     async def _carry(pos: Position, s: dict, mark: Decimal) -> bool:
-        """Flip a carried MIS position to NRML at its overnight margin
-        (block / release the delta) and charge the carry fee once. False =
-        the margin delta couldn't be funded (yet)."""
+        """Flip a carried MIS position to NRML — its locked (intraday) margin
+        is unchanged — and charge the carry fee once."""
         if pos.product_type == _PT.MIS:
-            new_margin = overnight_margin(s, pos.quantity, mark, pos.instrument.lot_size, position_is_usd(pos))
-            old_margin = to_decimal(pos.margin_used)
-            delta = new_margin - old_margin
-            if delta > 0:
-                try:
-                    await wallet_service.block_margin(pos.user_id, delta)
-                except InsufficientFundsError:
-                    return False
-            elif delta < 0:
-                await wallet_service.release_margin(pos.user_id, -delta)
-            pos.margin_used = Decimal128(str(new_margin))
+            # Operator 2026-11-11: the carry keeps the INTRADAY margin locked at
+            # entry — used margin never changes overnight. The overnight tier is
+            # only the funds check in plan_carry that sizes what carries.
+            old_margin = new_margin = to_decimal(pos.margin_used)
             pos.product_type = _PT.NRML
             await pos.save()
             await _recompute_tracker(
