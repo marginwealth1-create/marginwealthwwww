@@ -1215,6 +1215,21 @@ async def list_closed_trade_events_fifo(
     def _bookkey(token: str, product: str) -> tuple[str, str]:
         return (token, "") if token in _one_book else (token, product)
 
+    # When each position on a token opened: an unstamped fill that opened one
+    # is an open, never a close the engine forgot to stamp.
+    _opened: dict[str, list] = {}
+    for _p in _all_pos:
+        if _p.opened_at:
+            _opened.setdefault(_p.instrument.token, []).append(_naive(_p.opened_at))
+
+    def _opened_by(t: Any) -> bool:
+        ts = _naive(t.executed_at)
+        return any(abs((o - ts).total_seconds()) <= 2 for o in _opened.get(t.instrument.token, ()))
+
+    def _against(lots: Any, side: str) -> bool:
+        """Does the book hold any lot a `side` fill can close?"""
+        return any(f["side"] != side for f in lots)
+
     # One boundary per settlement-style close (WEEKLY_SETTLEMENT or
     # EXPIRY_SETTLED), to be merged into the walk. Both close the position
     # WITHOUT writing a Trade row — weekly re-opens at the settlement price,
@@ -1334,15 +1349,18 @@ async def list_closed_trade_events_fifo(
                 ),
                 key=lambda k: _naive(open_queues[k][0]["opened_at"]),
             )
+            # Only the settled side's lots: the position held one side.
             for _bk in _drain_keys:
                 _bq = open_queues[_bk]
-                while _bq and _remaining > 1e-9:
-                    _f = _bq[0]
+                for _f in _bq:
+                    if _remaining <= 1e-9:
+                        break
+                    if _f["side"] != b["side"]:
+                        continue
                     _take = min(float(_f["qty"]), _remaining)
                     _f["qty"] = float(_f["qty"]) - _take
                     _remaining -= _take
-                    if _f["qty"] <= 1e-9:
-                        _bq.popleft()
+                open_queues[_bk] = deque(_f for _f in _bq if _f["qty"] > 1e-9)
             # WEEKLY re-opens at the settlement price (reseed one fill under the
             # settled key so the next close prices off it); EXPIRY is terminal
             # (contract dead) — leave the queues empty, no reseed.
@@ -1367,28 +1385,30 @@ async def list_closed_trade_events_fifo(
         is_buy = t.action == OrderAction.BUY
         side_str = "BUY" if is_buy else "SELL"
 
-        q = open_queues.setdefault(key, deque())
+        q = own_q = open_queues.setdefault(key, deque())
 
         # Cross-product-type fallback: admin force-closes sometimes record
         # the closing fill with a different product_type than the opening fill
         # (e.g. MIS open closed as NRML). The exact (token, product_type) queue
-        # is empty, but another queue for the same token has the open position.
+        # holds nothing to close, but another queue for the same token does.
         # Only kick in when pnl_inr is set (definitive closing signal).
-        if not q and t.pnl_inr is not None:
+        if t.pnl_inr is not None and not _against(q, side_str):
             alt_key = next(
-                (k for k in open_queues if k[0] == t.instrument.token and open_queues[k]),
+                (k for k in open_queues if k[0] == t.instrument.token and _against(open_queues[k], side_str)),
                 None,
             )
             if alt_key:
                 q = open_queues[alt_key]
 
         # Primary signal: pnl_inr set = closing fill; None = opening fill.
-        # Fallback: if pnl_inr is None but queue has the OPPOSITE side,
-        # treat as a closing fill whose pnl_inr the matching engine missed
-        # (e.g. partial close recorded without pnl_inr due to an engine bug).
-        queue_side = q[0]["side"] if q else None
+        # Legacy fallback: fills booked before pnl_inr existed carry none, so
+        # an unstamped fill facing a book that holds only the OPPOSITE side is
+        # read as a close — unless it opened a position (a fresh open after a
+        # deleted position left stale lots behind, which drained them and
+        # billed the round trip twice), or the book also holds its own side
+        # (an add).
         is_closing = t.pnl_inr is not None or (
-            queue_side is not None and queue_side != side_str
+            bool(q) and all(f["side"] != side_str for f in q) and not _opened_by(t)
         )
 
         if not is_closing:
@@ -1403,7 +1423,24 @@ async def list_closed_trade_events_fifo(
             continue
 
         # ── Closing fill: consume from queue ─────────────────────────────
-        if not q:
+        # A reversal closes `closed_quantity` units and opens the rest on its
+        # own side, carrying that share of the fill's brokerage. Closes booked
+        # before the engine stamped closed_quantity close the whole fill.
+        _closed = qty
+        if getattr(t, "closed_quantity", None) is not None:
+            _closed = min(qty, float(t.closed_quantity))
+            _excess = qty - _closed
+            if _excess > 1e-9:
+                own_q.append({
+                    "price": price,
+                    "qty": _excess,
+                    "opened_at": t.executed_at,
+                    "side": side_str,
+                    "open_brk": _charge(t) * _excess / qty,
+                    "original_qty": _excess,
+                })
+
+        if not _against(q, side_str):
             # Queue is empty — no opening fill to pair against. This is the
             # EXPECTED state after an admin REOPEN: reopen flips the position
             # back to OPEN reusing the original entry but writes NO new
@@ -1422,15 +1459,15 @@ async def list_closed_trade_events_fifo(
             #   raw_gross = (entry - close) * qty   for a short (closed by BUY)
             # so `entry` falls straight out. price>0 guards the phantom
             # zero-priced fills the matching engine sometimes writes.
-            if t.pnl_inr is not None and qty > 0 and price > 0:
-                close_brk = _charge(t)
+            if t.pnl_inr is not None and _closed > 0 and price > 0:
+                close_brk = _charge(t) * _closed / qty
                 gross = float(_booked_gross(t))  # pnl_inr in native units, brokerage backed out
                 # The closing action is the OPPOSITE of the opening side.
                 opened_side = "SELL" if is_buy else "BUY"
                 if opened_side == "BUY":
-                    entry_price = price - (gross / qty)
+                    entry_price = price - (gross / _closed)
                 else:
-                    entry_price = price + (gross / qty)
+                    entry_price = price + (gross / _closed)
                 events.append({
                     "_row_id": f"fifo_{t.id}_0",
                     "_closed_at": t.executed_at,
@@ -1440,7 +1477,7 @@ async def list_closed_trade_events_fifo(
                     "opened_side": opened_side,
                     "entry_price": entry_price,
                     "close_price": price,
-                    "qty": qty,
+                    "qty": _closed,
                     "_order_id": t.order_id,
                     "gross_pnl": gross,
                     "fx_rate": float(str(t.fx_rate)) if getattr(t, "fx_rate", None) is not None else None,
@@ -1455,7 +1492,7 @@ async def list_closed_trade_events_fifo(
             continue
 
         close_brk = _charge(t)
-        remaining = qty
+        remaining = _closed
         sub_idx = 0
         # Bill the close at what the wallet was charged. The engine books
         # (close − Position.avg_price) × qty — or against a specific-lot basis,
@@ -1468,7 +1505,7 @@ async def list_closed_trade_events_fifo(
         # the units this close takes off the book. Unstamped (legacy) closes
         # keep the lot price.
         _booked = _booked_gross(t)
-        _units = to_decimal(min(qty, sum(f["qty"] for f in q)))
+        _units = to_decimal(min(_closed, sum(f["qty"] for f in q if f["side"] != side_str)))
         # Specific-lot close (Active-tab Exit): this closing trade was booked
         # against a SPECIFIC tapped fill (cost_basis_override), not the FIFO
         # front — so pair it with the queued opening fill whose entry price
@@ -1481,13 +1518,16 @@ async def list_closed_trade_events_fifo(
         except Exception:
             _basis = None
 
-        while remaining > 1e-9 and q:
-            idx = 0
-            if _basis is not None:
-                for j in range(len(q)):
-                    if abs(q[j]["price"] - _basis) < 1e-6:
-                        idx = j
-                        break
+        while remaining > 1e-9:
+            # A close takes only lots of the OTHER side: a book holding both
+            # (a reversal's new leg, a stale lot) priced a sell against a short.
+            _opp = [j for j in range(len(q)) if q[j]["side"] != side_str]
+            if not _opp:
+                break
+            idx = next(
+                (j for j in _opp if _basis is not None and abs(q[j]["price"] - _basis) < 1e-6),
+                _opp[0],
+            )
             front = q[idx]
             consume = min(front["qty"], remaining)
 

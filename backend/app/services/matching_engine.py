@@ -447,6 +447,7 @@ async def execute_market_order(
     raw_pnl_inr_dec: Decimal | None = None
     fill_fx: Decimal | None = None
     lot_basis: Decimal | None = None  # the specific-lot basis actually applied
+    closed_qty: Decimal | None = None
     if is_closing and existing_pos is not None:
         cur_qty = to_decimal(existing_pos.quantity)
         avg = to_decimal(existing_pos.avg_price)
@@ -509,6 +510,7 @@ async def execute_market_order(
             str(quantize_money(notional + (charges.total if order.action == OrderAction.SELL else -charges.total)))
         ),
         pnl_inr=Decimal128(str(pnl_inr_dec)) if pnl_inr_dec is not None else None,
+        closed_quantity=float(closed_qty) if closed_qty is not None else None,
         # Carry the specific-lot basis onto the Trade — only when it was applied
         # — so the FIFO closed-blotter pairs this close with the SAME lot the
         # P&L booked against. None for every average-price close.

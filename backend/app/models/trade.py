@@ -54,6 +54,10 @@ class Trade(TimestampMixin):
     # Already net of the closing-leg brokerage (when `chargeOn` includes
     # the close), so the displayed P&L matches the user's true cost.
     pnl_inr: Money | None = None
+    # Units of the position this closing fill closed — less than `quantity`
+    # on a reversal, whose excess opened the other side. None on opening
+    # fills and on closes booked before this field existed.
+    closed_quantity: float | None = None
 
     # ── Execution snapshot: what the market looked like at this fill ───
     # Slippage and latency cannot be reconstructed after the fact — for a
