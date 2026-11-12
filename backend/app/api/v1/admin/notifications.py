@@ -118,7 +118,9 @@ async def mark_all_read(admin: CurrentAdmin):
 # A composer in the admin panel lets any admin/broker push a one-off
 # notification (title + message + optional link) to EVERY user in their
 # own pool at once. Scoped via `scoped_user_ids` so a broker only reaches
-# their subtree and an admin only their clients; super-admin reaches all.
+# their subtree and an admin only their clients; super-admin (and its
+# staff) reaches its direct pool only — a broadcast writes into users'
+# inboxes, so it never crosses into a sub-admin's pool.
 class BroadcastBody(BaseModel):
     title: str = Field(min_length=1, max_length=120)
     message: str = Field(min_length=1, max_length=1000)

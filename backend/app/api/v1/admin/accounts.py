@@ -15,14 +15,21 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from io import BytesIO
-from typing import Any
+from typing import Annotated, Any
 from zoneinfo import ZoneInfo
 
 from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, Query
 from starlette.responses import StreamingResponse
 
-from app.core.dependencies import CurrentAdmin, require_perm, scoped_user_filter, scoped_user_ids
+from app.core.dependencies import (
+    CurrentAdmin,
+    is_effective_super_admin,
+    require_perm,
+    scoped_user_filter,
+    scoped_user_ids,
+)
+from app.core.exceptions import NotFoundError
 from app.models.position import Position, PositionStatus
 from app.models.trade import Trade
 from app.models.transaction import TransactionType, WalletTransaction
@@ -244,7 +251,8 @@ async def accounts_summary(
     # Comprehensive scope (incl. broker subtree for ADMIN) so the
     # brokers / sub-brokers tabs list every broker under the admin even
     # when a transferred broker's descendants weren't re-stamped.
-    admin_scope = await scoped_user_filter(admin)
+    # all_pools: {} for the effective super-admin (incl. its EMPLOYEE, D1).
+    admin_scope = await scoped_user_filter(admin, all_pools=True)
 
     # Collect ALL user ids in scope for grand total
     all_scope_query: dict[str, Any] = {
@@ -252,7 +260,7 @@ async def accounts_summary(
         "status": {"$ne": UserStatus.CLOSED.value},
         "is_demo": {"$ne": True},
     }
-    if admin.role == UserRole.SUPER_ADMIN:
+    if await is_effective_super_admin(admin):
         all_users = await User.find(all_scope_query).to_list()
     else:
         # Use the thorough subtree resolver (NOT the flat assigned_admin_id
@@ -321,8 +329,7 @@ async def accounts_summary(
             "role": UserRole.BROKER.value,
             "status": {"$ne": UserStatus.CLOSED.value},
         }
-        if admin.role != UserRole.SUPER_ADMIN:
-            broker_query.update(admin_scope)
+        broker_query.update(admin_scope)
         brokers = await User.find(broker_query).to_list()
 
         # Direct users (no broker)
@@ -345,8 +352,7 @@ async def accounts_summary(
             "status": {"$ne": UserStatus.CLOSED.value},
             "assigned_broker_id": {"$ne": None},
         }
-        if admin.role != UserRole.SUPER_ADMIN:
-            sub_query.update(admin_scope)
+        sub_query.update(admin_scope)
         sub_brokers = await User.find(sub_query).to_list()
 
         async def _do_sub(sb: User) -> dict[str, Any]:
@@ -423,17 +429,13 @@ async def broker_totals(
     preset: str | None = Query(default=None),
     _: None = Depends(require_perm("users", "read")),
 ) -> APIResponse:
-    try:
-        eid = PydanticObjectId(entity_id)
-    except Exception:
-        return APIResponse(data=ads._empty_broker_totals(), message="Invalid entity ID")
-
-    entity = await User.get(eid)
-    if not entity:
+    scope = await ads.entity_scope(admin, entity_id)
+    if scope is None or scope[0] is None:
         return APIResponse(data=ads._empty_broker_totals(), message="Entity not found")
+    entity, _role, clause = scope
 
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
-    result = await ads.compute_broker_totals(eid, start_utc, end_utc)
+    result = await ads.compute_broker_totals(entity.id, start_utc, end_utc, clause)
     return APIResponse(data=result)
 
 
@@ -451,18 +453,16 @@ async def entity_users(
     _: None = Depends(require_perm("users", "read")),
 ) -> APIResponse:
     _empty_resp = {"items": [], "meta": {"page": 1, "page_size": page_size, "total": 0, "total_pages": 0}}
-    try:
-        eid = PydanticObjectId(entity_id)
-    except Exception:
-        return APIResponse(data=_empty_resp, message="Invalid entity ID")
+    scope = await ads.entity_scope(admin, entity_id)
+    if scope is None:
+        return APIResponse(data=_empty_resp, message="Entity not found")
+    entity, entity_role, clause = scope
 
-    entity = await User.get(eid)
-    if not entity:
-        return APIResponse(data=_empty_resp)
-
-    entity_role = entity.role.value if hasattr(entity.role, "value") else str(entity.role)
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
-    result = await ads.get_entity_users(eid, entity_role, start_utc, end_utc, page, page_size, search)
+    result = await ads.get_entity_users(
+        entity.id if entity else None, entity_role, start_utc, end_utc,
+        page, page_size, search, pool_clause=clause,
+    )
     return APIResponse(data=result)
 
 
@@ -474,15 +474,21 @@ async def export_entity_users_excel(
     from_date: str | None = Query(default=None),
     to_date: str | None = Query(default=None),
     preset: str | None = Query(default=None),
+    *,
+    user_id: Annotated[PydanticObjectId | None, Query(description="One row only (row button)")] = None,
     _: None = Depends(require_perm("users", "read")),
 ) -> StreamingResponse:
-    eid = PydanticObjectId(entity_id)
-    entity = await User.get(eid)
-    entity_name = (entity.full_name or entity.user_code or entity_id) if entity else entity_id
-    entity_role = (entity.role.value if hasattr(entity.role, "value") else str(entity.role)) if entity else "BROKER"
+    scope = await ads.entity_scope(admin, entity_id)
+    if scope is None:
+        raise NotFoundError("Entity not found")
+    entity, entity_role, clause = scope
+    entity_name = (entity.full_name or entity.user_code or entity_id) if entity else "Direct Users"
 
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
-    users_data = await ads.get_all_entity_users(eid, entity_role, start_utc, end_utc)
+    users_data = await ads.get_all_entity_users(
+        entity.id if entity else None, entity_role, start_utc, end_utc,
+        pool_clause=clause, user_id=user_id,
+    )
     label = _period_label(from_date, to_date, preset)
     data = ads.render_entity_users_excel(entity_name, users_data, label)
     filename = f"pnl_{entity_name}_{from_date or 'all'}_{to_date or 'time'}.xlsx"
@@ -502,15 +508,21 @@ async def export_entity_users_pdf(
     from_date: str | None = Query(default=None),
     to_date: str | None = Query(default=None),
     preset: str | None = Query(default=None),
+    *,
+    user_id: Annotated[PydanticObjectId | None, Query(description="One row only (row button)")] = None,
     _: None = Depends(require_perm("users", "read")),
 ) -> StreamingResponse:
-    eid = PydanticObjectId(entity_id)
-    entity = await User.get(eid)
-    entity_name = (entity.full_name or entity.user_code or entity_id) if entity else entity_id
-    entity_role = (entity.role.value if hasattr(entity.role, "value") else str(entity.role)) if entity else "BROKER"
+    scope = await ads.entity_scope(admin, entity_id)
+    if scope is None:
+        raise NotFoundError("Entity not found")
+    entity, entity_role, clause = scope
+    entity_name = (entity.full_name or entity.user_code or entity_id) if entity else "Direct Users"
 
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
-    users_data = await ads.get_all_entity_users(eid, entity_role, start_utc, end_utc)
+    users_data = await ads.get_all_entity_users(
+        entity.id if entity else None, entity_role, start_utc, end_utc,
+        pool_clause=clause, user_id=user_id,
+    )
     label = _period_label(from_date, to_date, preset)
     data = ads.render_entity_users_pdf(entity_name, users_data, label)
     filename = f"pnl_{entity_name}_{from_date or 'all'}_{to_date or 'time'}.pdf"
@@ -532,12 +544,14 @@ async def export_broker_totals_excel(
     preset: str | None = Query(default=None),
     _: None = Depends(require_perm("users", "read")),
 ) -> StreamingResponse:
-    eid = PydanticObjectId(entity_id)
-    entity = await User.get(eid)
-    entity_name = (entity.full_name or entity.user_code or entity_id) if entity else entity_id
+    scope = await ads.entity_scope(admin, entity_id)
+    if scope is None or scope[0] is None:
+        raise NotFoundError("Entity not found")
+    entity, _role, clause = scope
+    entity_name = entity.full_name or entity.user_code or entity_id
 
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
-    totals = await ads.compute_broker_totals(eid, start_utc, end_utc)
+    totals = await ads.compute_broker_totals(entity.id, start_utc, end_utc, clause)
     label = _period_label(from_date, to_date, preset)
     data = ads.render_broker_totals_excel(totals, entity_name, label)
     filename = f"broker_summary_{entity_name}_{from_date or 'all'}_{to_date or 'time'}.xlsx"
@@ -559,12 +573,14 @@ async def export_broker_totals_pdf(
     preset: str | None = Query(default=None),
     _: None = Depends(require_perm("users", "read")),
 ) -> StreamingResponse:
-    eid = PydanticObjectId(entity_id)
-    entity = await User.get(eid)
-    entity_name = (entity.full_name or entity.user_code or entity_id) if entity else entity_id
+    scope = await ads.entity_scope(admin, entity_id)
+    if scope is None or scope[0] is None:
+        raise NotFoundError("Entity not found")
+    entity, _role, clause = scope
+    entity_name = entity.full_name or entity.user_code or entity_id
 
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
-    totals = await ads.compute_broker_totals(eid, start_utc, end_utc)
+    totals = await ads.compute_broker_totals(entity.id, start_utc, end_utc, clause)
     label = _period_label(from_date, to_date, preset)
     data = ads.render_broker_totals_pdf(totals, entity_name, label)
     filename = f"broker_summary_{entity_name}_{from_date or 'all'}_{to_date or 'time'}.pdf"

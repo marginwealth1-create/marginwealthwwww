@@ -368,12 +368,24 @@ async def _audit_scope_user_ids(admin) -> list[PydanticObjectId] | None:
     underlying mongo filters (`assigned_admin_id` for admin,
     `broker_ancestry` for broker) walk the right subtree per role.
     """
-    from app.core.dependencies import scoped_user_filter
+    from app.core.dependencies import (
+        _admin_bool_perm,
+        effective_scope_actor,
+        scoped_user_filter,
+    )
     from app.models.user import User, UserRole
 
+    # An EMPLOYEE audits its parent's pool only with the `audit` grant (this
+    # route has no perm gate); without it, just its own events as before.
+    actor = admin
+    if actor.role == UserRole.EMPLOYEE and not _admin_bool_perm(
+        actor.admin_permissions, "audit"
+    ):
+        return [actor.id]
+    admin = await effective_scope_actor(actor)
     if admin.role == UserRole.SUPER_ADMIN:
         return None
-    ids: set[PydanticObjectId] = {admin.id}
+    ids: set[PydanticObjectId] = {admin.id, actor.id}
     # Use the SAME comprehensive pool clause the /admin/users list + the audit
     # page's own user-search run through (`scoped_user_filter` → `_pool_clause`).
     # For ADMIN that unions the directly-assigned users AND the transferred-

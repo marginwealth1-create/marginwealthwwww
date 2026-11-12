@@ -11,7 +11,14 @@ from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 
-from app.core.dependencies import CurrentAdmin, require_perm, scoped_user_ids
+from app.core.dependencies import (
+    CurrentAdmin,
+    assert_user_in_scope,
+    is_effective_super_admin,
+    require_perm,
+    scoped_user_ids,
+)
+from app.core.exceptions import InsufficientPermissionsError, NotFoundError
 from app.models.order import Order, OrderStatus
 from app.models.position import Position, PositionStatus
 from app.models.trade import Trade
@@ -38,7 +45,7 @@ async def users_report(
     admin: CurrentAdmin,
     _: None = Depends(require_perm("reports", "read")),
 ):
-    scope = await scoped_user_ids(admin)
+    scope = await scoped_user_ids(admin, all_pools=True)
     if not scope:
         return APIResponse(
             data={"total": 0, "active": 0, "blocked": 0, "by_role": {}, "last_24h_signups": 0}
@@ -62,7 +69,7 @@ async def financial_report(
     admin: CurrentAdmin,
     _: None = Depends(require_perm("reports", "read")),
 ):
-    scope = await scoped_user_ids(admin)
+    scope = await scoped_user_ids(admin, all_pools=True)
     if not scope:
         return APIResponse(
             data={
@@ -113,7 +120,7 @@ async def trades_report(
 ):
     today = now_utc() - timedelta(hours=24)
     week = now_utc() - timedelta(days=7)
-    scope = await scoped_user_ids(admin)
+    scope = await scoped_user_ids(admin, all_pools=True)
     if not scope:
         empty = {"count": 0, "volume": 0.0, "brokerage": 0.0, "charges": 0.0}
         return APIResponse(data={"today": empty, "week": empty})
@@ -137,7 +144,7 @@ async def compliance_report(
     admin: CurrentAdmin,
     _: None = Depends(require_perm("reports", "read")),
 ):
-    scope = await scoped_user_ids(admin)
+    scope = await scoped_user_ids(admin, all_pools=True)
     if not scope:
         return APIResponse(data={"kyc_verified": 0, "kyc_pending": 0})
     base = {"_id": {"$in": scope}}
@@ -167,6 +174,22 @@ def _fmt_dt_short(dt: datetime | None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
+async def _tradebook_user(admin: User, user_id: str) -> User:
+    """The super-admin's Accounts Dashboard lists every pool's clients, so its
+    Trade Book button must read any of them (closed ones included). Everyone
+    else keeps the scoped_user_ids gate."""
+    if await is_effective_super_admin(admin):
+        return await assert_user_in_scope(admin, user_id, for_read=True)
+    uid = PydanticObjectId(user_id)
+    scope = await scoped_user_ids(admin)
+    if uid not in scope:
+        raise InsufficientPermissionsError("User not in your scope")
+    user = await User.get(uid)
+    if not user:
+        raise NotFoundError("User not found")
+    return user
+
+
 @router.get("/tradebook/pdf")
 async def tradebook_pdf(
     user_id: str,
@@ -175,16 +198,8 @@ async def tradebook_pdf(
     from_date: datetime | None = None,
     to_date: datetime | None = None,
 ):
-    uid = PydanticObjectId(user_id)
-    scope = await scoped_user_ids(admin)
-    if uid not in scope:
-        from app.core.exceptions import InsufficientPermissionsError
-        raise InsufficientPermissionsError("User not in your scope")
-
-    user = await User.get(uid)
-    if not user:
-        from app.core.exceptions import NotFoundError
-        raise NotFoundError("User not found")
+    user = await _tradebook_user(admin, user_id)
+    uid = user.id
 
     now = now_utc()
     q_time: dict[str, Any] = {}
@@ -483,7 +498,7 @@ async def top_movers(
     # ── Clients: realised P&L over the window ───────────────────────────
     since = now_utc() - timedelta(days=days)
     match: dict[str, Any] = {"executed_at": {"$gte": since}, "pnl_inr": {"$ne": None}}
-    scope = await scoped_user_ids(admin)
+    scope = await scoped_user_ids(admin, all_pools=True)
     if scope is not None:
         if not scope:
             return APIResponse(
@@ -557,7 +572,7 @@ async def similar_activity(
     """
     since = now_utc() - timedelta(days=days)
     match: dict[str, Any] = {"executed_at": {"$gte": since}}
-    scope = await scoped_user_ids(admin)
+    scope = await scoped_user_ids(admin, all_pools=True)
     if scope is not None:
         if not scope:
             return APIResponse(data={"clusters": [], "window_sec": window_sec, "days": days})
@@ -654,7 +669,7 @@ async def slippage_report(
     as zero.
     """
     since = now_utc() - timedelta(days=days)
-    match = _execution_scope_match(since, await scoped_user_ids(admin))
+    match = _execution_scope_match(since, await scoped_user_ids(admin, all_pools=True))
     if match is None:
         return APIResponse(data={"rows": [], "totals": {}, "days": days, "group_by": group_by})
     match["expected_price"] = {"$ne": None}
@@ -749,7 +764,7 @@ async def latency_report(
     order and filling it.
     """
     since = now_utc() - timedelta(days=days)
-    match = _execution_scope_match(since, await scoped_user_ids(admin))
+    match = _execution_scope_match(since, await scoped_user_ids(admin, all_pools=True))
     if match is None:
         return APIResponse(data={"rows": [], "totals": {}, "days": days, "stale_ms": stale_ms})
     match["fill_latency_ms"] = {"$ne": None}

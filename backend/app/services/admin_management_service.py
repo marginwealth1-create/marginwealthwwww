@@ -345,7 +345,9 @@ async def reassign_user(
 ) -> User:
     """Move a user into a sub-admin's pool, or back to super-admin (None)."""
     target = await user_service.get_user_or_404(user_id)
-    if target.role in {UserRole.SUPER_ADMIN, UserRole.ADMIN}:
+    # EMPLOYEE too: moving a staff login to another admin would let it act on
+    # that admin's pool. Employees are managed via /admin/employees/* only.
+    if target.role in {UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.EMPLOYEE}:
         raise ConflictError("Cannot reassign an admin-role user")
 
     new_oid: PydanticObjectId | None = None

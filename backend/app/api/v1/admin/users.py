@@ -14,6 +14,7 @@ from app.core.dependencies import (
     CurrentAdmin,
     assert_role_aware_perm,
     assert_user_in_scope,
+    is_effective_super_admin,
     require_perm,
     scoped_user_filter,
 )
@@ -148,6 +149,7 @@ async def list_users(
             UserRole.SUPER_ADMIN.value,
             UserRole.ADMIN.value,
             UserRole.BROKER.value,
+            UserRole.EMPLOYEE.value,
         }:
             raise HTTPException(
                 status_code=400,
@@ -157,11 +159,14 @@ async def list_users(
     else:
         # Hide all admin-tier rows from the regular Users page — they live
         # at /admin/management/sub-admins and /admin/management/brokers.
+        # EMPLOYEE logins are staff stamped into their admin's pool, not
+        # clients (dashboard "Total users" already leaves them out).
         query["role"] = {
             "$nin": [
                 UserRole.SUPER_ADMIN.value,
                 UserRole.ADMIN.value,
                 UserRole.BROKER.value,
+                UserRole.EMPLOYEE.value,
             ]
         }
     if status:
@@ -195,7 +200,9 @@ async def list_users(
         query["is_demo"] = {"$ne": True}
         query["email"] = {"$not": re.compile(r"@demo\.local$", re.IGNORECASE)}
 
-    scope = await scoped_user_filter(admin)
+    # Super-admin (and its staff) READS every pool; writes stay strict, so
+    # rows in a sub-admin's pool are flagged read_only below.
+    scope = await scoped_user_filter(admin, all_pools=True)
     and_clauses: list[dict] = []
     if q:
         regex = re.compile(re.escape(q.strip()), re.IGNORECASE)
@@ -229,6 +236,11 @@ async def list_users(
         rows = [r for r in rows if not getattr(r, "is_demo", False) and "@demo.local" not in (r.email or "")]
     items = [_ser(u) for u in rows]
     await _enrich_admin_broker_names(items)
+    # Mirrors assert_user_in_scope: a super-admin writes only to unassigned
+    # users; the UI hides write actions on the rest until reassigned.
+    super_side = await is_effective_super_admin(admin)
+    for item in items:
+        item["read_only"] = super_side and item["assigned_admin_id"] is not None
 
     # Batch-load wallets for the page so the admin list can surface the
     # `available_balance` + `settlement_outstanding` columns. One round-trip
@@ -374,6 +386,16 @@ async def users_live_stats(
     from app.utils.decimal_utils import to_decimal
 
     # ── 1. Resolve target users (parse ids or query the admin's scope) ──
+    # Client-tier rows only, in BOTH branches: explicit ids must not reach an
+    # admin / broker / staff login (the super-admin's pool clause is {}).
+    client_roles = {
+        "$nin": [
+            UserRole.SUPER_ADMIN.value,
+            UserRole.ADMIN.value,
+            UserRole.BROKER.value,
+            UserRole.EMPLOYEE.value,
+        ]
+    }
     target_oids: list[PydanticObjectId] = []
     if user_ids:
         for raw in user_ids.split(","):
@@ -389,21 +411,19 @@ async def users_live_stats(
                 continue
         if not target_oids:
             return APIResponse(data={"items": []})
-        scope_query: dict[str, Any] = {"_id": {"$in": target_oids}}
-        scope_query.update(await scoped_user_filter(admin))
+        scope_query: dict[str, Any] = {
+            "_id": {"$in": target_oids},
+            "role": client_roles,
+        }
+        scope_query.update(await scoped_user_filter(admin, all_pools=True))
         users = await User.find(scope_query).to_list()
     else:
         scope_query = {
-            "role": {
-                "$nin": [
-                    UserRole.SUPER_ADMIN.value,
-                    UserRole.ADMIN.value,
-                    UserRole.BROKER.value,
-                ]
-            },
+            "role": client_roles,
             "status": {"$ne": UserStatus.CLOSED.value},
+            "is_demo": {"$ne": True},
         }
-        scope_query.update(await scoped_user_filter(admin))
+        scope_query.update(await scoped_user_filter(admin, all_pools=True))
         users = await User.find(scope_query).limit(200).to_list()
 
     if not users:
@@ -492,7 +512,7 @@ async def get_user(
     admin: CurrentAdmin,
     _: None = Depends(require_perm("users", "read")),
 ):
-    u = await assert_user_in_scope(admin, user_id)
+    u = await assert_user_in_scope(admin, user_id, for_read=True)
     detail = _ser(u)
     wallet = await wallet_service.summary(u.id)
     # Realized P&L that reconciles with deposits (balance = deposits + realised).
@@ -1322,7 +1342,11 @@ async def impersonate(user_id: str, admin: CurrentAdmin):
 
 # ── Live Trade Stats ────────────────────────────────────────────────
 @router.get("/{user_id}/live-trade-stats", response_model=APIResponse[dict])
-async def live_trade_stats(user_id: str, admin: CurrentAdmin):
+async def live_trade_stats(
+    user_id: str,
+    admin: CurrentAdmin,
+    _: None = Depends(require_perm("users", "read")),
+):
     """Per-user live trading snapshot for the admin row dropdown.
 
     Aggregates:
@@ -1352,7 +1376,7 @@ async def live_trade_stats(user_id: str, admin: CurrentAdmin):
     )
     from app.utils.decimal_utils import to_decimal
 
-    target = await assert_user_in_scope(admin, user_id)
+    target = await assert_user_in_scope(admin, user_id, for_read=True)
     wallet = await wallet_service.get_or_create(target.id)
 
     available = float(str(wallet.available_balance))

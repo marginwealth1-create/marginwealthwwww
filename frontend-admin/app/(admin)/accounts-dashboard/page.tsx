@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { toast } from "sonner";
 import {
   BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
@@ -55,6 +56,15 @@ function downloadBlob(blob: Blob, filename: string) {
   a.download = filename;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+/** Row download: save the blob, or toast why it failed (no silent no-op). */
+async function saveOrToast(fetchBlob: () => Promise<Blob>, filename: string) {
+  try {
+    downloadBlob(await fetchBlob(), filename);
+  } catch (err) {
+    toast.error(err instanceof Error ? err.message : "Download failed");
+  }
 }
 
 function downloadCSV(entities: AccountEntity[], grandTotal?: AccountEntity) {
@@ -1051,8 +1061,10 @@ function UserPnlRow({
             size="sm"
             className="h-7 text-[10px] px-2"
             onClick={async () => {
-              const blob = await AccountsAPI.exportEntityUsersExcel(entityId, dateParams);
-              downloadBlob(blob, `pnl_${u.user_code}.xlsx`);
+              await saveOrToast(
+                () => AccountsAPI.exportEntityUsersExcel(entityId, { ...dateParams, user_id: u.user_id }),
+                `pnl_${u.user_code}.xlsx`,
+              );
             }}
           >
             <FileSpreadsheet className="size-3 mr-0.5" /> Excel
@@ -1062,8 +1074,10 @@ function UserPnlRow({
             size="sm"
             className="h-7 text-[10px] px-2"
             onClick={async () => {
-              const blob = await AccountsAPI.exportEntityUsersPdf(entityId, dateParams);
-              downloadBlob(blob, `pnl_${u.user_code}.pdf`);
+              await saveOrToast(
+                () => AccountsAPI.exportEntityUsersPdf(entityId, { ...dateParams, user_id: u.user_id }),
+                `pnl_${u.user_code}.pdf`,
+              );
             }}
           >
             <FileText className="size-3 mr-0.5" /> PDF
@@ -1076,12 +1090,10 @@ function UserPnlRow({
             className="h-7 text-[10px] px-2"
             title="Full trade book (incl. weekly settlement)"
             onClick={async () => {
-              const blob = await ReportsAdminAPI.tradebookPdf(
-                u.user_id,
-                dateParams.from_date,
-                dateParams.to_date,
+              await saveOrToast(
+                () => ReportsAdminAPI.tradebookPdf(u.user_id, dateParams.from_date, dateParams.to_date),
+                `tradebook_${u.user_code}.pdf`,
               );
-              downloadBlob(blob, `tradebook_${u.user_code}.pdf`);
             }}
           >
             <BookOpen className="size-3 mr-0.5" /> Trade Book
@@ -1160,8 +1172,10 @@ function UserPnlCard({
           size="sm"
           className="h-8 text-[10px]"
           onClick={async () => {
-            const blob = await AccountsAPI.exportEntityUsersExcel(entityId, dateParams);
-            downloadBlob(blob, `pnl_${u.user_code}.xlsx`);
+            await saveOrToast(
+              () => AccountsAPI.exportEntityUsersExcel(entityId, { ...dateParams, user_id: u.user_id }),
+              `pnl_${u.user_code}.xlsx`,
+            );
           }}
         >
           <FileSpreadsheet className="size-3 mr-1" /> Excel
@@ -1171,8 +1185,10 @@ function UserPnlCard({
           size="sm"
           className="h-8 text-[10px]"
           onClick={async () => {
-            const blob = await AccountsAPI.exportEntityUsersPdf(entityId, dateParams);
-            downloadBlob(blob, `pnl_${u.user_code}.pdf`);
+            await saveOrToast(
+              () => AccountsAPI.exportEntityUsersPdf(entityId, { ...dateParams, user_id: u.user_id }),
+              `pnl_${u.user_code}.pdf`,
+            );
           }}
         >
           <FileText className="size-3 mr-1" /> PDF
@@ -1183,12 +1199,10 @@ function UserPnlCard({
           size="sm"
           className="h-8 text-[10px]"
           onClick={async () => {
-            const blob = await ReportsAdminAPI.tradebookPdf(
-              u.user_id,
-              dateParams.from_date,
-              dateParams.to_date,
+            await saveOrToast(
+              () => ReportsAdminAPI.tradebookPdf(u.user_id, dateParams.from_date, dateParams.to_date),
+              `tradebook_${u.user_code}.pdf`,
             );
-            downloadBlob(blob, `tradebook_${u.user_code}.pdf`);
           }}
         >
           <BookOpen className="size-3 mr-1" /> Trade Book

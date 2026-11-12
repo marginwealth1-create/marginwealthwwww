@@ -1374,7 +1374,11 @@ export const AccountsAPI = {
       api.get(`/admin/accounts/entity-users/${entityId}`, { params }),
     ),
 
-  exportEntityUsersExcel: async (entityId: string, params?: DateParams): Promise<Blob> => {
+  // user_id: one row only (row button), scoped to the entity server-side.
+  exportEntityUsersExcel: async (
+    entityId: string,
+    params?: DateParams & { user_id?: string },
+  ): Promise<Blob> => {
     const res = await api.get(`/admin/accounts/entity-users/${entityId}/export/excel`, {
       params,
       responseType: "blob",
@@ -1382,7 +1386,10 @@ export const AccountsAPI = {
     return res.data;
   },
 
-  exportEntityUsersPdf: async (entityId: string, params?: DateParams): Promise<Blob> => {
+  exportEntityUsersPdf: async (
+    entityId: string,
+    params?: DateParams & { user_id?: string },
+  ): Promise<Blob> => {
     const res = await api.get(`/admin/accounts/entity-users/${entityId}/export/pdf`, {
       params,
       responseType: "blob",

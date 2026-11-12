@@ -224,6 +224,11 @@ async def effective_scope_actor(admin: User) -> User:
     return parent if parent is not None else admin
 
 
+async def is_effective_super_admin(admin: User) -> bool:
+    """True for a SUPER_ADMIN or an EMPLOYEE whose parent is one."""
+    return (await effective_scope_actor(admin)).role == UserRole.SUPER_ADMIN
+
+
 def scoped_admin_filter(admin: User) -> dict:
     """Mongo filter to scope a User-collection query to the actor's own pool.
 
@@ -281,21 +286,22 @@ async def _admin_pool_clause(admin_id: PydanticObjectId) -> dict:
     }
 
 
-async def _pool_clause(admin: User) -> dict:
+async def _pool_clause(admin: User, *, all_pools: bool = False) -> dict:
     """Assignment clause for any admin-tier actor (no role/status filter).
 
     EMPLOYEE actors resolve to their PARENT admin first (effective_scope_actor)
-    so they operate on the parent's pool.
+    so they operate on the parent's pool. ``all_pools`` drops the clause for
+    the super-admin only (read-only views of every pool); others ignore it.
     """
     admin = await effective_scope_actor(admin)
     if admin.role == UserRole.SUPER_ADMIN:
-        return {"assigned_admin_id": None}
+        return {} if all_pools else {"assigned_admin_id": None}
     if admin.role == UserRole.BROKER:
         return {"broker_ancestry": admin.id}
     return await _admin_pool_clause(admin.id)
 
 
-async def scoped_user_filter(admin: User) -> dict:
+async def scoped_user_filter(admin: User, *, all_pools: bool = False) -> dict:
     """Async Mongo filter scoping a User query to the actor's owned pool,
     INCLUDING the broker subtree for ADMIN.
 
@@ -309,12 +315,15 @@ async def scoped_user_filter(admin: User) -> dict:
     keep their own ``role`` condition (every current caller already does).
     Combine with other ``$or`` conditions (e.g. a search box) via
     ``$and`` so the scope ``$or`` isn't clobbered.
+
+    ``all_pools=True`` (READ-only views): for an effective super-admin returns
+    ``{}`` — every pool. No effect for any other actor.
     """
-    return await _pool_clause(admin)
+    return await _pool_clause(admin, all_pools=all_pools)
 
 
 async def scoped_user_ids(
-    admin: User, *, include_closed: bool = False
+    admin: User, *, include_closed: bool = False, all_pools: bool = False
 ) -> list[PydanticObjectId]:
     """Returns the explicit list of user_ids the actor may touch.
 
@@ -330,9 +339,13 @@ async def scoped_user_ids(
     accounts aggregations. Pass ``True`` for FINANCIAL-record views (Money
     Transactions) where a deleted user's cash in/out must still be visible
     for audit — the money moved is real and doesn't disappear with the user.
+
+    ``all_pools`` (default False): for an effective super-admin, drop only the
+    pool clause (every pool's clients); role / demo / status filters still
+    apply. READ-only views only. Ignored for ADMIN / BROKER.
     """
     coll = User.get_motor_collection()
-    base = await _pool_clause(admin)
+    base = await _pool_clause(admin, all_pools=all_pools)
     q: dict = {
         **base,
         "role": {"$nin": _NON_CLIENT_ROLES},
@@ -415,8 +428,8 @@ async def assert_user_in_scope(
 ) -> User:
     """Loads the target user and 403s if the actor doesn't own them.
 
-    Admin-tier targets (SUPER_ADMIN / ADMIN / BROKER) are rejected here
-    — those are managed via the dedicated management endpoints. Pool
+    Admin-tier targets (SUPER_ADMIN / ADMIN / BROKER / EMPLOYEE) are rejected
+    here — those are managed via the dedicated management endpoints. Pool
     membership semantics per role:
       - SUPER_ADMIN: target.assigned_admin_id IS NULL
       - ADMIN: target.assigned_admin_id == admin.id
@@ -438,9 +451,11 @@ async def assert_user_in_scope(
     target = await User.get(oid)
     if target is None:
         raise NotFoundError("User not found")
-    if target.role in {UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.BROKER}:
+    if target.role in {
+        UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.BROKER, UserRole.EMPLOYEE
+    }:
         raise InsufficientPermissionsError(
-            "Cannot operate on an admin/broker user via this endpoint"
+            "Cannot operate on an admin/broker/staff user via this endpoint"
         )
     if admin.role == UserRole.SUPER_ADMIN:
         if target.assigned_admin_id is not None and not for_read:

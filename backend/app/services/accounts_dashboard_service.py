@@ -30,6 +30,8 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from app.core.dependencies import effective_scope_actor, scoped_user_filter
+from app.core.exceptions import InsufficientPermissionsError
 from app.models.pnl_sharing import AgreementStatus, AgreementType, PnlSharingAgreement
 from app.models.position import Position, PositionStatus
 from app.models.trade import Trade
@@ -44,6 +46,41 @@ from app.utils.time_utils import IST
 logger = logging.getLogger(__name__)
 
 TRADING_ROLES = [UserRole.CLIENT.value, UserRole.DEALER.value, UserRole.MASTER.value]
+
+# Virtual entity: the Brokers tab's "Direct Users (No Broker)" row (id "direct").
+DIRECT = "DIRECT"
+
+
+async def entity_scope(
+    admin: User, entity_id: str
+) -> tuple[User | None, str, dict[str, Any]] | None:
+    """The ONE scope guard behind every /admin/accounts entity endpoint.
+
+    Returns ``(entity, entity_role, caller_clause)``, or None for an unknown
+    id. ``"direct"`` gives ``(None, DIRECT, clause)``. An EMPLOYEE entity —
+    incl. the caller's own id, which the All Users tab sends — is its parent
+    admin's pool. The effective super-admin may name any entity (clause
+    ``{}``, D1); anyone else only itself or a BROKER inside its own pool
+    (403 otherwise), and its pool clause is ANDed into every user query.
+    """
+    clause = await scoped_user_filter(admin, all_pools=True)
+    if entity_id == "direct":
+        return None, DIRECT, clause
+    try:
+        entity = await User.get(PydanticObjectId(entity_id))
+    except Exception:
+        return None
+    if entity is None:
+        return None
+    entity = await effective_scope_actor(entity)
+    actor = await effective_scope_actor(admin)
+    if actor.role != UserRole.SUPER_ADMIN and entity.id != actor.id:
+        in_pool = entity.role == UserRole.BROKER and await User.find_one(
+            {"$and": [{"_id": entity.id}, clause]}
+        )
+        if not in_pool:
+            raise InsufficientPermissionsError("Entity is outside your scope")
+    return entity, entity.role.value, clause
 
 
 # ── Week options for dropdown ────────────────────────────────────────
@@ -84,8 +121,17 @@ async def _broker_client_ids(broker_id: PydanticObjectId) -> list[PydanticObject
 async def _entity_pool_ids(
     entity_id: PydanticObjectId,
     entity_role: str,
+    pool_clause: dict[str, Any] | None = None,
 ) -> list[PydanticObjectId]:
-    """User IDs in an entity's pool based on role."""
+    """User IDs in an entity's pool based on role, ANDed with the caller's
+    ``pool_clause`` (from entity_scope) when given."""
+    if entity_role == UserRole.EMPLOYEE.value:
+        # Staff works on its parent admin's pool. trading.py passes the
+        # caller's own (id, role) straight in, so resolve it here too.
+        emp = await User.get(entity_id)
+        if emp is not None:
+            parent = await effective_scope_actor(emp)
+            entity_id, entity_role = parent.id, parent.role.value
     coll = User.get_motor_collection()
     query: dict[str, Any] = {
         "role": {"$in": TRADING_ROLES},
@@ -104,7 +150,9 @@ async def _entity_pool_ids(
     elif entity_role in (UserRole.SUPER_ADMIN.value, "SUPER_ADMIN"):
         pass  # all users
     else:
-        query["assigned_broker_id"] = entity_id
+        return []  # default-deny: an unknown entity role means NO users, never all
+    if pool_clause:
+        query = {"$and": [query, pool_clause]}
     cursor = coll.find(query, {"_id": 1})
     return [doc["_id"] async for doc in cursor]
 
@@ -252,6 +300,7 @@ async def compute_broker_totals(
     entity_id: PydanticObjectId,
     start_utc: datetime | None,
     end_utc: datetime | None,
+    pool_clause: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute NET CLIENT PNL, BKG, TOTAL, SETTLEMENT, ACTUAL PNL, SHARING.
     Despite the name this also serves the ADMIN and SUPER_ADMIN tabs —
@@ -264,7 +313,7 @@ async def compute_broker_totals(
     if not entity:
         return _empty_broker_totals()
 
-    user_ids = await _entity_pool_ids(entity_id, entity.role.value)
+    user_ids = await _entity_pool_ids(entity_id, entity.role.value, pool_clause)
     # Operator-debug log — when "filter not working" complaints come in
     # we can grep journalctl for this line and confirm the dates that
     # actually reached the aggregation, ruling out a frontend bug.
@@ -474,26 +523,32 @@ def _empty_broker_totals() -> dict[str, Any]:
 # ── Per-user PNL breakdown within an entity ──────────────────────────
 
 async def get_entity_users(
-    entity_id: PydanticObjectId,
+    entity_id: PydanticObjectId | None,
     entity_role: str,
     start_utc: datetime | None,
     end_utc: datetime | None,
     page: int = 1,
     page_size: int = 15,
     search: str | None = None,
+    *,
+    pool_clause: dict[str, Any] | None = None,
+    user_id: PydanticObjectId | None = None,
 ) -> dict[str, Any]:
     """Paginated per-user PNL breakdown for an entity's client pool.
 
-    Operator request: only ACTIVE users surface here.  Previously this
-    filter was `status != CLOSED` so PENDING (never logged in) and
-    BLOCKED rows polluted the table with empty 0.00 lines.  The
-    aggregate pool totals card and broker tabs still walk the full
-    `assigned_*` graph — this filter is local to the per-user
-    pagination only.
+    Status filter is `status != CLOSED` — the same as the pool totals card
+    and the summary. BEHAVIOUR CHANGE: this used to be `status == ACTIVE`
+    (an operator request to hide empty 0.00 PENDING/BLOCKED rows), which
+    also dropped a kill-switched (BLOCKED) client who HAD traded, so the
+    rows and the per-user Excel/PDF summed short of the card and that
+    client could not be billed. The zero-activity guard below already keeps
+    empty rows out. ``pool_clause`` (the caller's, from entity_scope) is
+    ANDed in; ``user_id`` narrows to that one row inside the entity's scope
+    (an id outside it returns nothing).
     """
     user_query: dict[str, Any] = {
         "role": {"$in": TRADING_ROLES},
-        "status": UserStatus.ACTIVE.value,
+        "status": {"$ne": UserStatus.CLOSED.value},
         "is_demo": {"$ne": True},
     }
     if entity_role in (UserRole.BROKER.value, "BROKER"):
@@ -512,6 +567,11 @@ async def get_entity_users(
         if broker_ids:
             scope_filter.append({"assigned_broker_id": {"$in": broker_ids}})
         user_query["$or"] = scope_filter
+    elif entity_role == DIRECT:
+        user_query["assigned_broker_id"] = None
+    elif entity_role not in (UserRole.SUPER_ADMIN.value, "SUPER_ADMIN"):
+        # Default-deny: an unknown entity role means NO users, never all.
+        return {"items": [], "meta": {"page": 1, "page_size": page_size, "total": 0, "total_pages": 1}}
 
     if search and search.strip():
         import re
@@ -524,6 +584,10 @@ async def get_entity_users(
             user_query = {"$and": [user_query, {"$or": search_filter}]}
         else:
             user_query["$or"] = search_filter
+    if pool_clause:
+        user_query = {"$and": [user_query, pool_clause]}
+    if user_id is not None:
+        user_query = {"$and": [user_query, {"_id": user_id}]}
 
     # Scan ALL users matching the scope (no DB pagination) so the
     # post-filter "drop all-zero rows" step can yield a true paginated
@@ -696,15 +760,18 @@ async def get_entity_users(
 
 
 async def get_all_entity_users(
-    entity_id: PydanticObjectId,
+    entity_id: PydanticObjectId | None,
     entity_role: str,
     start_utc: datetime | None,
     end_utc: datetime | None,
+    *,
+    pool_clause: dict[str, Any] | None = None,
+    user_id: PydanticObjectId | None = None,
 ) -> list[dict[str, Any]]:
     """All users (no pagination) for export."""
     result = await get_entity_users(
         entity_id, entity_role, start_utc, end_utc,
-        page=1, page_size=10000,
+        page=1, page_size=10000, pool_clause=pool_clause, user_id=user_id,
     )
     return result["items"]
 

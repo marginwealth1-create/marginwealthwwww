@@ -19,6 +19,7 @@ from app.core.dependencies import (
     CurrentAdmin,
     SuperAdmin,
     assert_user_in_scope,
+    is_effective_super_admin,
     require_perm,
     scoped_user_ids,
     super_admin_direct_user_ids,
@@ -663,7 +664,8 @@ async def house_exposure(
         "status": PositionStatus.OPEN.value,
         "$or": [{"is_demo": {"$ne": True}}, {"is_demo": {"$exists": False}}],
     }
-    scope = await scoped_user_ids(admin)
+    # The house book is every pool's positions for the super-admin.
+    scope = await scoped_user_ids(admin, all_pools=True)
     if scope is not None:
         if not scope:
             return APIResponse(data={"rows": [], "totals": {}})
@@ -2545,9 +2547,13 @@ async def positions_pnl_summary(
 
     if user_filter_oid is not None:
         _acct_ids = [user_filter_oid]
-    elif own_scope and admin.role == UserRole.SUPER_ADMIN:
+    elif (
+        own_scope or admin.role == UserRole.EMPLOYEE
+    ) and await is_effective_super_admin(admin):
         # Super-admin Positions page: own direct users only (same pool as the
         # table above), so the Total-of-Both cards match that filtered book.
+        # Its staff gets the same book (its table is the direct pool too; the
+        # page sends own_scope only for the SUPER_ADMIN role).
         _acct_ids = await super_admin_direct_user_ids()
     else:
         _acct_ids = await _acct_pool(admin.id, admin.role.value)
