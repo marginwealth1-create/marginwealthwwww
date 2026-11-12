@@ -87,6 +87,11 @@ class Trade(TimestampMixin):
     # FINAL close — matching the admin Position-doc view. The wallet P&L is
     # already netted via the reopen's REVERSAL; this only governs display.
     superseded_by_reopen: bool = False
+    # Set with superseded_by_reopen by an admin DELETE: the fill leaves the
+    # FIFO cost book (list_closed_trade_events_fifo) altogether, so a deleted
+    # position's opening lots stop pricing later closes. Deletes made before
+    # this field existed left it unset.
+    fifo_deleted: bool = False
 
     executed_at: datetime = Field(default_factory=now_utc)
 

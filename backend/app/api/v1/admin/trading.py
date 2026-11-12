@@ -1269,6 +1269,49 @@ async def _supersede_settlement_pnl(p: Position) -> None:
         )
 
 
+async def _delete_window(p: Position) -> dict[str, Any]:
+    """The fills a delete of `p` takes back: its token and products over
+    [opened_at − 5s, (closed_at or now) + 3s]. A reopen keeps the first
+    opened_at, so that span can hold whole other positions on the key (one
+    opened and closed between the close and the reopen, a weekly predecessor)
+    — their fills are theirs, and stay."""
+    from datetime import timedelta
+
+    from app.utils.time_utils import now_utc
+
+    end = p.closed_at or now_utc()
+    lo = (p.opened_at or end) - timedelta(seconds=5)
+    hi = end + timedelta(seconds=3)
+    products = await position_service.fill_products(p, lo, end)
+    others = await Position.find(
+        {
+            "_id": {"$ne": p.id},
+            "user_id": p.user_id,
+            "instrument.token": p.instrument.token,
+            "product_type": {"$in": products},
+            "opened_at": {"$lte": hi},
+            "$or": [{"closed_at": None}, {"closed_at": {"$gte": lo}}],
+        }
+    ).to_list()
+    q: dict[str, Any] = {
+        "user_id": p.user_id,
+        "instrument.token": p.instrument.token,
+        "product_type": {"$in": products},
+        "executed_at": {"$gte": lo, "$lte": hi},
+    }
+    # ponytail: time spans, not ownership — a fill of `p` within 2s before
+    # another position opened is ceded to it. A Trade→Position link (§7.1)
+    # makes this exact.
+    spans = [
+        {"executed_at": {"$gte": o.opened_at - timedelta(seconds=2), "$lte": o.closed_at or hi}}
+        for o in others
+        if o.opened_at
+    ]
+    if spans:
+        q["$nor"] = spans
+    return q
+
+
 async def _net_delete_outstanding(user_id: PydanticObjectId) -> None:
     """A delete's reversal debit that found no free cash (it was locked as
     margin) is floored to 0 and parked in settlement_outstanding. Net that
@@ -2914,6 +2957,16 @@ async def delete_position(
     closing_brokerage = _Decimal("0")
     booked_total = _Decimal("0")
 
+    # One window for the brokerage refund, the supersede and the order wipe.
+    # A fill a reopen already undid was settled by that reopen.
+    from app.models.trade import Trade as _TradeDel
+
+    _win_fills = await _TradeDel.find(await _delete_window(p)).to_list()
+    _live = [t for t in _win_fills if not t.superseded_by_reopen]
+
+    def _charges(fills: list) -> _Decimal:
+        return sum((to_decimal(t.total_charges or t.brokerage or 0) for t in fills), _Decimal("0"))
+
     if is_open:
         # Release the locked margin back to available_balance. Best-effort:
         # release_margin is idempotent against drift (caps at used_margin),
@@ -2931,23 +2984,7 @@ async def delete_position(
         # paid brokerage. A delete leaves no trace, so reverse those too
         # (31-Oct V548MQ: a deleted open KPITTECH kept its rollover partial
         # close's -₹6,519.82 and that closed row could never be deleted).
-        from datetime import timedelta as _td_open
-        from app.models.trade import Trade as _TradeOpenDel
-        from app.utils.time_utils import now_utc as _now_open
-
-        _olo = (p.opened_at or _now_open()) - _td_open(seconds=5)
-        _fills = await _TradeOpenDel.find(
-            {
-                "user_id": p.user_id,
-                "instrument.token": p.instrument.token,
-                "product_type": {"$in": await position_service.fill_products(p, _olo, _now_open())},
-                "executed_at": {"$gte": _olo},
-                "superseded_by_reopen": {"$ne": True},
-            }
-        ).to_list()
-        open_charges = sum(
-            (to_decimal(t.total_charges or t.brokerage or 0) for t in _fills), _Decimal("0")
-        )
+        open_charges = _charges(_live)
         cash_refund = realized - open_charges
         if cash_refund != _Decimal("0"):
             try:
@@ -3075,55 +3112,14 @@ async def delete_position(
                     detail=f"Settlement unwind failed; delete aborted: {e}",
                 )
 
-        # ── Step B: look up brokerage on the closing Trade row ────────
-        closing_brokerage = _Decimal("0")
-        if p.closed_at is not None:
-            try:
-                from app.models.trade import Trade as _TradeModel
-                ct = await _TradeModel.find_one(
-                    {
-                        "user_id": p.user_id,
-                        "instrument.token": p.instrument.token,
-                        "pnl_inr": {"$ne": None},
-                        "executed_at": {
-                            "$gte": p.closed_at - _td_delta(seconds=15),
-                            "$lte": p.closed_at + _td_delta(seconds=15),
-                        },
-                    }
-                )
-                if ct is not None:
-                    closing_brokerage = to_decimal(ct.total_charges or ct.brokerage or 0)
-            except Exception:
-                closing_brokerage = _Decimal("0")
-
-        # ── Step B2: opening-leg brokerage ────────────────────────────
-        # A DELETE removes the WHOLE position, so the brokerage paid to OPEN
-        # it (every opening BUY fill — pnl_inr is None) must be refunded too,
-        # not just the closing leg. Reopen deliberately leaves this charged
-        # (the position stays open, so the open brokerage still applies), but
-        # delete fully unwinds the position. Operator caught the leak: after a
-        # delete the user's balance was short by exactly the opening brokerage
-        # (₹321 + ₹320 across cycles). Sum every opening fill across the
-        # position's lifecycle [opened_at, closed_at].
-        opening_brokerage = _Decimal("0")
-        if p.closed_at is not None:
-            try:
-                from app.models.trade import Trade as _TradeOpen
-                _olo = (p.opened_at or p.closed_at) - _td_delta(seconds=15)
-                _ohi = p.closed_at + _td_delta(seconds=15)
-                opens = await _TradeOpen.find(
-                    {
-                        "user_id": p.user_id,
-                        "instrument.token": p.instrument.token,
-                        "product_type": {"$in": await position_service.fill_products(p, _olo, _ohi)},
-                        "pnl_inr": None,  # opening fills carry no realized P&L
-                        "executed_at": {"$gte": _olo, "$lte": _ohi},
-                    }
-                ).to_list()
-                for ot in opens:
-                    opening_brokerage += to_decimal(ot.total_charges or ot.brokerage or 0)
-            except Exception:
-                opening_brokerage = _Decimal("0")
+        # ── Steps B / B2: brokerage of every fill the delete hides ────
+        # Every closing fill, partial closes included (one fill found near
+        # closed_at left the earlier partials charged while the supersede hid
+        # them), and every opening leg (pnl_inr None) — a DELETE unwinds the
+        # whole position. Same window as the supersede below, so a quick
+        # same-key re-entry keeps its own charges.
+        closing_brokerage = _charges([t for t in _live if t.pnl_inr is not None])
+        opening_brokerage = _charges([t for t in _live if t.pnl_inr is None])
 
         # ── Step C: cash reversal (PnL cash portion + brokerage) ──────
         # cash_refund = signed amount leaving wallet after this reversal
@@ -3167,48 +3163,34 @@ async def delete_position(
     # closing leg), a delete removes the whole position, so its opening-leg
     # brokerage must drop too — operator: "delete karne par brokerage bhi har
     # jagah se hat jaye". Window = the position's full life [opened_at,
-    # closed_at]; bounded by the doc's own timestamps so a parallel same-token
-    # position outside that span keeps its fills.
+    # closed_at] less other positions' spans (`_delete_window`).
+    #
+    # `fifo_deleted` also takes the fills out of the FIFO cost book: flagged
+    # only, the bare opening legs stayed queued and priced every later close
+    # on the script. A weekly settlement's re-seed of this position goes too.
     try:
-        from datetime import timedelta as _td_sup
-        from app.models.trade import Trade as _TradeSup
         from app.models.order import Order as _OrderSup
+        from app.models.position_settlement import PositionSettlement as _PSDel
         from app.utils.time_utils import now_utc as _now_sup
 
-        _lo = (p.opened_at or p.closed_at)
-        _hi = p.closed_at or _now_sup()  # OPEN delete: every fill up to now
         await _supersede_settlement_pnl(p)
-        if _lo is not None:
-            _sup_q: dict[str, Any] = {
-                "user_id": p.user_id,
-                "instrument.token": p.instrument.token,
-                "product_type": {
-                    "$in": await position_service.fill_products(p, _lo - _td_sup(seconds=5), _hi)
-                },
-                "executed_at": {
-                    "$gte": _lo - _td_sup(seconds=5),
-                    "$lte": _hi + _td_sup(seconds=3),
-                },
-            }
-            # Collect the fills' parent orders BEFORE flagging, so we can wipe
-            # them from the user's order blotter too.
-            _sup_trades = await _TradeSup.find(_sup_q).to_list()
-            _order_ids = list(
-                {t.order_id for t in _sup_trades if getattr(t, "order_id", None)}
-            )
-            await _TradeSup.get_motor_collection().update_many(
-                _sup_q, {"$set": {"superseded_by_reopen": True}}
-            )
-            # Bug: a deleted position's EXECUTED orders lingered in the user's
-            # Orders → Executed tab (the user list reads Order docs directly,
-            # which carry no superseded flag). Hard-remove them so a delete
-            # wipes the order everywhere, not just the trade/position/ledger.
-            # Operator: "trade delete karne par user side ke execute orders se
-            # bhi hat jaye."
-            if _order_ids:
-                await _OrderSup.get_motor_collection().delete_many(
-                    {"_id": {"$in": _order_ids}}
-                )
+        await _TradeDel.get_motor_collection().update_many(
+            {"_id": {"$in": [t.id for t in _win_fills]}},
+            {"$set": {"superseded_by_reopen": True, "fifo_deleted": True}},
+        )
+        # Bug: a deleted position's EXECUTED orders lingered in the user's
+        # Orders → Executed tab (the user list reads Order docs directly,
+        # which carry no superseded flag). Hard-remove them so a delete
+        # wipes the order everywhere, not just the trade/position/ledger.
+        # Operator: "trade delete karne par user side ke execute orders se
+        # bhi hat jaye."
+        _order_ids = list({t.order_id for t in _win_fills if getattr(t, "order_id", None)})
+        if _order_ids:
+            await _OrderSup.get_motor_collection().delete_many({"_id": {"$in": _order_ids}})
+        await _PSDel.get_motor_collection().update_many(
+            {"user_id": p.user_id, "new_position_id": p.id},
+            {"$set": {"successor_deleted_at": _now_sup()}},
+        )
     except Exception:
         logger.exception("delete_supersede_trades_failed", extra={"pos_id": str(p.id)})
 

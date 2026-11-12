@@ -19,6 +19,7 @@ from app.models._base import OrderAction, ProductType
 from app.models.holding import Holding
 from app.models.order import InstrumentRef
 from app.models.position import Position, PositionStatus, UserPositionTracker
+from app.models.position_settlement import PositionSettlement
 from app.utils.decimal_utils import (
     ZERO,
     add,
@@ -1185,8 +1186,9 @@ async def list_closed_trade_events_fifo(
     from collections import deque
     from app.models.trade import Trade
 
+    # A deleted position's fills are out of the book, opening legs included.
     trades = await (
-        Trade.find(Trade.user_id == PydanticObjectId(user_id))
+        Trade.find({"user_id": PydanticObjectId(user_id), "fifo_deleted": {"$ne": True}})
         .sort("-executed_at")
         .limit(3000)
         .to_list()
@@ -1237,6 +1239,23 @@ async def list_closed_trade_events_fifo(
     # its own and the closed blotter / tradebook would miss them (they showed on
     # the admin's Position-based view but not the user's Trade-based one).
     _SETTLE_REASONS = ("WEEKLY_SETTLEMENT", "EXPIRY_SETTLED")
+    # Weekly closes whose re-opened successor an admin later deleted: nothing
+    # holds the re-seeded lot any more.
+    _weekly = [_p.id for _p in closed_pos if _p.close_reason == "WEEKLY_SETTLEMENT"]
+    _successor_gone = (
+        {
+            s.old_position_id
+            for s in await PositionSettlement.find(
+                {
+                    "user_id": PydanticObjectId(user_id),
+                    "old_position_id": {"$in": _weekly},
+                    "successor_deleted_at": {"$ne": None},
+                }
+            ).to_list()
+        }
+        if _weekly
+        else set()
+    )
     _settle_boundaries: list[dict] = []
     for _p in closed_pos:
         if _p.close_reason not in _SETTLE_REASONS or not _p.closed_at:
@@ -1365,7 +1384,7 @@ async def list_closed_trade_events_fifo(
             # settled key so the next close prices off it); EXPIRY is terminal
             # (contract dead) — leave the queues empty, no reseed.
             _sq = open_queues.setdefault(b["key"], deque())
-            if b.get("close_reason") == "WEEKLY_SETTLEMENT":
+            if b.get("close_reason") == "WEEKLY_SETTLEMENT" and b["pid"] not in _successor_gone:
                 _sq.append({
                     "price": b["settle_price"],
                     "qty": b["qty"],
@@ -1590,7 +1609,8 @@ async def list_closed_trade_events_fifo(
     # opening fill in order) — but they must not render, otherwise a
     # reopened-then-reclosed position shows every intermediate close instead
     # of just its final one. This makes the user Closed blotter match the
-    # admin Position-doc view.
+    # admin Position-doc view. (A delete that stamped `fifo_deleted` took its
+    # fills out before the walk; only older deletes still reach here.)
     events = [e for e in events if not e.get("_superseded")]
 
     # Enrich events with close_reason from Position documents so the user

@@ -115,6 +115,9 @@ class PositionSettlement(TimestampMixin):
     status: PositionSettlementStatus = PositionSettlementStatus.PENDING
     error: str | None = None
     settled_at: datetime | None = None
+    # Set when an admin deletes new_position_id: the FIFO walk then stops
+    # re-seeding that position's lot at the settlement price.
+    successor_deleted_at: datetime | None = None
 
     is_demo: bool = False
 
