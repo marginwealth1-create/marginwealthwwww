@@ -18,6 +18,7 @@ ZERO: Decimal = Decimal("0")
 ONE: Decimal = Decimal("1")
 HUNDRED: Decimal = Decimal("100")
 PAISE: Decimal = Decimal("0.01")  # 2dp
+BASIS: Decimal = Decimal("0.000001")  # 6dp
 
 
 def to_decimal(value: Any) -> Decimal:
@@ -43,6 +44,14 @@ def to_decimal128(value: Any) -> Decimal128:
 def quantize_money(value: Decimal) -> Decimal:
     """Round to 2 decimal places using banker's rounding."""
     return value.quantize(PAISE, rounding=ROUND_HALF_EVEN)
+
+
+def quantize_basis(value: Decimal) -> Decimal:
+    """Round a derived cost basis / average price to 6 dp (banker's rounding).
+
+    An average is not a money amount: at 2 dp, 408.6166… stored as 408.62 and
+    a 15,000-unit close booked the 0.0033 error × 15,000."""
+    return value.quantize(BASIS, rounding=ROUND_HALF_EVEN)
 
 
 def quantize_price(value: Decimal, *, tick_size: Decimal | None = None) -> Decimal:

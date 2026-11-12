@@ -55,7 +55,7 @@ from bson import Decimal128
 from app.core.database import close_database, init_database
 from app.models.position import Position, PositionStatus
 from app.models.user import User
-from app.utils.decimal_utils import quantize_money, to_decimal
+from app.utils.decimal_utils import quantize_basis, quantize_money, to_decimal
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("merge_fragmented_positions")
@@ -107,8 +107,8 @@ def _plan_merge(positions: list[Position]) -> dict | None:
     if buy_qty <= 0 and sell_qty <= 0:
         return None
 
-    buy_avg = quantize_money(_wavg(buys, buy_qty))
-    sell_avg = quantize_money(_wavg(sells, sell_qty))
+    buy_avg = quantize_basis(_wavg(buys, buy_qty))
+    sell_avg = quantize_basis(_wavg(sells, sell_qty))
     offset = min(buy_qty, sell_qty)
     realized = (
         quantize_money((sell_avg - buy_avg) * to_decimal(offset)) if offset > 0 else ZERO

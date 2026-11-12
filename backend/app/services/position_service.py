@@ -22,6 +22,7 @@ from app.models.position import Position, PositionStatus, UserPositionTracker
 from app.utils.decimal_utils import (
     ZERO,
     add,
+    quantize_basis,
     quantize_money,
     sub,
     to_decimal,
@@ -164,7 +165,7 @@ async def apply_fill(
             # Same side (pyramiding): weighted avg, ADD the new leg's margin.
             total = to_decimal(abs(cur_qty) + abs(signed_qty))
             pos.avg_price = Decimal128(
-                str(quantize_money((cur_avg * to_decimal(abs(cur_qty)) + price * to_decimal(abs(signed_qty))) / total))
+                str(quantize_basis((cur_avg * to_decimal(abs(cur_qty)) + price * to_decimal(abs(signed_qty))) / total))
             )
             pos.quantity = new_qty
             pos.opening_quantity = max(float(pos.opening_quantity or 0), abs(new_qty))
@@ -252,7 +253,7 @@ async def apply_fill(
                     ) / rem
                     if new_basis < 0:
                         new_basis = to_decimal(0)
-                    pos.avg_price = Decimal128(str(quantize_money(new_basis)))
+                    pos.avg_price = Decimal128(str(quantize_basis(new_basis)))
                 # apply_brackets stays False — the surviving position is in
                 # its original direction with its original avg, so existing
                 # SL/TP remain valid (if any). The closing order's bracket
@@ -791,7 +792,7 @@ async def _apply_holding(
     if action == OrderAction.BUY:
         new_qty = h.quantity + quantity
         denom = to_decimal(max(1.0, new_qty))
-        new_avg = quantize_money(
+        new_avg = quantize_basis(
             (to_decimal(h.avg_price) * to_decimal(h.quantity) + price * qty_dec) / denom
         )
         h.quantity = new_qty
@@ -1075,7 +1076,7 @@ async def resync_closed_position_fills(position: Position) -> int:
         qty = abs(to_decimal(t.quantity))
         if t.pnl_inr is None:
             # Opening fill → new entry price.
-            t.price = to_decimal128(new_avg)
+            t.price = Decimal128(str(quantize_basis(new_avg)))
             t.value = to_decimal128(new_avg * to_decimal(t.quantity))
         else:
             # Closing fill → new close price + recomputed realised. Keep the
@@ -1083,7 +1084,7 @@ async def resync_closed_position_fills(position: Position) -> int:
             # match the matching-engine convention.
             gross = (new_close - new_avg) * qty * sign * fx
             close_brk = to_decimal(t.total_charges or t.brokerage or 0)
-            t.price = to_decimal128(new_close)
+            t.price = Decimal128(str(quantize_basis(new_close)))
             t.value = to_decimal128(new_close * to_decimal(t.quantity))
             t.pnl_inr = to_decimal128(quantize_money(gross - close_brk))
         await t.save()
@@ -2519,8 +2520,8 @@ async def consolidate_open_positions(user_id: PydanticObjectId | str) -> int:
         if buy_qty <= 0 and sell_qty <= 0:
             continue
 
-        buy_avg = quantize_money(_wavg(buys, buy_qty))
-        sell_avg = quantize_money(_wavg(sells, sell_qty))
+        buy_avg = quantize_basis(_wavg(buys, buy_qty))
+        sell_avg = quantize_basis(_wavg(sells, sell_qty))
         offset = min(buy_qty, sell_qty)
         realized = (
             quantize_money((sell_avg - buy_avg) * to_decimal(offset)) if offset > 0 else ZERO

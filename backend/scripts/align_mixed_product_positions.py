@@ -48,7 +48,7 @@ from app.core.database import close_database, init_database
 from app.models._base import ProductType
 from app.models.position import Position, PositionStatus
 from app.models.user import User
-from app.utils.decimal_utils import quantize_money, to_decimal
+from app.utils.decimal_utils import quantize_basis, quantize_money, to_decimal
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("align_mixed_product_positions")
@@ -158,7 +158,7 @@ async def _align_user(uid, apply: bool) -> dict[str, int]:
         wsum = ZERO
         for p in lots:
             wsum += to_decimal(p.avg_price) * to_decimal(abs(float(p.quantity or 0)))
-        wavg = quantize_money(wsum / to_decimal(total_abs))
+        wavg = quantize_basis(wsum / to_decimal(total_abs))
 
         # KEEPER = an existing NRML lot if present (its id/opened_at stay),
         # else the earliest lot (which we retype to NRML). We update ONE doc
