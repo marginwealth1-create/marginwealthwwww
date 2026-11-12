@@ -2081,9 +2081,30 @@ async def admin_reopen_position(
             _sup_q["product_type"] = {
                 "$in": await position_service.fill_products(p, _win.get("$gte", p.closed_at), _win["$lte"])
             }
-            await _TradeSup.get_motor_collection().update_many(
-                _sup_q, {"$set": {"superseded_by_reopen": True}}
+            # From now on the undone closes also leave the FIFO walk
+            # (superseded_at), so their lots are back for the re-close — but
+            # only when they took exactly the units this reopen restores and
+            # nothing has traded on the script since. Otherwise the walk would
+            # keep lots the position no longer holds, or re-pair a close
+            # already billed; those keep the flag alone (walked, rows hidden).
+            _set: dict[str, Any] = {"superseded_by_reopen": True}
+            _undone = await _TradeSup.find(_sup_q).to_list()
+            _units = sum(
+                min(abs(t.quantity), t.closed_quantity if t.closed_quantity is not None else abs(t.quantity))
+                for t in _undone
             )
+            _since = await _TradeSup.find_one(
+                {
+                    "user_id": p.user_id,
+                    "instrument.token": p.instrument.token,
+                    "executed_at": {"$gt": _win["$lte"]},
+                    "fifo_deleted": {"$ne": True},
+                    "superseded_at": None,
+                }
+            )
+            if abs(_units - opening_qty) < 1e-9 and _since is None:
+                _set["superseded_at"] = _now_utc()
+            await _TradeSup.get_motor_collection().update_many(_sup_q, {"$set": _set})
     except Exception:
         logger.exception("reopen_supersede_trades_failed", extra={"pos_id": str(p.id)})
 
@@ -2772,6 +2793,8 @@ async def position_netting_entries(
         "user_id": p.user_id,
         "instrument.token": p.instrument.token,
         "product_type": {"$in": list({_pt, "MIS"})},
+        # A close a reopen undid (or a deleted neighbour's fill) is not a leg.
+        "superseded_by_reopen": {"$ne": True},
     }
     time_q: dict = {}
     if p.opened_at:

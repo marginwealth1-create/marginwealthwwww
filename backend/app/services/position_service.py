@@ -1186,9 +1186,12 @@ async def list_closed_trade_events_fifo(
     from collections import deque
     from app.models.trade import Trade
 
-    # A deleted position's fills are out of the book, opening legs included.
+    # A deleted position's fills are out of the book, opening legs included,
+    # and so is a close a reopen undid from §2.6 on (superseded_at).
     trades = await (
-        Trade.find({"user_id": PydanticObjectId(user_id), "fifo_deleted": {"$ne": True}})
+        Trade.find(
+            {"user_id": PydanticObjectId(user_id), "fifo_deleted": {"$ne": True}, "superseded_at": None}
+        )
         .sort("-executed_at")
         .limit(3000)
         .to_list()

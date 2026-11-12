@@ -92,6 +92,11 @@ class Trade(TimestampMixin):
     # position's opening lots stop pricing later closes. Deletes made before
     # this field existed left it unset.
     fifo_deleted: bool = False
+    # Set with superseded_by_reopen by an admin REOPEN from §2.6 on: the undone
+    # close leaves the FIFO cost book, so its lots are back for the re-close.
+    # Fills flagged before carry none and are still walked (sent statements
+    # reproduce).
+    superseded_at: datetime | None = None
 
     executed_at: datetime = Field(default_factory=now_utc)
 
