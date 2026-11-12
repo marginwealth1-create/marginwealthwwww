@@ -1251,31 +1251,6 @@ async def list_positions(
     return APIResponse(data=out)
 
 
-async def _fill_products(p: Position, lo: datetime, hi: datetime) -> list[str]:
-    """Product books whose fills belong to `p` over [lo, hi]. A carried
-    position was opened as MIS and flipped to NRML at the EOD rollover, so its
-    opening (and pre-rollover partial-close) fills are MIS while the doc says
-    NRML — count those too, unless a separate MIS position on the same token
-    overlaps the window (then they're that position's fills)."""
-    from app.models._base import ProductType as _PT
-
-    products = [p.product_type.value]
-    if p.product_type == _PT.NRML:
-        other = await Position.find_one(
-            {
-                "_id": {"$ne": p.id},
-                "user_id": p.user_id,
-                "instrument.token": p.instrument.token,
-                "product_type": _PT.MIS.value,
-                "opened_at": {"$lte": hi},
-                "$or": [{"closed_at": None}, {"closed_at": {"$gte": lo}}],
-            }
-        )
-        if other is None:
-            products.append(_PT.MIS.value)
-    return products
-
-
 async def _supersede_settlement_pnl(p: Position) -> None:
     """A WEEKLY_SETTLEMENT close books its P&L as a wallet PNL row (no Trade
     row), which the P&L card sums directly. Reopen / delete reverse that P&L
@@ -2053,12 +2028,16 @@ async def admin_reopen_position(
             _sup_q: dict[str, Any] = {
                 "user_id": p.user_id,
                 "instrument.token": p.instrument.token,
-                "product_type": p.product_type.value,
                 "pnl_inr": {"$ne": None},
                 "executed_at": {"$lte": p.closed_at + _td_sup(seconds=3)},
             }
             if _cyc_start is not None:
                 _sup_q["executed_at"]["$gte"] = _cyc_start - _td_sup(seconds=1)
+            # A carried position's pre-rollover closes are MIS-stamped.
+            _win = _sup_q["executed_at"]
+            _sup_q["product_type"] = {
+                "$in": await position_service.fill_products(p, _win.get("$gte", p.closed_at), _win["$lte"])
+            }
             await _TradeSup.get_motor_collection().update_many(
                 _sup_q, {"$set": {"superseded_by_reopen": True}}
             )
@@ -2961,7 +2940,7 @@ async def delete_position(
             {
                 "user_id": p.user_id,
                 "instrument.token": p.instrument.token,
-                "product_type": {"$in": await _fill_products(p, _olo, _now_open())},
+                "product_type": {"$in": await position_service.fill_products(p, _olo, _now_open())},
                 "executed_at": {"$gte": _olo},
                 "superseded_by_reopen": {"$ne": True},
             }
@@ -3136,7 +3115,7 @@ async def delete_position(
                     {
                         "user_id": p.user_id,
                         "instrument.token": p.instrument.token,
-                        "product_type": {"$in": await _fill_products(p, _olo, _ohi)},
+                        "product_type": {"$in": await position_service.fill_products(p, _olo, _ohi)},
                         "pnl_inr": None,  # opening fills carry no realized P&L
                         "executed_at": {"$gte": _olo, "$lte": _ohi},
                     }
@@ -3203,7 +3182,9 @@ async def delete_position(
             _sup_q: dict[str, Any] = {
                 "user_id": p.user_id,
                 "instrument.token": p.instrument.token,
-                "product_type": {"$in": await _fill_products(p, _lo - _td_sup(seconds=5), _hi)},
+                "product_type": {
+                    "$in": await position_service.fill_products(p, _lo - _td_sup(seconds=5), _hi)
+                },
                 "executed_at": {
                     "$gte": _lo - _td_sup(seconds=5),
                     "$lte": _hi + _td_sup(seconds=3),

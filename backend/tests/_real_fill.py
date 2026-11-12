@@ -42,17 +42,25 @@ async def _no_quote(_token: str) -> dict:
 
 
 async def market(
-    user: User, action: str, qty: float, price: str, *, at: datetime | None = None
+    user: User,
+    action: str,
+    qty: float,
+    price: str,
+    *,
+    at: datetime | None = None,
+    product: ProductType = ProductType.MIS,
 ) -> Trade:
     """Fill a MARKET order for `user`. `at` moves only the Trade's clock into a
-    test's window; the brokerage on it is whatever the engine charged."""
+    test's window; the brokerage on it is whatever the engine charged.
+    `product` is the order's product type as order_service stamps it (NRML once
+    an open carried position makes a later order adopt it)."""
     order = Order(
         order_number=f"TB{secrets.token_hex(6)}",
         user_id=user.id,
         instrument=INSTRUMENT,
         action=OrderAction(action),
         order_type=OrderType.MARKET,
-        product_type=ProductType.MIS,
+        product_type=product,
         lots=qty,
         quantity=qty,
         pending_quantity=qty,

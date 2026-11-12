@@ -7,6 +7,7 @@ and for CNC trades writes/updates the long-term Holding record.
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -997,6 +998,29 @@ async def list_closed_trade_events(
     return events[:limit]
 
 
+async def fill_products(p: Position, lo: datetime, hi: datetime) -> list[str]:
+    """Product books whose fills belong to `p` over [lo, hi]. A carried
+    position was opened as MIS and flipped to NRML at the EOD rollover, so its
+    opening (and pre-rollover partial-close) fills are MIS while the doc says
+    NRML — count those too, unless a separate MIS position on the same token
+    overlaps the window (then they're that position's fills)."""
+    products = [p.product_type.value]
+    if p.product_type == ProductType.NRML:
+        other = await Position.find_one(
+            {
+                "_id": {"$ne": p.id},
+                "user_id": p.user_id,
+                "instrument.token": p.instrument.token,
+                "product_type": ProductType.MIS.value,
+                "opened_at": {"$lte": hi},
+                "$or": [{"closed_at": None}, {"closed_at": {"$gte": lo}}],
+            }
+        )
+        if other is None:
+            products.append(ProductType.MIS.value)
+    return products
+
+
 async def resync_closed_position_fills(position: Position) -> int:
     """Push an admin-edited CLOSED position's prices/P&L back onto its
     underlying Trade fills so the user-facing Closed blotter reflects it.
@@ -1029,7 +1053,7 @@ async def resync_closed_position_fills(position: Position) -> int:
         {
             "user_id": position.user_id,
             "instrument.token": position.instrument.token,
-            "product_type": position.product_type.value,
+            "product_type": {"$in": await fill_products(position, lo, hi)},
             "executed_at": {"$gte": lo, "$lte": hi},
         }
     ).to_list()
@@ -1065,6 +1089,39 @@ async def resync_closed_position_fills(position: Position) -> int:
         await t.save()
         updated += 1
     return updated
+
+
+def _one_book_tokens(positions: list[Position]) -> set[str]:
+    """Tokens whose fills form ONE FIFO book whatever their product type.
+
+    The EOD carry flips a surviving MIS position to NRML and leaves its
+    opening fills stamped MIS, and every later order on that token adopts
+    NRML. Keyed on the FILL's product type, one position's lots sat in two
+    queues: a close after the flip paired against half its own book
+    (sign-flipped rows), units it could not pair were dropped, and the
+    stranded lot later priced a fresh round trip. Only a token that HELD
+    positions under two product types at the same time keeps them apart —
+    those are genuinely separate books.
+    """
+    spans: dict[str, list[tuple]] = {}
+    for p in positions:
+        spans.setdefault(p.instrument.token, []).append(
+            (
+                p.opened_at.replace(tzinfo=None) if p.opened_at else datetime.min,
+                p.closed_at.replace(tzinfo=None) if p.closed_at else datetime.max,
+                p.product_type.value,
+            )
+        )
+    out: set[str] = set()
+    for token, rows in spans.items():
+        ends: dict[str, Any] = {}  # product → latest close among those opened so far
+        for opened, closed, product in sorted(rows):
+            if any(end > opened for k, end in ends.items() if k != product):
+                break  # held at once with a position under another product type
+            ends[product] = max(ends.get(product, closed), closed)
+        else:
+            out.add(token)
+    return out
 
 
 async def list_closed_trade_events_fifo(
@@ -1115,13 +1172,16 @@ async def list_closed_trade_events_fifo(
     from datetime import datetime as _datetime
     from app.models.position import Position, PositionStatus
 
-    closed_pos = await Position.find(
-        Position.user_id == PydanticObjectId(user_id),
-        Position.status == PositionStatus.CLOSED,
-    ).to_list()
+    _all_pos = await Position.find(Position.user_id == PydanticObjectId(user_id)).to_list()
+    closed_pos = [_p for _p in _all_pos if _p.status == PositionStatus.CLOSED]
 
     def _naive(dt: Any) -> Any:
         return dt.replace(tzinfo=None) if dt else _datetime.min
+
+    _one_book = _one_book_tokens(_all_pos)
+
+    def _bookkey(token: str, product: str) -> tuple[str, str]:
+        return (token, "") if token in _one_book else (token, product)
 
     # One boundary per settlement-style close (WEEKLY_SETTLEMENT or
     # EXPIRY_SETTLED), to be merged into the walk. Both close the position
@@ -1148,7 +1208,7 @@ async def list_closed_trade_events_fifo(
         )
         _settle_boundaries.append({
             "ts": _p.closed_at,
-            "key": (_p.instrument.token, _p.product_type.value),
+            "key": _bookkey(_p.instrument.token, _p.product_type.value),
             "entry_price": float(str(_p.avg_price)),  # this cycle's entry
             "settle_price": float(str(_p.ltp)),       # settlement LTP = new avg
             "qty": _sq,
@@ -1267,7 +1327,7 @@ async def list_closed_trade_events_fifo(
             continue
 
         t = _obj
-        key = (t.instrument.token, t.product_type.value)
+        key = _bookkey(t.instrument.token, t.product_type.value)
         qty = abs(float(t.quantity))
         if qty <= 0:
             continue
@@ -1459,13 +1519,13 @@ async def list_closed_trade_events_fifo(
         # (token, product_type) → [(closed_at, close_reason), ...]
         _pos_map: dict[tuple, list] = {}
         for _p in closed_pos:
-            _k = (_p.instrument.token, _p.product_type.value)
+            _k = _bookkey(_p.instrument.token, _p.product_type.value)
             if _p.closed_at:
                 _pos_map.setdefault(_k, []).append((_p.closed_at, _p.close_reason or "USER"))
         for ev in events:
             if ev.get("close_reason"):
                 continue  # already set (e.g. inline settlement rows)
-            _k = (ev["instrument_token"], ev["product_type"].value)
+            _k = _bookkey(ev["instrument_token"], ev["product_type"].value)
             _entries = _pos_map.get(_k)
             if _entries:
                 _cat = ev["closed_at"]
@@ -1497,10 +1557,6 @@ async def list_closed_trade_events_fifo(
     # position that was open on that instrument when the close happened.
     _unknown = [ev for ev in events if ev.get("_open_unknown")]
     if _unknown:
-        _all_pos = closed_pos + await Position.find(
-            Position.user_id == PydanticObjectId(user_id),
-            Position.status == PositionStatus.OPEN,
-        ).to_list()
         for ev in _unknown:
             _cat = _naive(ev["closed_at"])
             _cands = [
