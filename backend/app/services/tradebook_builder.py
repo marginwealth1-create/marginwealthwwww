@@ -6,11 +6,10 @@ Closed tab uses (``position_service.list_closed_trade_events_fifo``), so the
 PDF matches the Closed tab **entry-by-entry** with the **same net P&L** — no
 average-cost drift, no "tradebook aur closed-trade alag" mismatch.
 
-Why not the per-``Trade.pnl_inr`` list the reports used before: ``pnl_inr`` is
-booked off the NETTED position's weighted-average price, while the Closed tab
-walks a FIFO queue (sell matched to the oldest buy lot). Totals agree only for
-fully-flat positions; per-row entry price + P&L attribution diverged. Rendering
-the FIFO events makes every row identical to what the user sees in the app.
+The FIFO lots decide which fills a close takes off the book and how brokerage
+splits; each row is priced at what the wallet booked for that close
+(``Trade.pnl_inr``: the engine's average, or a specific-lot basis), so the
+statement, the Closed tab and the wallet agree period by period.
 """
 
 from __future__ import annotations

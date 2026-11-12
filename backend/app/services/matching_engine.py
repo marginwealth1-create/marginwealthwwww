@@ -446,16 +446,29 @@ async def execute_market_order(
     pnl_inr_dec: Decimal | None = None
     raw_pnl_inr_dec: Decimal | None = None
     fill_fx: Decimal | None = None
+    lot_basis: Decimal | None = None  # the specific-lot basis actually applied
     if is_closing and existing_pos is not None:
         cur_qty = to_decimal(existing_pos.quantity)
         avg = to_decimal(existing_pos.avg_price)
+        closed_qty = min(abs(cur_qty), qty_dec)
         # Specific-lot close: realize against the tapped fill's entry price
         # instead of the position average. Opt-in — set ONLY by the Active-tab
-        # per-fill Exit; every other close leaves _cbo None → avg-price as before.
+        # per-fill Exit; every other close leaves it None → avg-price as before.
+        # A per-fill exit parked before this position opened (a weekly
+        # settlement has re-opened it at the settle price since) names a lot of
+        # the previous cycle, already settled — it closes at the average.
         _cbo = getattr(order, "cost_basis_override", None)
-        if _cbo is not None:
-            avg = to_decimal(_cbo)
-        closed_qty = min(abs(cur_qty), qty_dec)
+        if (
+            _cbo is not None
+            and existing_pos.opened_at is not None
+            and order.created_at.replace(tzinfo=None) < existing_pos.opened_at.replace(tzinfo=None)
+        ):
+            _cbo = None
+        lot_basis = position_service.basis_override(
+            existing_pos, closed_qty, to_decimal(_cbo) if _cbo is not None else None
+        )
+        if lot_basis is not None:
+            avg = lot_basis
         sign = Decimal(1) if cur_qty > 0 else Decimal(-1)
         raw_realized = (ltp - avg) * closed_qty * sign
         # Converted only for a position opened under the USD→INR rate; one
@@ -496,10 +509,10 @@ async def execute_market_order(
             str(quantize_money(notional + (charges.total if order.action == OrderAction.SELL else -charges.total)))
         ),
         pnl_inr=Decimal128(str(pnl_inr_dec)) if pnl_inr_dec is not None else None,
-        # Carry the specific-lot basis onto the Trade so the FIFO closed-blotter
-        # pairs this close with the SAME lot the P&L booked against. None for
-        # every non-Active-tab-Exit close → unchanged FIFO display.
-        cost_basis_override=getattr(order, "cost_basis_override", None) if is_closing else None,
+        # Carry the specific-lot basis onto the Trade — only when it was applied
+        # — so the FIFO closed-blotter pairs this close with the SAME lot the
+        # P&L booked against. None for every average-price close.
+        cost_basis_override=_money(lot_basis),
         expected_price=_money(to_decimal(expected_price) if expected_price else None),
         reference_ltp=_money(raw_ltp),
         bid_at_fill=_money(bid),
@@ -551,11 +564,7 @@ async def execute_market_order(
         stop_loss=sl_dec,
         target=tp_dec,
         is_demo=bool(getattr(order, "is_demo", False)),
-        cost_basis_override=(
-            to_decimal(getattr(order, "cost_basis_override", None))
-            if getattr(order, "cost_basis_override", None) is not None
-            else None
-        ),
+        cost_basis_override=lot_basis,
     )
 
     # ── P&L sharing WS notify on Position close ──────────────────────

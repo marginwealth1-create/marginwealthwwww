@@ -50,12 +50,14 @@ async def market(
     at: datetime | None = None,
     product: ProductType = ProductType.MIS,
     basis: str | None = None,
+    placed_at: datetime | None = None,
 ) -> Trade:
     """Fill a MARKET order for `user`. `at` moves only the Trade's clock into a
     test's window; the brokerage on it is whatever the engine charged.
     `product` is the order's product type as order_service stamps it (NRML once
     an open carried position makes a later order adopt it). `basis` is the
-    tapped fill's price on an Active-tab specific-lot Exit."""
+    tapped fill's price on an Active-tab specific-lot Exit. `placed_at` backdates
+    the order, as for a parked exit that fires now."""
     order = Order(
         order_number=f"TB{secrets.token_hex(6)}",
         user_id=user.id,
@@ -70,6 +72,8 @@ async def market(
         placed_by=user.id,
         cost_basis_override=Decimal(basis) if basis is not None else None,
     )
+    if placed_at is not None:
+        order.created_at = placed_at
     await order.insert()
     with patch.object(market_data_service, "get_quote", _no_quote):
         trade = await matching_engine.execute_market_order(

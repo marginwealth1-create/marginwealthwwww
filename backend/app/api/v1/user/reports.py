@@ -476,9 +476,8 @@ async def tradebook_full_pdf(
     money_txs = await WalletTransaction.find(tx_q).sort("+created_at").to_list()
 
     # Closed rows come from the SAME FIFO reconstruction the app's Closed tab
-    # renders, so the PDF matches the Closed tab entry-by-entry (FIFO entry
-    # price → close price → gross P&L) — not the netted-average pnl_inr, which
-    # attributed per-row P&L differently and never lined up with the Closed tab.
+    # renders, so the PDF matches the Closed tab entry-by-entry, each row priced
+    # at what the wallet booked for that close.
     from app.services.tradebook_builder import fifo_closed_rows
 
     closed_rows, _fifo_net_pnl, sum_brokerage = await fifo_closed_rows(

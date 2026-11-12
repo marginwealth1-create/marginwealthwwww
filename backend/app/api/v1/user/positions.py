@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from typing import Any
 
 from beanie import PydanticObjectId
@@ -129,6 +130,19 @@ def _parse_position_id(position_id: str) -> PydanticObjectId:
         return PydanticObjectId(position_id)
     except Exception:  # bson.errors.InvalidId
         raise HTTPException(status_code=404, detail="Position not found")
+
+
+def _lot_basis(p: Position, t: Any) -> str | None:
+    """The tapped fill's price as a specific-lot exit basis — None (exit at the
+    average) when the fill predates `p`: a weekly settlement re-opened the
+    position at the settle price, so that lot's move is settled and the lot is
+    no longer one of its. 2 s grace: opened_at is stamped just after the
+    opening fill."""
+    if p.opened_at and t.executed_at and (
+        t.executed_at.replace(tzinfo=None) < p.opened_at.replace(tzinfo=None) - timedelta(seconds=2)
+    ):
+        return None
+    return str(t.price)
 
 
 def _effective_qty(p: Position) -> tuple[float, float, int]:
@@ -1783,7 +1797,7 @@ async def close_active_trade(trade_id: str, user: CurrentUser):
             # own entry price, not the position average (operator: "active me
             # 105 close karu to 105 ki hi entry close ho, FIFO/avg mat lagao").
             # Native fill price; only this Active-tab path sets it.
-            "cost_basis_override": str(t.price),
+            "cost_basis_override": _lot_basis(p, t),
         },
     )
 
@@ -1883,7 +1897,6 @@ async def _ensure_fill_sl_tp(user, p, t, sl_val, tp_val, set_sl: bool, set_tp: b
         qty = abs(float(t.quantity))
     lot_size = max(1, int(p.instrument.lot_size or 1))
     lots = qty / lot_size if lot_size else qty
-    basis = float(str(t.price))
     group = str(t.id)
 
     existing = await Order.find(
@@ -1908,7 +1921,7 @@ async def _ensure_fill_sl_tp(user, p, t, sl_val, tp_val, set_sl: bool, set_tp: b
         "lots": lots,
         "force_quantity": qty,
         "is_squareoff": True,
-        "cost_basis_override": str(basis),
+        "cost_basis_override": _lot_basis(p, t),
         "sl_tp_source_trade_id": str(t.id),
         "oco_group_id": group,
         "placed_from": "WEB",

@@ -35,6 +35,26 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def basis_override(pos: Position, closed_qty: Any, override: Decimal | None) -> Decimal | None:
+    """The specific-lot basis a close of `pos` may realize against — None
+    means the position average.
+
+    Only a PARTIAL close honours it: the survivors' average is re-derived as
+    (avg·Q − basis·q) / (Q − q), so the cycle still books exactly what the
+    lots cost. A close that takes the whole position leaves no survivor to
+    carry (avg − basis), so it books at the average — exiting the Active
+    tab's last lot after an average-price close lost that difference for
+    good. A basis that would drive the survivors' average below zero is
+    refused too (it was floored at 0 and the money dropped)."""
+    if override is None:
+        return None
+    held = to_decimal(abs(pos.quantity))
+    q = to_decimal(closed_qty)
+    if q >= held or to_decimal(pos.avg_price) * held < override * q:
+        return None
+    return override
+
+
 async def apply_fill(
     *,
     user_id: PydanticObjectId,
@@ -180,6 +200,7 @@ async def apply_fill(
             # tapped fill's entry price, else the position average. Kept in
             # lockstep with matching_engine's raw_realized so Trade.pnl, the
             # wallet PNL move and pos.realized_pnl all agree.
+            cost_basis_override = basis_override(pos, closed_qty, cost_basis_override)
             basis = cost_basis_override if cost_basis_override is not None else cur_avg
             realized = (price - basis) * to_decimal(closed_qty) * sign
             pos.realized_pnl = Decimal128(str(quantize_money(to_decimal(pos.realized_pnl) + realized)))
@@ -251,8 +272,6 @@ async def apply_fill(
                         cur_avg * to_decimal(abs(cur_qty))
                         - basis * to_decimal(closed_qty)
                     ) / rem
-                    if new_basis < 0:
-                        new_basis = to_decimal(0)
                     pos.avg_price = Decimal128(str(quantize_basis(new_basis)))
                 # apply_brackets stays False — the surviving position is in
                 # its original direction with its original avg, so existing
@@ -1092,6 +1111,18 @@ async def resync_closed_position_fills(position: Position) -> int:
     return updated
 
 
+def _booked_gross(t: Any) -> Decimal | None:
+    """The native gross the engine booked on closing fill `t`, or None for an
+    unstamped fill. pnl_inr is that gross in rupees, net of the close
+    brokerage — whatever basis it was realized against (the position average,
+    a specific-lot override, an admin edit's resync)."""
+    if t.pnl_inr is None:
+        return None
+    gross = to_decimal(t.pnl_inr) + to_decimal(t.total_charges or t.brokerage or 0)
+    fx = to_decimal(t.fx_rate) if getattr(t, "fx_rate", None) is not None else ZERO
+    return gross / fx if fx > 0 else gross
+
+
 def _one_book_tokens(positions: list[Position]) -> set[str]:
     """Tokens whose fills form ONE FIFO book whatever their product type.
 
@@ -1141,11 +1172,11 @@ async def list_closed_trade_events_fifo(
     Example — user holds:
         Fill A: BUY 100 @ 4339.89
         Fill B: BUY 100 @ 4339.99
-    User sells 150 qty → two rows:
-        Row 1: 100 @ entry 4339.89 → close px
-        Row 2:  50 @ entry 4339.99 → close px
-
-    P&L per row = (close_price - entry_price) × qty  (for BUY positions).
+    User sells 150 qty → two rows: 100 against fill A, 50 against fill B.
+    The lots decide which fills survive, the rows' opened_at and the
+    brokerage split; a stamped close is PRICED at what the wallet booked (the
+    engine's average, or a specific-lot basis), so entry_price is that basis
+    and P&L per row = (close_price - entry_price) × qty (for BUY positions).
     Brokerage is split proportionally across the sub-rows that a single
     closing trade produces.
 
@@ -1393,13 +1424,7 @@ async def list_closed_trade_events_fifo(
             # zero-priced fills the matching engine sometimes writes.
             if t.pnl_inr is not None and qty > 0 and price > 0:
                 close_brk = _charge(t)
-                gross = float(str(t.pnl_inr)) + close_brk  # back out brokerage → raw gross
-                # pnl_inr is rupees; entry recovery needs the native gross.
-                _fx = getattr(t, "fx_rate", None)
-                if _fx is not None:
-                    _fx_v = float(str(_fx))
-                    if _fx_v > 0:
-                        gross /= _fx_v
+                gross = float(_booked_gross(t))  # pnl_inr in native units, brokerage backed out
                 # The closing action is the OPPOSITE of the opening side.
                 opened_side = "SELL" if is_buy else "BUY"
                 if opened_side == "BUY":
@@ -1432,6 +1457,18 @@ async def list_closed_trade_events_fifo(
         close_brk = _charge(t)
         remaining = qty
         sub_idx = 0
+        # Bill the close at what the wallet was charged. The engine books
+        # (close − Position.avg_price) × qty — or against a specific-lot basis,
+        # whose cost the re-derived average then releases — and stamps it on
+        # pnl_inr. Pricing off each lot's own price billed the same trade a
+        # second way: a partly closed pyramid printed a different week, and
+        # across a weekly settlement (booked off the engine average) the gap
+        # never washed out. The lots still decide which fills survive, the
+        # opened_at and the brokerage split; the stamp is shared pro rata over
+        # the units this close takes off the book. Unstamped (legacy) closes
+        # keep the lot price.
+        _booked = _booked_gross(t)
+        _units = to_decimal(min(qty, sum(f["qty"] for f in q)))
         # Specific-lot close (Active-tab Exit): this closing trade was booked
         # against a SPECIFIC tapped fill (cost_basis_override), not the FIFO
         # front — so pair it with the queued opening fill whose entry price
@@ -1465,7 +1502,12 @@ async def list_closed_trade_events_fifo(
             eff_basis = _basis if _basis is not None else front["price"]
 
             # Gross P&L for this (opening-fill × closing-fill) pairing
-            if front["side"] == "BUY":
+            if _booked is not None and _units > 0:
+                gross = float(_booked * to_decimal(consume) / _units)
+                _per_unit = _booked / _units
+                _px = to_decimal(t.price)
+                eff_basis = float(_px - _per_unit if front["side"] == "BUY" else _px + _per_unit)
+            elif front["side"] == "BUY":
                 gross = (price - eff_basis) * consume   # long close
             else:
                 gross = (eff_basis - price) * consume   # short close
