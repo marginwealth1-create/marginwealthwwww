@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { CATEGORY_FIELDS, isFieldNA } from "@/lib/nettingMatrixConfig";
-import { Cell } from "./Cell";
+import { Cell, confirmZeroBrokerage } from "./Cell";
 
 
 export function ScriptOverrides({ categoryId }: { categoryId: string }) {
@@ -129,6 +129,7 @@ export function ScriptOverrides({ categoryId }: { categoryId: string }) {
   const dirtyCount = Object.values(edits).reduce((s, e) => s + Object.keys(e).length, 0);
 
   async function saveAll() {
+    if (!confirmZeroBrokerage(edits)) return;
     setSaving(true);
     try {
       for (const id of Object.keys(edits)) {
@@ -487,9 +488,10 @@ export function ScriptOverrides({ categoryId }: { categoryId: string }) {
                           value={getValue(s, f.key)}
                           dirty={edits[s.id]?.[f.key] !== undefined}
                           inheritPlaceholder
-                          // Show the segment (global) default this symbol
-                          // inherits — "inherit (₹X)" instead of bare
-                          // "inherit" — so the admin sees the value actually
+                          // Show what this symbol inherits — the caller's
+                          // pool cascade (own tier, else the tiers above,
+                          // else the seed) — "inherit (₹X)" instead of bare
+                          // "inherit", so the admin sees the value actually
                           // in effect before overriding it.
                           inheritValue={segRow ? (segRow as any)[f.key] : undefined}
                           onChange={(v) => setEdit(s.id, f.key, v)}

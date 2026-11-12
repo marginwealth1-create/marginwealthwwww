@@ -599,7 +599,9 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
         wallet_sum["credit_limit"] += to_decimal(w.credit_limit)
         wallet_sum["total_deposits"] += to_decimal(w.total_deposits)
         wallet_sum["total_withdrawals"] += to_decimal(w.total_withdrawals)
-        wallet_sum["total_brokerage"] += to_decimal(w.total_brokerage)
+        # Fills book brokerage as CHARGES (→ total_charges); total_brokerage
+        # only moves on an admin manual BROKERAGE entry.
+        wallet_sum["total_brokerage"] += to_decimal(w.total_brokerage) + to_decimal(w.total_charges)
 
     # Realised PNL by window (positions closed in window). Reuses the
     # USD-quoted FX-conversion pattern from /admin/users/{id}/live-trade-stats.

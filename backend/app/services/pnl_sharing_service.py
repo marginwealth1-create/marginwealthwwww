@@ -39,7 +39,11 @@ from app.models.transaction import TransactionType, WalletTransaction
 from app.models.user import User, UserRole
 from app.schemas.pnl_sharing import ReportRow, ReportSummary
 from app.services import market_data_service, wallet_service
-from app.services.admin_settlement_service import _realised_inr
+from app.services.admin_settlement_service import (
+    _house_brokerage,
+    _realised_inr,
+    _settlement_pool,
+)
 from app.services.audit_service import log_event
 from app.utils.decimal_utils import quantize_money, to_decimal
 from app.utils.time_utils import now_utc
@@ -130,19 +134,14 @@ class SharingSnapshot:
 async def _broker_client_ids(
     broker_id: PydanticObjectId,
 ) -> list[PydanticObjectId]:
-    """User ids in this broker's entire subtree (direct clients + sub-brokers + their clients).
+    """Trading accounts in this broker's entire subtree (direct clients +
+    clients of nested sub-brokers).
 
     Matches via ``broker_ancestry`` multikey index — captures everyone whose
-    ancestor chain includes ``broker_id``: direct clients (parent broker is
-    in their ancestry), nested sub-brokers, and clients of those sub-brokers.
-
-    Brokers themselves don't have closed Positions of their own, so including
-    them in the lookup is harmless — the Position query filters by
-    ``status=CLOSED`` and brokers don't trade.
+    ancestor chain includes ``broker_id``. Sub-brokers themselves, and demo
+    accounts, are left out by ``_settlement_pool``.
     """
-    coll = User.get_motor_collection()
-    cursor = coll.find({"broker_ancestry": broker_id}, {"_id": 1})
-    return [doc["_id"] async for doc in cursor]
+    return await _settlement_pool({"broker_ancestry": broker_id})
 
 
 async def compute_sharing_snapshot(
@@ -153,7 +152,7 @@ async def compute_sharing_snapshot(
     """Aggregate the broker's clients' realized P&L + brokerage in window
     and apply the agreement's share %.
 
-    Pure-ish: reads from Mongo (Position / WalletTransaction / User) but
+    Pure-ish: reads from Mongo (Position / Trade / WalletTransaction / User) but
     writes nothing. The result is a frozen ``SharingSnapshot`` dataclass.
 
     Mirrors ``admin_settlement_service.compute_settlement`` at broker-level
@@ -177,15 +176,7 @@ async def compute_sharing_snapshot(
         for p in positions:
             net_client_pnl += _realised_inr(p, fallback_usd_inr)
 
-        bkg_txns = await WalletTransaction.find(
-            {
-                "user_id": {"$in": user_ids},
-                "transaction_type": TransactionType.BROKERAGE.value,
-                "created_at": {"$gte": period_start, "$lte": period_end},
-            }
-        ).to_list()
-        for t in bkg_txns:
-            net_client_bkg += abs(to_decimal(t.amount))
+        net_client_bkg = await _house_brokerage(user_ids, period_start, period_end)
 
     share_frac = to_decimal(agreement.share_pct) / Decimal("100")
     broker_view_pnl = -net_client_pnl
@@ -457,6 +448,26 @@ async def list_agreements_for_actor(
 
 
 # ── Settlement ───────────────────────────────────────────────────────
+async def _refuse_overlap(
+    agreement_id: PydanticObjectId,
+    period_start: datetime,
+    period_end: datetime,
+    cadence: SettlementCadence,
+) -> None:
+    """The unique index is (agreement_id, period_start) only, so a period of
+    another cadence that overlaps this one (a paid week inside this month, or
+    a paid Monday sharing this week's start) would be paid twice."""
+    if await PnlSharingSettlement.find_one(
+        PnlSharingSettlement.agreement_id == agreement_id,
+        PnlSharingSettlement.cadence != cadence,
+        PnlSharingSettlement.period_start <= period_end,
+        PnlSharingSettlement.period_end >= period_start,
+    ):
+        raise AgreementValidationError(
+            "a settlement of another cadence already covers part of this period"
+        )
+
+
 async def settle_period(
     *,
     agreement_id: PydanticObjectId,
@@ -482,12 +493,29 @@ async def settle_period(
     if agreement is None:
         raise AgreementValidationError("agreement not found")
 
+    await _refuse_overlap(agreement_id, period_start, period_end, cadence)
+
     existing = await PnlSharingSettlement.find_one(
         PnlSharingSettlement.agreement_id == agreement_id,
         PnlSharingSettlement.period_start == period_start,
     )
     if existing is not None and existing.status == SharingSettlementStatus.SETTLED:
         return existing  # already done — idempotent
+
+    if existing is not None and await WalletTransaction.find_one(
+        {"reference_type": "PnlSharingSettlement", "reference_id": str(existing.id)}
+    ):
+        # An earlier attempt already moved a wallet leg (it failed half-way,
+        # or its save never landed). Any row counts: a payer with no cash
+        # gets only a SETTLEMENT_OUTSTANDING_BOOKED row. Running again would
+        # debit a second time, on fresh numbers. Leave the money and the
+        # stored figures alone and hand the row to an operator.
+        existing.status = SharingSettlementStatus.FAILED
+        existing.failure_reason = (
+            "A wallet leg is already booked for this settlement; reconcile manually"
+        )
+        await existing.save()
+        return existing
 
     snap = await compute_sharing_snapshot(agreement, period_start, period_end)
 
@@ -665,12 +693,31 @@ async def build_report(
     end_ist = _as_ist(to_dt)
     while cursor <= end_ist:
         p_start, p_end = compute_period_bounds(cadence, cursor)
-        snap = await compute_sharing_snapshot(agreement, p_start, p_end)
-
         existing = await PnlSharingSettlement.find_one(
             PnlSharingSettlement.agreement_id == agreement.id,
             PnlSharingSettlement.period_start == p_start,
         )
+        if (
+            existing is not None
+            and existing.status == SharingSettlementStatus.SETTLED
+            and existing.cadence == cadence
+        ):
+            # A settled period reports what was paid, never a recomputation
+            # on today's data or today's share %. A row of another cadence
+            # that only shares this period_start (a paid Monday in a WEEKLY
+            # view) covers part of the period, so that one is computed live.
+            snap = SharingSnapshot(
+                net_client_pnl_inr=to_decimal(existing.net_client_pnl_inr),
+                net_client_bkg_inr=to_decimal(existing.net_client_bkg_inr),
+                total_of_both_inr=to_decimal(existing.total_of_both_inr),
+                actual_pnl_inr=to_decimal(existing.actual_pnl_inr),
+                sharing_pnl_inr=to_decimal(existing.sharing_pnl_inr),
+                sharing_bkg_inr=to_decimal(existing.sharing_bkg_inr),
+                sharing_total_inr=to_decimal(existing.sharing_total_inr),
+            )
+        else:
+            snap = await compute_sharing_snapshot(agreement, p_start, p_end)
+
         if existing is None:
             status_label = "UNSETTLED"
             unsettled += 1

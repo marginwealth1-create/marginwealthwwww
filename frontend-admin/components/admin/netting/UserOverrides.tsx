@@ -17,7 +17,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { CATEGORY_FIELDS, isFieldNA, type SegmentRow } from "@/lib/nettingMatrixConfig";
-import { Cell } from "./Cell";
+import { Cell, confirmZeroBrokerage } from "./Cell";
 import { CategoryChips } from "./CategoryChips";
 
 export function UserOverrides({
@@ -129,6 +129,7 @@ export function UserOverrides({
 
   async function saveAll() {
     if (!user) return;
+    if (!confirmZeroBrokerage(edits)) return;
     setSaving(true);
     try {
       for (const segName of Object.keys(edits)) {
@@ -652,6 +653,7 @@ function UserScriptOverrides({
 
   async function saveAll() {
     if (!user) return;
+    if (!confirmZeroBrokerage(edits)) return;
     setSaving(true);
     try {
       for (const key of Object.keys(edits)) {

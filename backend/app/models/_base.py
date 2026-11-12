@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 
-from beanie import Document
+from beanie import Document, Replace, Save, SaveChanges, before_event
 from pydantic import ConfigDict, Field
 
 from app.utils.time_utils import now_utc
@@ -25,7 +25,9 @@ class StrEnum(str, Enum):
 class TimestampMixin(Document):
     """Adds auto-managed created_at / updated_at to any document.
 
-    Beanie's `before_event` hooks (Insert/Update/Save) refresh `updated_at`.
+    A `before_event` hook refreshes `updated_at` on `.save()`, `.replace()`
+    and `.save_changes()`. Instance `.set()` / `.update()` and raw motor
+    writes (`find_one_and_update`, `update_many`) bypass it.
     """
 
     created_at: datetime = Field(default_factory=now_utc)
@@ -37,9 +39,9 @@ class TimestampMixin(Document):
         use_state_management = True
         validate_on_save = True
 
-    async def save_changes(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+    @before_event(Replace, Save, SaveChanges)
+    def _touch_updated_at(self) -> None:
         self.updated_at = now_utc()
-        return await super().save_changes(*args, **kwargs)
 
 
 # ── Shared enums ─────────────────────────────────────────────────────

@@ -8,7 +8,7 @@ import { NettingAPI } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { CATEGORY_FIELDS, isFieldNA, type FieldDef, type SegmentRow } from "@/lib/nettingMatrixConfig";
-import { Cell } from "./Cell";
+import { Cell, confirmZeroBrokerage } from "./Cell";
 import { useAdminAuthStore } from "@/stores/authStore";
 import { canEdit } from "@/lib/permissions";
 
@@ -28,9 +28,11 @@ export function SegmentMatrix({ categoryId }: { categoryId: string }) {
   function setEdit(segId: string, key: string, val: any) {
     setEdits((prev) => ({ ...prev, [segId]: { ...(prev[segId] || {}), [key]: val } }));
   }
+  // The caller's OWN value (null = Not set); what it inherits, and from
+  // which tier, is on `seg.inherited` and shows as the cell placeholder.
   function getValue(seg: any, key: string) {
     if (edits[seg.id]?.[key] !== undefined) return edits[seg.id][key];
-    return seg[key];
+    return (seg.own ?? seg)[key];
   }
   function rowOf(seg: any): SegmentRow {
     return {
@@ -55,6 +57,12 @@ export function SegmentMatrix({ categoryId }: { categoryId: string }) {
     const src = rows[0];
     if (!src) return;
     const val = getValue(src, f.key) ?? null;
+    // A Not-set top row would stage null, and Save would wipe every other
+    // row's own override back to the inherited value.
+    if (val === null || val === "") {
+      toast.info(`Set ${f.label} on the top segment first`);
+      return;
+    }
     setEdits((prev) => {
       const next = { ...prev };
       let n = 0;
@@ -91,7 +99,7 @@ export function SegmentMatrix({ categoryId }: { categoryId: string }) {
       for (const seg of segments as any[]) {
         for (const f of fields) {
           if (f.type !== "select") continue;
-          const stored = seg[f.key];
+          const stored = (seg.own ?? seg)[f.key];
           // Leave unset values alone — backend resolver infers.
           if (stored === null || stored === undefined || stored === "") continue;
           const valid = (f.options ?? []).some((o: any) => String(o.v) === String(stored));
@@ -111,6 +119,8 @@ export function SegmentMatrix({ categoryId }: { categoryId: string }) {
   const dirtyCount = Object.values(edits).reduce((s, e) => s + Object.keys(e).length, 0);
 
   async function saveAll() {
+    // Over every staged edit, so a ₹0 copied down every segment is caught too.
+    if (!confirmZeroBrokerage(edits)) return;
     setSaving(true);
     try {
       // Parallelise the PUTs. The old sequential loop made saving 14 dirty
@@ -183,6 +193,9 @@ export function SegmentMatrix({ categoryId }: { categoryId: string }) {
                       na={false}
                       value={getValue(seg, f.key)}
                       dirty={edits[seg.id]?.[f.key] !== undefined}
+                      inheritPlaceholder
+                      inheritValue={seg.inherited?.[f.key]?.value}
+                      inheritTier={seg.inherited?.[f.key]?.tier}
                       onChange={(v) => setEdit(seg.id, f.key, v)}
                     />
                   </div>
@@ -236,6 +249,9 @@ export function SegmentMatrix({ categoryId }: { categoryId: string }) {
                         na={isFieldNA(segRow, categoryId, f)}
                         value={getValue(seg, f.key)}
                         dirty={edits[seg.id]?.[f.key] !== undefined}
+                        inheritPlaceholder
+                        inheritValue={seg.inherited?.[f.key]?.value}
+                        inheritTier={seg.inherited?.[f.key]?.tier}
                         onChange={(v) => setEdit(seg.id, f.key, v)}
                       />
                     </td>

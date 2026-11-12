@@ -32,6 +32,8 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from app.utils.decimal_utils import add
+
 BRAND = rl_colors.HexColor("#3B5BDB")  # MarginWealth brand blue
 BRAND_SOFT = rl_colors.HexColor("#EEF2FF")
 GRID = rl_colors.HexColor("#E5E7EB")
@@ -876,6 +878,9 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
 
 
 def build_margin_pdf(user, summary: dict) -> bytes:
+    # Fills book brokerage as CHARGES (→ total_charges); total_brokerage only
+    # moves on an admin manual BROKERAGE entry. The client paid both.
+    brokerage = str(add(summary.get("total_brokerage"), summary.get("total_charges")))
     styles = _styles()
     doc, buf = _doc()
     elems = _header(
@@ -894,7 +899,7 @@ def build_margin_pdf(user, summary: dict) -> bytes:
                 ("Unrealized P&L", _fmt_money(summary.get("unrealized_pnl"))),
                 ("Total deposits", _fmt_money(summary.get("total_deposits"))),
                 ("Total withdrawals", _fmt_money(summary.get("total_withdrawals"))),
-                ("Total brokerage", _fmt_money(summary.get("total_brokerage"))),
+                ("Total brokerage", _fmt_money(brokerage)),
             ],
             styles,
         ),

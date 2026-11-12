@@ -55,31 +55,23 @@ def _ser_user_override(s) -> dict:
 
 
 # ── Segment matrix ────────────────────────────────────────────────
-def _merge_with_override(seg, override, scope: str) -> dict:
-    """Returns the platform segment dict with this pool's overrides
-    layered on top. Override-null fields fall back to the platform value
-    so the UI shows what the pool's users actually see. `scope` is one of
-    ``GLOBAL`` / ``SUPER_ADMIN`` / ``SUB_ADMIN`` / ``BROKER``."""
+def _merge_with_override(seg, override, scope: str, inherited: dict) -> dict:
+    """The segment row as the caller's pool sees it. Top-level fields hold
+    the value in effect for the pool's users (the caller's own value, else
+    what it inherits). ``own`` is the caller's own value per field (null =
+    Not set) and ``inherited`` the ``{value, tier}`` it falls back to from
+    the tiers strictly above the caller (see
+    ``svc.caller_inherited_segment_fields``). `scope` is one of
+    ``SUPER_ADMIN`` / ``SUB_ADMIN`` / ``BROKER``."""
     base = _ser_segment(seg)
     base["scope"] = scope
-    if override is None:
-        return base
-    over = override.model_dump(
-        exclude={
-            "id",
-            "revision_id",
-            "sub_admin_id",
-            "super_admin_id",
-            "broker_id",
-            "segment_name",
-            "created_at",
-            "updated_at",
-        }
-    )
-    for k, v in over.items():
-        if v is not None:
-            base[k] = v
-    base["override_id"] = str(override.id)
+    for f, d in inherited.items():
+        own = svc._tier_value(override, f)
+        base[f] = d["value"] if own is None else own
+    base["own"] = {f: getattr(override, f, None) for f in svc.NETTING_FIELDS}
+    base["inherited"] = inherited
+    if override is not None:
+        base["override_id"] = str(override.id)
     return base
 
 
@@ -106,8 +98,9 @@ async def list_segments(
 ):
     rows = await svc.list_segments()
     by_name, scope = await _load_pool_overrides(admin)
+    inh = await svc.caller_inherited_segment_fields(admin, rows)
     return APIResponse(
-        data=[_merge_with_override(r, by_name.get(r.name), scope) for r in rows]
+        data=[_merge_with_override(r, by_name.get(r.name), scope, inh[r.name]) for r in rows]
     )
 
 
@@ -150,14 +143,15 @@ async def get_segment(
     _: None = Depends(require_perm("segment_settings", "read")),
 ):
     seg = await svc.get_segment(segment_id)
+    inh = (await svc.caller_inherited_segment_fields(admin, [seg]))[seg.name]
     if admin.role == UserRole.SUPER_ADMIN:
         over = await svc.get_super_admin_segment_override(admin.id, seg.name)
-        return APIResponse(data=_merge_with_override(seg, over, "SUPER_ADMIN"))
+        return APIResponse(data=_merge_with_override(seg, over, "SUPER_ADMIN", inh))
     if admin.role == UserRole.BROKER:
         over = await svc.get_broker_segment_override(admin.id, seg.name)
-        return APIResponse(data=_merge_with_override(seg, over, "BROKER"))
+        return APIResponse(data=_merge_with_override(seg, over, "BROKER", inh))
     over = await svc.get_sub_admin_segment_override(admin.id, seg.name)
-    return APIResponse(data=_merge_with_override(seg, over, "SUB_ADMIN"))
+    return APIResponse(data=_merge_with_override(seg, over, "SUB_ADMIN", inh))
 
 
 @router.put("/segments/{segment_id}", response_model=APIResponse[dict])
@@ -191,7 +185,8 @@ async def update_segment(
     else:
         over = await svc.upsert_sub_admin_segment_override(admin.id, seg.name, patch)
         scope = "SUB_ADMIN"
-    return APIResponse(data=_merge_with_override(seg, over, scope))
+    inh = (await svc.caller_inherited_segment_fields(admin, [seg]))[seg.name]
+    return APIResponse(data=_merge_with_override(seg, over, scope, inh))
 
 
 @router.get("/diagnose", response_model=APIResponse[dict])

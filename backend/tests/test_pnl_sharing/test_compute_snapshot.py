@@ -15,11 +15,7 @@ from bson import Decimal128
 from app.models._base import Exchange, ProductType
 from app.models.order import InstrumentRef
 from app.models.position import Position, PositionStatus
-from app.models.transaction import (
-    TransactionStatus,
-    TransactionType,
-    WalletTransaction,
-)
+from app.models.user import User, UserRole, UserStatus
 from app.services.pnl_sharing_service import compute_sharing_snapshot
 
 
@@ -58,29 +54,10 @@ async def _make_position(
     return pos
 
 
-async def _make_brokerage_tx(
-    *,
-    user_id,
-    amount: str,
-    created_at: datetime,
-) -> WalletTransaction:
-    tx = WalletTransaction(
-        user_id=user_id,
-        transaction_type=TransactionType.BROKERAGE,
-        amount=Decimal128(amount),
-        narration="test brokerage",
-        status=TransactionStatus.COMPLETED,
-        created_at=created_at,
-        updated_at=created_at,
-    )
-    await tx.insert()
-    return tx
-
-
 # ── Tests ────────────────────────────────────────────────────────────
 
 
-async def test_snapshot_clients_lost_broker_wins(db, agreement, client_user):
+async def test_snapshot_clients_lost_broker_wins(charge, db, agreement, client_user):
     """Clients lost ₹10,000 (realized_pnl=-10000), brokerage ₹500.
 
     Broker view: gains ₹10,000 + ₹500 = ₹10,500.
@@ -94,11 +71,7 @@ async def test_snapshot_clients_lost_broker_wins(db, agreement, client_user):
         realized_pnl="-10000",
         closed_at=datetime(2026, 5, 18, 12, 0, tzinfo=UTC),
     )
-    await _make_brokerage_tx(
-        user_id=client_user.id,
-        amount="-500",  # debit (charged); abs() in service handles sign
-        created_at=datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC),
-    )
+    await charge(client_user, "500", datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC))
 
     snap = await compute_sharing_snapshot(agreement, period_start, period_end)
 
@@ -111,7 +84,7 @@ async def test_snapshot_clients_lost_broker_wins(db, agreement, client_user):
     assert snap.sharing_total_inr == Decimal("3150.00")
 
 
-async def test_snapshot_clients_won_broker_loses(db, agreement, client_user):
+async def test_snapshot_clients_won_broker_loses(charge, db, agreement, client_user):
     """Clients gained ₹5,000, brokerage ₹200.
 
     Broker view: -₹5,000 PNL + ₹200 BKG = -₹4,800.
@@ -125,11 +98,7 @@ async def test_snapshot_clients_won_broker_loses(db, agreement, client_user):
         realized_pnl="5000",
         closed_at=datetime(2026, 5, 18, 12, 0, tzinfo=UTC),
     )
-    await _make_brokerage_tx(
-        user_id=client_user.id,
-        amount="-200",
-        created_at=datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC),
-    )
+    await charge(client_user, "200", datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC))
 
     snap = await compute_sharing_snapshot(agreement, period_start, period_end)
 
@@ -142,7 +111,7 @@ async def test_snapshot_clients_won_broker_loses(db, agreement, client_user):
     assert snap.sharing_total_inr == Decimal("-1440.00")
 
 
-async def test_snapshot_outside_window_excluded(db, agreement, client_user):
+async def test_snapshot_outside_window_excluded(charge, db, agreement, client_user):
     """A position closed BEFORE the window must not count."""
     period_start = datetime(2026, 5, 18, 0, 0, tzinfo=UTC)
     period_end = datetime(2026, 5, 18, 23, 59, 59, tzinfo=UTC)
@@ -154,11 +123,7 @@ async def test_snapshot_outside_window_excluded(db, agreement, client_user):
         closed_at=datetime(2026, 5, 17, 23, 0, tzinfo=UTC),
     )
     # Also a brokerage row from outside the window — also filtered out.
-    await _make_brokerage_tx(
-        user_id=client_user.id,
-        amount="-500",
-        created_at=datetime(2026, 5, 17, 23, 0, 1, tzinfo=UTC),
-    )
+    await charge(client_user, "500", datetime(2026, 5, 17, 23, 0, 1, tzinfo=UTC))
 
     snap = await compute_sharing_snapshot(agreement, period_start, period_end)
 
@@ -175,6 +140,7 @@ async def test_snapshot_outside_window_excluded(db, agreement, client_user):
 
 
 async def test_brokerage_only_agreement_zeros_sharing_pnl(
+    charge,
     db, admin_user, broker_user, client_user
 ):
     """A BROKERAGE_ONLY agreement: clients lost ₹10000 + brokerage ₹500.
@@ -206,11 +172,7 @@ async def test_brokerage_only_agreement_zeros_sharing_pnl(
         realized_pnl="-10000",
         closed_at=datetime(2026, 5, 18, 12, 0, tzinfo=UTC),
     )
-    await _make_brokerage_tx(
-        user_id=client_user.id,
-        amount="-500",
-        created_at=datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC),
-    )
+    await charge(client_user, "500", datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC))
 
     snap = await compute_sharing_snapshot(a, period_start, period_end)
     assert snap.net_client_pnl_inr == Decimal("-10000.00")  # display value still set
@@ -221,6 +183,7 @@ async def test_brokerage_only_agreement_zeros_sharing_pnl(
 
 
 async def test_snapshot_includes_subbroker_clients_in_subtree(
+    charge,
     db, admin_user, broker_user, agreement
 ):
     """Agreement is admin↔parent_broker. If broker has a sub-broker, and
@@ -274,11 +237,7 @@ async def test_snapshot_includes_subbroker_clients_in_subtree(
         realized_pnl="-10000",
         closed_at=datetime(2026, 5, 18, 12, 0, tzinfo=UTC),
     )
-    await _make_brokerage_tx(
-        user_id=sub_client.id,
-        amount="-500",
-        created_at=datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC),
-    )
+    await charge(sub_client, "500", datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC))
 
     snap = await compute_sharing_snapshot(agreement, period_start, period_end)
 
@@ -288,3 +247,38 @@ async def test_snapshot_includes_subbroker_clients_in_subtree(
     assert snap.sharing_pnl_inr == Decimal("3000.00")
     assert snap.sharing_bkg_inr == Decimal("150.00")
     assert snap.sharing_total_inr == Decimal("3150.00")
+
+
+async def test_snapshot_skips_demo_accounts(charge, db, admin_user, broker_user, agreement):
+    """A demo client in the broker's subtree trades through the same engine,
+    but its P&L and brokerage are not real money and never reach the share."""
+    demo = User(
+        user_code="TCLI_DEMO",
+        email="democlient@example.com",
+        mobile="9999900101",
+        full_name="Demo Client",
+        password_hash="x",
+        role=UserRole.CLIENT,
+        status=UserStatus.ACTIVE,
+        is_demo=True,
+        assigned_admin_id=admin_user.id,
+        assigned_broker_id=broker_user.id,
+        broker_ancestry=[broker_user.id],
+    )
+    await demo.insert()
+    await _make_position(
+        user_id=demo.id,
+        realized_pnl="-10000",
+        closed_at=datetime(2026, 5, 18, 12, 0, tzinfo=UTC),
+    )
+    await charge(demo, "500", datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC))
+
+    snap = await compute_sharing_snapshot(
+        agreement,
+        datetime(2026, 5, 18, 0, 0, tzinfo=UTC),
+        datetime(2026, 5, 18, 23, 59, 59, tzinfo=UTC),
+    )
+
+    assert snap.net_client_pnl_inr == Decimal("0.00")
+    assert snap.net_client_bkg_inr == Decimal("0.00")
+    assert snap.sharing_total_inr == Decimal("0.00")

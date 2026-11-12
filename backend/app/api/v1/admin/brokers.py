@@ -475,7 +475,9 @@ async def broker_report(broker_id: str, actor: CurrentAdmin):
         wallet_sum["credit_limit"] += to_decimal(w.credit_limit)
         wallet_sum["total_deposits"] += to_decimal(w.total_deposits)
         wallet_sum["total_withdrawals"] += to_decimal(w.total_withdrawals)
-        wallet_sum["total_brokerage"] += to_decimal(w.total_brokerage)
+        # Fills book brokerage as CHARGES (→ total_charges); total_brokerage
+        # only moves on an admin manual BROKERAGE entry.
+        wallet_sum["total_brokerage"] += to_decimal(w.total_brokerage) + to_decimal(w.total_charges)
 
     from app.services import market_data_service
     fallback_usd_inr = to_decimal(market_data_service.get_usd_inr_rate())

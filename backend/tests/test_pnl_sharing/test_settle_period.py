@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
 import pytest_asyncio
 from bson import Decimal128
 
@@ -21,11 +22,7 @@ from app.models.pnl_sharing import (
     SharingSettlementStatus,
 )
 from app.models.position import Position, PositionStatus
-from app.models.transaction import (
-    TransactionStatus,
-    TransactionType,
-    WalletTransaction,
-)
+from app.models.transaction import TransactionType
 from app.models.wallet import Wallet
 from app.services import pnl_sharing_service as svc
 
@@ -84,29 +81,11 @@ async def _make_position(
     return pos
 
 
-async def _make_brokerage_tx(
-    *,
-    user_id,
-    amount: str,
-    created_at: datetime,
-) -> WalletTransaction:
-    tx = WalletTransaction(
-        user_id=user_id,
-        transaction_type=TransactionType.BROKERAGE,
-        amount=Decimal128(amount),
-        narration="test brokerage",
-        status=TransactionStatus.COMPLETED,
-        created_at=created_at,
-        updated_at=created_at,
-    )
-    await tx.insert()
-    return tx
-
-
 # ── Tests ────────────────────────────────────────────────────────────
 
 
 async def test_settle_period_credits_admin_debits_broker(
+    charge,
     db,
     admin_user,
     broker_user,
@@ -126,11 +105,7 @@ async def test_settle_period_credits_admin_debits_broker(
         realized_pnl="-10000",
         closed_at=datetime(2026, 5, 18, 12, 0, tzinfo=UTC),
     )
-    await _make_brokerage_tx(
-        user_id=client_user.id,
-        amount="-500",
-        created_at=datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC),
-    )
+    await charge(client_user, "500", datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC))
 
     settlement = await svc.settle_period(
         agreement_id=agreement.id,
@@ -155,6 +130,7 @@ async def test_settle_period_credits_admin_debits_broker(
 
 
 async def test_settle_period_idempotent(
+    charge,
     db,
     admin_user,
     broker_user,
@@ -163,7 +139,8 @@ async def test_settle_period_idempotent(
     admin_wallet,
     broker_wallet,
 ):
-    """Calling settle_period twice for the same period must NOT double-pay."""
+    """Calling settle_period twice for the same period must NOT double-pay,
+    and a SETTLED row is never recomputed, even when the period moves."""
     period_start = datetime(2026, 5, 1, 0, 0, tzinfo=UTC)
     period_end = datetime(2026, 5, 31, 23, 59, 59, tzinfo=UTC)
 
@@ -172,11 +149,7 @@ async def test_settle_period_idempotent(
         realized_pnl="-10000",
         closed_at=datetime(2026, 5, 18, 12, 0, tzinfo=UTC),
     )
-    await _make_brokerage_tx(
-        user_id=client_user.id,
-        amount="-500",
-        created_at=datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC),
-    )
+    await charge(client_user, "500", datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC))
 
     first = await svc.settle_period(
         agreement_id=agreement.id,
@@ -186,6 +159,13 @@ async def test_settle_period_idempotent(
         triggered_by="MANUAL",
         actor=admin_user,
     )
+    # A late close and its brokerage land in the already-paid period.
+    await _make_position(
+        user_id=client_user.id,
+        realized_pnl="-10000",
+        closed_at=datetime(2026, 5, 19, 12, 0, tzinfo=UTC),
+    )
+    await charge(client_user, "500", datetime(2026, 5, 19, 12, 0, 1, tzinfo=UTC))
     second = await svc.settle_period(
         agreement_id=agreement.id,
         period_start=period_start,
@@ -196,6 +176,7 @@ async def test_settle_period_idempotent(
     )
     assert first.id == second.id
     assert second.status == SharingSettlementStatus.SETTLED
+    assert Decimal(str(second.sharing_total_inr)) == Decimal("3150.00")
 
     aw = await Wallet.find_one(Wallet.user_id == admin_user.id)
     bw = await Wallet.find_one(Wallet.user_id == broker_user.id)
@@ -205,9 +186,9 @@ async def test_settle_period_idempotent(
 
 
 async def test_settle_period_fails_on_insufficient_balance(
+    charge,
     db,
     admin_user,
-    broker_user,
     client_user,
     agreement,
 ):
@@ -223,11 +204,7 @@ async def test_settle_period_fails_on_insufficient_balance(
         realized_pnl="-10000",
         closed_at=datetime(2026, 5, 18, 12, 0, tzinfo=UTC),
     )
-    await _make_brokerage_tx(
-        user_id=client_user.id,
-        amount="-500",
-        created_at=datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC),
-    )
+    await charge(client_user, "500", datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC))
 
     settlement = await svc.settle_period(
         agreement_id=agreement.id,
@@ -244,6 +221,7 @@ async def test_settle_period_fails_on_insufficient_balance(
 
 
 async def test_settle_period_debits_admin_credits_broker_when_client_wins(
+    charge,
     db,
     admin_user,
     broker_user,
@@ -266,11 +244,7 @@ async def test_settle_period_debits_admin_credits_broker_when_client_wins(
         realized_pnl="5000",
         closed_at=datetime(2026, 5, 18, 12, 0, tzinfo=UTC),
     )
-    await _make_brokerage_tx(
-        user_id=client_user.id,
-        amount="-200",
-        created_at=datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC),
-    )
+    await charge(client_user, "200", datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC))
 
     settlement = await svc.settle_period(
         agreement_id=agreement.id,
@@ -324,3 +298,118 @@ async def test_settle_period_zero_amount_no_wallet_calls(
     bw = await Wallet.find_one(Wallet.user_id == broker_user.id)
     assert Decimal(str(aw.available_balance)) == Decimal("100000")
     assert Decimal(str(bw.available_balance)) == Decimal("100000")
+
+
+@pytest.mark.usefixtures("admin_wallet", "broker_wallet")
+async def test_half_moved_retry_never_debits_twice(charge, client_user, agreement, monkeypatch):
+    """The broker leg is booked, then the admin leg fails. The retry, which now
+    sees more brokerage, must not debit the broker a second time."""
+    period_start = datetime(2026, 5, 1, 0, 0, tzinfo=UTC)
+    period_end = datetime(2026, 5, 31, 23, 59, 59, tzinfo=UTC)
+    await _make_position(
+        user_id=client_user.id,
+        realized_pnl="-10000",
+        closed_at=datetime(2026, 5, 18, 12, 0, tzinfo=UTC),
+    )
+    await charge(client_user, "500", datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC))
+
+    real_adjust = svc.wallet_service.adjust
+
+    async def admin_leg_fails(*args, **kwargs):
+        if kwargs.get("transaction_type") == TransactionType.PNL_SHARING_RECEIPT:
+            raise RuntimeError("wallet adjust: too much concurrent contention")
+        return await real_adjust(*args, **kwargs)
+
+    def settle():
+        return svc.settle_period(
+            agreement_id=agreement.id,
+            period_start=period_start,
+            period_end=period_end,
+            cadence=SettlementCadence.MONTHLY,
+            triggered_by="AUTO",
+        )
+
+    monkeypatch.setattr(svc.wallet_service, "adjust", admin_leg_fails)
+    assert (await settle()).status == SharingSettlementStatus.FAILED
+    monkeypatch.undo()
+
+    await charge(client_user, "500", datetime(2026, 5, 20, 12, 0, tzinfo=UTC))
+    retry = await settle()
+
+    assert retry.status == SharingSettlementStatus.FAILED
+    assert "already booked" in retry.failure_reason
+    bw = await Wallet.find_one(Wallet.user_id == agreement.broker_id)
+    aw = await Wallet.find_one(Wallet.user_id == agreement.admin_id)
+    assert Decimal(str(bw.available_balance)) == Decimal("96850.00")  # debited once
+    assert Decimal(str(aw.available_balance)) == Decimal("100000")
+
+
+async def test_half_moved_retry_counts_a_leg_booked_to_dues(
+    charge, broker_user, client_user, agreement, monkeypatch
+):
+    """A broker with no cash and auto settlement: the payout leg writes only a
+    SETTLEMENT_OUTSTANDING_BOOKED row. The retry must still see money moved."""
+    broker_user.auto_settlement = True
+    await broker_user.save()
+    period_start = datetime(2026, 5, 1, 0, 0, tzinfo=UTC)
+    period_end = datetime(2026, 5, 31, 23, 59, 59, tzinfo=UTC)
+    await _make_position(
+        user_id=client_user.id,
+        realized_pnl="-1000",
+        closed_at=datetime(2026, 5, 18, 12, 0, tzinfo=UTC),
+    )
+    await charge(client_user, "50", datetime(2026, 5, 18, 12, 0, 1, tzinfo=UTC))
+
+    real_adjust = svc.wallet_service.adjust
+
+    async def admin_leg_fails(*args, **kwargs):
+        if kwargs.get("transaction_type") == TransactionType.PNL_SHARING_RECEIPT:
+            raise RuntimeError("wallet adjust: too much concurrent contention")
+        return await real_adjust(*args, **kwargs)
+
+    def settle():
+        return svc.settle_period(
+            agreement_id=agreement.id,
+            period_start=period_start,
+            period_end=period_end,
+            cadence=SettlementCadence.MONTHLY,
+            triggered_by="AUTO",
+        )
+
+    monkeypatch.setattr(svc.wallet_service, "adjust", admin_leg_fails)
+    assert (await settle()).status == SharingSettlementStatus.FAILED
+    monkeypatch.undo()
+
+    retry = await settle()
+
+    assert retry.status == SharingSettlementStatus.FAILED
+    bw = await Wallet.find_one(Wallet.user_id == agreement.broker_id)
+    assert Decimal(str(bw.settlement_outstanding)) == Decimal("315.00")  # booked once
+
+
+@pytest.mark.usefixtures("admin_wallet", "broker_wallet")
+async def test_settled_week_is_not_paid_again_by_a_monthly_settle(
+    charge, client_user, agreement
+):
+    """'Settle now' sends the report toggle's cadence. A month that overlaps an
+    already-paid week must be refused, not paid a second time."""
+    tue = datetime(2026, 5, 5, 6, 30, tzinfo=UTC)
+    await _make_position(user_id=client_user.id, realized_pnl="-1000", closed_at=tue)
+    await charge(client_user, "50", tue)
+
+    async def settle(cadence):
+        p_start, p_end = svc.compute_period_bounds(cadence, tue)
+        return await svc.settle_period(
+            agreement_id=agreement.id,
+            period_start=p_start,
+            period_end=p_end,
+            cadence=cadence,
+            triggered_by="MANUAL",
+        )
+
+    assert (await settle(SettlementCadence.WEEKLY)).status == SharingSettlementStatus.SETTLED
+    with pytest.raises(svc.AgreementValidationError):
+        await settle(SettlementCadence.MONTHLY)
+
+    bw = await Wallet.find_one(Wallet.user_id == agreement.broker_id)
+    assert Decimal(str(bw.available_balance)) == Decimal("99685.00")  # paid once

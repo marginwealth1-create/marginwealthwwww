@@ -114,6 +114,7 @@ async def _aggregate_for_users(
         # transaction. Always sum from trades for accuracy.
         all_trades = await Trade.find({
             "user_id": {"$in": user_ids},
+            "superseded_by_reopen": {"$ne": True},
         }).to_list()
         brokerage = sum(_d(t.brokerage) for t in all_trades)
         volume = sum(_d(t.value) for t in all_trades)
@@ -152,6 +153,7 @@ async def _aggregate_for_users(
 
         closing_trades = await Trade.find({
             "user_id": {"$in": user_ids},
+            "superseded_by_reopen": {"$ne": True},
             "pnl_inr": {"$ne": None},
             "executed_at": date_filter,
         }).to_list()
@@ -161,6 +163,7 @@ async def _aggregate_for_users(
 
         all_trades = await Trade.find({
             "user_id": {"$in": user_ids},
+            "superseded_by_reopen": {"$ne": True},
             "executed_at": date_filter,
         }).to_list()
         brokerage = sum(_d(t.brokerage) for t in all_trades)

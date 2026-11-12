@@ -9,8 +9,10 @@ Where:
 - gross_user_loss  = sum of negative `Position.realized_pnl` (taken positive)
   for positions closed during the IST week, across the sub-admin's users.
 - gross_user_profit = sum of positive `Position.realized_pnl`.
-- total_brokerage = sum of |amount| in `WalletTransaction` rows of type
-  ``BROKERAGE`` for the same users in the same window.
+- total_brokerage = the brokerage those users were charged in the window
+  (see ``_house_brokerage``).
+
+The pool is the sub-admin's real trading accounts (``_settlement_pool``).
 
 USD-quoted segments (crypto / forex / metals / energy) are converted to INR
 using ``Position.open_usd_inr_rate`` snapshot when present (the same logic
@@ -25,6 +27,7 @@ from decimal import Decimal
 from typing import Any
 
 from beanie import PydanticObjectId
+from beanie.exceptions import DocumentNotFound
 
 from app.core.exceptions import (
     ConflictError,
@@ -75,10 +78,48 @@ def _realised_inr(p: Position, fallback_usd_inr: Decimal | None = None) -> Decim
     return realized_pnl_inr(p)
 
 
-async def _sub_admin_user_ids(sub_admin_id: PydanticObjectId) -> list[PydanticObjectId]:
-    coll = User.get_motor_collection()
-    cursor = coll.find({"assigned_admin_id": sub_admin_id}, {"_id": 1})
+async def _settlement_pool(query: dict[str, Any]) -> list[PydanticObjectId]:
+    """Ids of the real trading accounts matching `query`, the pool every
+    settlement and P&L-sharing period is computed over. Demo accounts and
+    non-trading roles are left out. CLOSED accounts stay in, because their
+    in-window activity is real money."""
+    # Local import: accounts_dashboard_service imports this module.
+    from app.services.accounts_dashboard_service import TRADING_ROLES  # noqa: PLC0415
+
+    cursor = User.get_motor_collection().find(
+        {**query, "role": {"$in": TRADING_ROLES}, "is_demo": {"$ne": True}}, {"_id": 1}
+    )
     return [doc["_id"] async for doc in cursor]
+
+
+async def _house_brokerage(
+    user_ids: list[PydanticObjectId], start_utc: datetime, end_utc: datetime
+) -> Decimal:
+    """Brokerage the house earned from `user_ids` in the window.
+
+    This is Σ Trade.brokerage over fills no admin delete or reopen undid (the
+    Accounts dashboard's Net Client BKG), plus admin manual BROKERAGE ledger
+    entries, where a debit to the client is revenue. The fill path books the
+    same money as CHARGES rows, so those are not added a second time.
+    """
+    # Local import: accounts_dashboard_service imports this module.
+    from app.services.accounts_dashboard_service import client_totals_for_users  # noqa: PLC0415
+
+    if not user_ids:
+        return Decimal("0")
+    fills = (await client_totals_for_users(user_ids, start_utc, end_utc))["net_client_bkg"]
+    manual = await WalletTransaction.find(
+        {
+            "user_id": {"$in": user_ids},
+            "transaction_type": TransactionType.BROKERAGE.value,
+            "created_at": {"$gte": start_utc, "$lte": end_utc},
+        }
+    ).to_list()
+    return fills - sum((to_decimal(t.amount) for t in manual), Decimal("0"))
+
+
+async def _sub_admin_user_ids(sub_admin_id: PydanticObjectId) -> list[PydanticObjectId]:
+    return await _settlement_pool({"assigned_admin_id": sub_admin_id})
 
 
 async def compute_settlement(
@@ -133,16 +174,7 @@ async def compute_settlement(
             elif pnl > 0:
                 gross_profit += pnl
 
-        # Brokerage charged within the week
-        broker_txns = await WalletTransaction.find(
-            {
-                "user_id": {"$in": user_ids},
-                "transaction_type": TransactionType.BROKERAGE.value,
-                "created_at": {"$gte": period_start_utc, "$lte": period_end_utc},
-            }
-        ).to_list()
-        for t in broker_txns:
-            brokerage += abs(to_decimal(t.amount))
+        brokerage = await _house_brokerage(user_ids, period_start_utc, period_end_utc)
 
     net_house = gross_loss - gross_profit + brokerage
     pct = to_decimal(sa.pnl_share_pct) if sa.pnl_share_pct is not None else Decimal("0")
@@ -163,7 +195,18 @@ async def compute_settlement(
     existing.pnl_share_pct_snapshot = to_decimal128(pct)
     existing.sub_admin_share_inr = to_decimal128(share)
     existing.status = AdminSettlementStatus.PENDING
-    await existing.save()
+    if existing.id is None:
+        await existing.insert()
+    else:
+        existing.updated_at = datetime.now(UTC)
+        try:
+            # Rewrite only a row that is still PENDING: a finalize that landed
+            # while this ran must never be overwritten.
+            await AdminSettlement.find_one(
+                {"_id": existing.id, "status": AdminSettlementStatus.PENDING.value}
+            ).replace_one(existing)
+        except DocumentNotFound:
+            return (await AdminSettlement.get(existing.id)) or existing, True
 
     await log_event(
         action=AuditAction.SETTLEMENT_COMPUTE,

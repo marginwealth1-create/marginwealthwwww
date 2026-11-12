@@ -15,6 +15,7 @@ from bson import Decimal128
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from app.core.config import settings
+from app.core.database import _document_models
 from app.models.pnl_sharing import (
     AgreementStatus,
     PnlSharingAgreement,
@@ -25,6 +26,7 @@ from app.models.position import Position
 from app.models.transaction import WalletTransaction
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
+from tests._real_fill import market, set_commission_per_lot
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -32,6 +34,10 @@ async def db():
     client = AsyncIOMotorClient(settings.MONGODB_URL, tz_aware=True)
     test_db_name = f"{settings.MONGODB_DB_NAME}_test_pnl_sharing"
     test_db = client[test_db_name]
+    # Every model, since brokerage is booked by a real fill through the engine.
+    # Indexes only for the models these tests lean on: building all of them on
+    # every test costs ~4 s.
+    await init_beanie(database=test_db, document_models=_document_models(), skip_indexes=True)
     await init_beanie(
         database=test_db,
         document_models=[
@@ -114,3 +120,16 @@ async def agreement(db, admin_user, broker_user) -> PnlSharingAgreement:
     )
     await a.insert()
     return a
+
+
+@pytest_asyncio.fixture
+async def charge(db):
+    """Charge `user` ₹`amount` of brokerage the way production does: a real
+    MARKET fill through the engine at a ₹1/lot netting commission (an opening
+    BUY, so no P&L is realised). Only the Trade's clock is moved to `at`."""
+    await set_commission_per_lot(1)
+
+    async def _charge(user: User, amount: str, at: datetime) -> None:
+        await market(user, "BUY", float(amount), "100", at=at)
+
+    return _charge

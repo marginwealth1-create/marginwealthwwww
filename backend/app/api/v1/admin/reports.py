@@ -90,7 +90,11 @@ async def financial_report(
     total_credit = sum(float(str(w.credit_limit)) for w in wallets)
     total_deposits = sum(float(str(w.total_deposits)) for w in wallets)
     total_withdrawals = sum(float(str(w.total_withdrawals)) for w in wallets)
-    total_brokerage = sum(float(str(w.total_brokerage)) for w in wallets)
+    # Fills book brokerage as CHARGES (→ total_charges); total_brokerage only
+    # moves on an admin manual BROKERAGE entry.
+    total_brokerage = sum(
+        float(str(w.total_brokerage)) + float(str(w.total_charges)) for w in wallets
+    )
 
     pending_dep = await DepositRequest.find(
         {"status": DepositStatus.PENDING.value, **user_q}
@@ -124,7 +128,8 @@ async def trades_report(
     if not scope:
         empty = {"count": 0, "volume": 0.0, "brokerage": 0.0, "charges": 0.0}
         return APIResponse(data={"today": empty, "week": empty})
-    base = {"user_id": {"$in": scope}}
+    # Fills an admin delete / reopen refunded are out of every brokerage sum.
+    base = {"user_id": {"$in": scope}, "superseded_by_reopen": {"$ne": True}}
     today_trades = await Trade.find({**base, "executed_at": {"$gte": today}}).to_list()
     week_trades = await Trade.find({**base, "executed_at": {"$gte": week}}).to_list()
 

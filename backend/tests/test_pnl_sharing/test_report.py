@@ -11,11 +11,6 @@ from app.models._base import Exchange, ProductType
 from app.models.order import InstrumentRef
 from app.models.pnl_sharing import SettlementCadence
 from app.models.position import Position, PositionStatus
-from app.models.transaction import (
-    TransactionStatus,
-    TransactionType,
-    WalletTransaction,
-)
 from app.services import pnl_sharing_service as svc
 
 
@@ -56,29 +51,10 @@ async def _make_position(
     return pos
 
 
-async def _make_brokerage_tx(
-    *,
-    user_id,
-    amount: str,
-    created_at: datetime,
-) -> WalletTransaction:
-    tx = WalletTransaction(
-        user_id=user_id,
-        transaction_type=TransactionType.BROKERAGE,
-        amount=Decimal128(amount),
-        narration="test brokerage",
-        status=TransactionStatus.COMPLETED,
-        created_at=created_at,
-        updated_at=created_at,
-    )
-    await tx.insert()
-    return tx
-
-
 # ── Tests ────────────────────────────────────────────────────────────
 
 
-async def test_report_daily_aggregates_per_day(db, agreement, broker_user, client_user):
+async def test_report_daily_aggregates_per_day(charge, db, agreement, broker_user, client_user):
     """Two closed positions on different days → two rows in DAILY report.
 
     Day 1 (2026-05-18 IST): clients lost 1000 + brokerage 50 → broker gains 1050
@@ -93,22 +69,14 @@ async def test_report_daily_aggregates_per_day(db, agreement, broker_user, clien
         realized_pnl="-1000",
         closed_at=datetime(2026, 5, 18, 6, 30, tzinfo=UTC),
     )
-    await _make_brokerage_tx(
-        user_id=client_user.id,
-        amount="-50",
-        created_at=datetime(2026, 5, 18, 6, 30, 1, tzinfo=UTC),
-    )
+    await charge(client_user, "50", datetime(2026, 5, 18, 6, 30, 1, tzinfo=UTC))
     # 2026-05-19 06:30 UTC = 2026-05-19 12:00 IST → Day 2
     await _make_position(
         user_id=client_user.id,
         realized_pnl="-2000",
         closed_at=datetime(2026, 5, 19, 6, 30, tzinfo=UTC),
     )
-    await _make_brokerage_tx(
-        user_id=client_user.id,
-        amount="-100",
-        created_at=datetime(2026, 5, 19, 6, 30, 1, tzinfo=UTC),
-    )
+    await charge(client_user, "100", datetime(2026, 5, 19, 6, 30, 1, tzinfo=UTC))
 
     # IST-aligned bounds: from = 2026-05-18 00:00 IST (2026-05-17 18:30 UTC)
     # to = within 2026-05-19 IST day (2026-05-19 12:00 UTC = 2026-05-19 17:30 IST)
@@ -140,18 +108,14 @@ async def test_report_daily_aggregates_per_day(db, agreement, broker_user, clien
     assert report.summary.periods_unsettled == 2
 
 
-async def test_report_summary_aggregates(db, agreement, broker_user, client_user):
+async def test_report_summary_aggregates(charge, db, agreement, broker_user, client_user):
     """Summary totals match sum of row values for a one-month MONTHLY report."""
     await _make_position(
         user_id=client_user.id,
         realized_pnl="-1000",
         closed_at=datetime(2026, 5, 18, 6, 30, tzinfo=UTC),
     )
-    await _make_brokerage_tx(
-        user_id=client_user.id,
-        amount="-50",
-        created_at=datetime(2026, 5, 18, 6, 30, 1, tzinfo=UTC),
-    )
+    await charge(client_user, "50", datetime(2026, 5, 18, 6, 30, 1, tzinfo=UTC))
 
     # IST-aligned bounds: from = 2026-05-01 00:00 IST (2026-04-30 18:30 UTC)
     # to = within May 2026 IST month (2026-05-15 12:00 UTC = 2026-05-15 17:30 IST)
@@ -174,3 +138,71 @@ async def test_report_summary_aggregates(db, agreement, broker_user, client_user
     # Sanity check on values used to derive sharing
     assert Decimal(report.rows[0].net_client_pnl_inr) == Decimal("-1000.00")
     assert Decimal(report.rows[0].net_client_bkg_inr) == Decimal("50.00")
+
+
+async def test_settled_period_reports_the_stored_figures(
+    charge, db, admin_user, agreement, client_user
+):
+    """A SETTLED period shows what was paid, even after the period's numbers
+    move, and the summary totals use the same stored figures."""
+    day1 = datetime(2026, 5, 18, 6, 30, tzinfo=UTC)
+    await _make_position(user_id=client_user.id, realized_pnl="-1000", closed_at=day1)
+    await charge(client_user, "50", day1)
+    p_start, p_end = svc.compute_period_bounds(SettlementCadence.DAILY, day1)
+    await svc.settle_period(
+        agreement_id=agreement.id,
+        period_start=p_start,
+        period_end=p_end,
+        cadence=SettlementCadence.DAILY,
+        triggered_by="MANUAL",
+        actor=admin_user,
+    )
+    # The paid day moves afterwards: a late close and its brokerage.
+    await _make_position(user_id=client_user.id, realized_pnl="-1000", closed_at=day1)
+    await charge(client_user, "50", day1)
+
+    report = await svc.build_report(
+        agreement=agreement,
+        cadence=SettlementCadence.DAILY,
+        from_dt=datetime(2026, 5, 17, 18, 30, tzinfo=UTC),
+        to_dt=datetime(2026, 5, 19, 12, 0, tzinfo=UTC),
+    )
+
+    paid, open_day = report.rows
+    assert paid.settlement_status == "SETTLED"
+    assert (paid.sharing_pnl_inr, paid.sharing_bkg_inr) == ("300.00", "15.00")  # not 600 / 30
+    assert Decimal(paid.net_client_bkg_inr) == Decimal("50")
+    assert open_day.settlement_status == "UNSETTLED"
+    assert report.summary.total_sharing_pnl_inr == "300.00"
+    assert report.summary.total_sharing_bkg_inr == "15.00"
+
+
+async def test_settled_day_does_not_stand_in_for_its_week(
+    charge, db, admin_user, agreement, client_user
+):
+    """A DAILY row settled for Monday shares its period_start with that week.
+    The WEEKLY report row must still cover the whole week, live."""
+    mon = datetime(2026, 6, 1, 6, 30, tzinfo=UTC)
+    tue = datetime(2026, 6, 2, 6, 30, tzinfo=UTC)
+    await charge(client_user, "50", mon)
+    d_start, d_end = svc.compute_period_bounds(SettlementCadence.DAILY, mon)
+    await svc.settle_period(
+        agreement_id=agreement.id,
+        period_start=d_start,
+        period_end=d_end,
+        cadence=SettlementCadence.DAILY,
+        triggered_by="MANUAL",
+        actor=admin_user,
+    )
+    await charge(client_user, "100", tue)
+
+    report = await svc.build_report(
+        agreement=agreement,
+        cadence=SettlementCadence.WEEKLY,
+        from_dt=mon,
+        to_dt=tue,
+    )
+
+    (week,) = report.rows
+    assert Decimal(week.net_client_bkg_inr) == Decimal("150")  # not Monday's 50
+    assert report.summary.total_sharing_bkg_inr == "45.00"

@@ -179,10 +179,14 @@ async def _entity_pool_ids(
 #       Catch-all for any future correction script that prefixes its
 #       narration with the word. Cheap to include; missing it would
 #       just re-create the same bug for the next operator-written fix.
+#   "Carry-forward charge …"
+#       The EOD carry fee (position_service.convert_intraday_to_carry). A
+#       house charge, not an admin Deduct Fund.
 _SYSTEM_ADJUSTMENT_PATTERNS = (
     "initial balance credit",
     "bogus 0-price fill reversal",
     "reversal trade=",  # the bogus-fill narration always contains this fragment
+    "carry-forward charge",
 )
 
 

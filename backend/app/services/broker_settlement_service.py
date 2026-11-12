@@ -8,6 +8,8 @@ B-book formula (same as admin settlement)::
 Pool definition is INTENTIONALLY direct-clients-only (not the whole subtree)
 so that sub-broker pools don't double-count up the chain. A broker's
 direct clients = users where ``broker_ancestry[-1] == broker.id``.
+Brokerage and the pool filter are the sub-admin settlement's
+(``_house_brokerage``, ``_settlement_pool``).
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from decimal import Decimal
 from typing import Any
 
 from beanie import PydanticObjectId
+from beanie.exceptions import DocumentNotFound
 
 from app.core.exceptions import (
     ConflictError,
@@ -27,10 +30,13 @@ from app.core.exceptions import (
 from app.models.audit_log import AuditAction
 from app.models.broker_settlement import BrokerSettlement, BrokerSettlementStatus
 from app.models.position import Position, PositionStatus
-from app.models.transaction import TransactionType, WalletTransaction
 from app.models.user import User, UserRole
 from app.services import market_data_service
-from app.services.admin_settlement_service import ist_week_bounds
+from app.services.admin_settlement_service import (
+    _house_brokerage,
+    _settlement_pool,
+    ist_week_bounds,
+)
 from app.services.audit_service import log_event
 from app.utils.decimal_utils import to_decimal, to_decimal128
 from app.utils.time_utils import UTC
@@ -54,21 +60,7 @@ async def _direct_client_ids(broker_id: PydanticObjectId) -> list[PydanticObject
     """Direct clients of a broker: ``assigned_broker_id == broker_id``.
     Excludes sub-broker rows so settlement scope is non-overlapping with
     sub-broker settlements."""
-    coll = User.get_motor_collection()
-    cursor = coll.find(
-        {
-            "assigned_broker_id": broker_id,
-            "role": {
-                "$nin": [
-                    UserRole.SUPER_ADMIN.value,
-                    UserRole.ADMIN.value,
-                    UserRole.BROKER.value,
-                ]
-            },
-        },
-        {"_id": 1},
-    )
-    return [doc["_id"] async for doc in cursor]
+    return await _settlement_pool({"assigned_broker_id": broker_id})
 
 
 async def compute_settlement(
@@ -119,15 +111,7 @@ async def compute_settlement(
             elif pnl > 0:
                 gross_profit += pnl
 
-        broker_txns = await WalletTransaction.find(
-            {
-                "user_id": {"$in": user_ids},
-                "transaction_type": TransactionType.BROKERAGE.value,
-                "created_at": {"$gte": period_start_utc, "$lte": period_end_utc},
-            }
-        ).to_list()
-        for t in broker_txns:
-            brokerage += abs(to_decimal(t.amount))
+        brokerage = await _house_brokerage(user_ids, period_start_utc, period_end_utc)
 
     net_house = gross_loss - gross_profit + brokerage
     # Split share: PnL % on the trading-P&L leg (loss − profit), brokerage %
@@ -164,7 +148,18 @@ async def compute_settlement(
     existing.pnl_share_pct_snapshot = to_decimal128(pct)
     existing.broker_share_inr = to_decimal128(share)
     existing.status = BrokerSettlementStatus.PENDING
-    await existing.save()
+    if existing.id is None:
+        await existing.insert()
+    else:
+        existing.updated_at = datetime.now(UTC)
+        try:
+            # Rewrite only a row that is still PENDING: a finalize that landed
+            # while this ran must never be overwritten.
+            await BrokerSettlement.find_one(
+                {"_id": existing.id, "status": BrokerSettlementStatus.PENDING.value}
+            ).replace_one(existing)
+        except DocumentNotFound:
+            return (await BrokerSettlement.get(existing.id)) or existing, True
 
     await log_event(
         action=AuditAction.BROKER_SETTLEMENT_COMPUTE,

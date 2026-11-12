@@ -34,7 +34,7 @@ from app.models.netting import (
     UserRiskSettings,
     UserSegmentOverride,
 )
-from app.models.user import User
+from app.models.user import User, UserRole
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,37 @@ RISK_CACHE_TTL = 300
 
 NETTING_FIELDS = list(NettingFieldsRequired.model_fields.keys())
 RISK_FIELDS = list(RiskSettingsRequired.model_fields.keys())
+
+# Margin fields where a tier's stored 0 means "inherit": the cascade keeps
+# walking to the next tier. Otherwise a stray 0 hid every lower tier and the
+# field chain then read it as unset, landing on the segment-wide margin or a
+# hard-coded 100. Commission fields are NOT here: 0 there is a real "free".
+ZERO_INHERITS_FIELDS = frozenset({
+    "intradayMargin", "overnightMargin",
+    "optionBuyIntraday", "optionBuyOvernight",
+    "optionSellIntraday", "optionSellOvernight",
+    "expiryDayIntradayMargin", "expiryDayOptionBuyMargin", "expiryDayOptionSellMargin",
+})
+
+
+def _tier_value(layer: Any, field: str) -> Any:
+    """The value this override tier holds for `field`; None = inherit."""
+    v = getattr(layer, field, None)
+    return None if field in ZERO_INHERITS_FIELDS and v == 0 else v
+
+
+def _walk_tiers(layers: list[tuple[str, Any]], seg: Any) -> dict[str, dict[str, Any]]:
+    """Per field, the first `(tier, override)` layer (most specific first)
+    that holds a value, else the seed segment: {field: {value, tier}}."""
+    out: dict[str, dict[str, Any]] = {}
+    for f in NETTING_FIELDS:
+        out[f] = {"value": getattr(seg, f, None), "tier": "SEED"}
+        for tier, layer in layers:
+            v = _tier_value(layer, f)
+            if v is not None:
+                out[f] = {"value": v, "tier": tier}
+                break
+    return out
 
 
 # Cached super-admin id — looked up once per process. The resolver hits
@@ -2052,9 +2083,8 @@ def _to_legacy_dict(
     def _opt_pick(field: str, ovn_field: str) -> float:
         """Option-specific margin override. NULL or 0 = inherit from
         segment-wide intraday/overnight; any other number is an explicit
-        per-side override. Treat 0 as inherit since the matrix UI uses
-        plain number inputs with no "blank/inherit" affordance — typing
-        0 is the only way for admin to signal "don't override".
+        per-side override. Override tiers' zeros were already skipped by the
+        composite merge (ZERO_INHERITS_FIELDS); this catches a seed-row 0.
         """
         opt_ovn = pick(ovn_field, None) if is_overnight else None
         opt_intra = pick(field, None)
@@ -2529,7 +2559,7 @@ async def get_effective_settings(
             if layer is None:
                 continue
             for f in NETTING_FIELDS:
-                v = getattr(layer, f, None)
+                v = _tier_value(layer, f)
                 if v is not None and getattr(composite_override, f, None) is None:
                     setattr(composite_override, f, v)
 
@@ -2630,43 +2660,55 @@ async def inherited_segment_fields(
     out: dict[str, dict[str, Any]] = {}
     for seg in segs:
         # Most-specific first; first non-null per field wins, else base seg.
-        layers: list[Any] = []
+        layers: list[tuple[str, Any]] = []
         if broker_id is not None:
-            layers.append(
+            layers.append((
+                "BROKER",
                 await BrokerSegmentOverride.find_one(
                     BrokerSegmentOverride.broker_id == broker_id,
                     BrokerSegmentOverride.segment_name == seg.name,
-                )
-            )
+                ),
+            ))
         if admin_id is not None:
-            layers.append(
+            layers.append((
+                "SUB_ADMIN",
                 await SubAdminSegmentOverride.find_one(
                     SubAdminSegmentOverride.sub_admin_id == admin_id,
                     SubAdminSegmentOverride.segment_name == seg.name,
-                )
-            )
+                ),
+            ))
         if sa_id is not None:
-            layers.append(
+            layers.append((
+                "SUPER_ADMIN",
                 await SuperAdminSegmentOverride.find_one(
                     SuperAdminSegmentOverride.super_admin_id == sa_id,
                     SuperAdminSegmentOverride.segment_name == seg.name,
-                )
-            )
-        resolved: dict[str, Any] = {}
-        for f in NETTING_FIELDS:
-            val = None
-            for layer in layers:
-                if layer is None:
-                    continue
-                lv = getattr(layer, f, None)
-                if lv is not None:
-                    val = lv
-                    break
-            if val is None:
-                val = getattr(seg, f, None)
-            resolved[f] = val
-        out[seg.name] = resolved
+                ),
+            ))
+        out[seg.name] = {f: d["value"] for f, d in _walk_tiers(layers, seg).items()}
     return out
+
+
+async def caller_inherited_segment_fields(
+    caller: User, segs: list[NettingSegment]
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """For the admin matrix: per segment, per field, what the CALLER's pool
+    inherits from the tiers strictly above the caller, and from which tier —
+    BROKER: its admin → super-admin → seed; ADMIN: super-admin → seed;
+    SUPER_ADMIN: seed. Same order and 0-rule as the resolver."""
+    tiers: list[tuple[str, dict[str, Any]]] = []
+    if caller.role != UserRole.SUPER_ADMIN:
+        if caller.role == UserRole.BROKER and caller.assigned_admin_id is not None:
+            admin_rows = await list_sub_admin_segment_overrides(caller.assigned_admin_id)
+            tiers.append(("SUB_ADMIN", {r.segment_name: r for r in admin_rows}))
+        sa_id = await _resolve_super_admin_id()
+        if sa_id is not None:
+            sa_rows = await list_super_admin_segment_overrides(sa_id)
+            tiers.append(("SUPER_ADMIN", {r.segment_name: r for r in sa_rows}))
+    return {
+        seg.name: _walk_tiers([(t, by.get(seg.name)) for t, by in tiers], seg)
+        for seg in segs
+    }
 
 
 # ── Bulk copy ──────────────────────────────────────────────────────
