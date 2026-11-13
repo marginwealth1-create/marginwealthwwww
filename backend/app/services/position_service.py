@@ -16,11 +16,13 @@ from beanie import PydanticObjectId
 from bson import Decimal128
 from pymongo.errors import DuplicateKeyError
 
+from app.core.exceptions import ConflictError
 from app.models._base import OrderAction, ProductType
 from app.models.holding import Holding
-from app.models.order import InstrumentRef
+from app.models.order import InstrumentRef, Order, OrderStatus
 from app.models.position import Position, PositionStatus, UserPositionTracker
 from app.models.position_settlement import PositionSettlement
+from app.models.trade import Trade
 from app.utils.decimal_utils import (
     ZERO,
     add,
@@ -1043,74 +1045,237 @@ async def fill_products(p: Position, lo: datetime, hi: datetime) -> list[str]:
     return products
 
 
-async def resync_closed_position_fills(position: Position) -> int:
-    """Push an admin-edited CLOSED position's prices/P&L back onto its
-    underlying Trade fills so the user-facing Closed blotter reflects it.
-
-    WHY: the user "Closed" tab is rebuilt FIFO from `Trade` documents
-    (entry = opening fill price, close = closing fill price, realised =
-    (close-entry)*qty). `admin_edit_position` only rewrites the `Position`
-    doc + a wallet REVERSAL — it never touched the fills, so an admin's
-    open/close-price correction showed on the admin Position view but the
-    user's history kept the OLD price/P&L. This syncs the fills.
-
-    Targeting (no Position→Trade FK exists): fills for the same
-    (user, token, product_type) executed inside the position's
-    [opened_at, closed_at] window (±10s slack). Opening fills (pnl_inr is
-    None) take the new avg_price; closing fills (pnl_inr set) take the new
-    close price and a recomputed pnl_inr so P&L-based consumers (reports,
-    reopen unwind) stay aligned. Best-effort — returns the number of fills
-    updated; the caller logs and never lets a miss fail the edit.
-    """
-    from datetime import timedelta
-    from app.models.trade import Trade
-    from app.services import market_data_service as _mds
-
-    if position.opened_at is None or position.closed_at is None:
-        return 0
-
-    lo = position.opened_at - timedelta(seconds=10)
-    hi = position.closed_at + timedelta(seconds=10)
-    trades = await Trade.find(
+async def position_fills_query(p: Position) -> dict[str, Any]:
+    """The fills that are `p`'s: its token and products over
+    [opened_at − 5s, (closed_at or now) + 3s]. A reopen keeps the first
+    opened_at, so that span can hold whole other positions on the key (one
+    opened and closed between the close and the reopen, a weekly predecessor)
+    — their fills are theirs, and stay out."""
+    end = p.closed_at or now_utc()
+    lo = (p.opened_at or end) - timedelta(seconds=5)
+    hi = end + timedelta(seconds=3)
+    products = await fill_products(p, lo, end)
+    others = await Position.find(
         {
-            "user_id": position.user_id,
-            "instrument.token": position.instrument.token,
-            "product_type": {"$in": await fill_products(position, lo, hi)},
-            "executed_at": {"$gte": lo, "$lte": hi},
+            "_id": {"$ne": p.id},
+            "user_id": p.user_id,
+            "instrument.token": p.instrument.token,
+            "product_type": {"$in": products},
+            "opened_at": {"$lte": hi},
+            "$or": [{"closed_at": None}, {"closed_at": {"$gte": lo}}],
         }
     ).to_list()
-    if not trades:
-        return 0
+    q: dict[str, Any] = {
+        "user_id": p.user_id,
+        "instrument.token": p.instrument.token,
+        "product_type": {"$in": products},
+        "executed_at": {"$gte": lo, "$lte": hi},
+    }
+    # ponytail: time spans, not ownership — a fill of `p` within 2s before
+    # another position opened is ceded to it. A Trade→Position link (§7.1)
+    # makes this exact.
+    spans = [
+        {"executed_at": {"$gte": o.opened_at - timedelta(seconds=2), "$lte": o.closed_at or hi}}
+        for o in others
+        if o.opened_at
+    ]
+    if spans:
+        q["$nor"] = spans
+    return q
 
-    new_avg = to_decimal(position.avg_price)
-    new_close = to_decimal(position.ltp)
-    opened_side = str(getattr(position, "opened_side", None) or "BUY").upper()
-    sign = Decimal(1) if opened_side == "BUY" else Decimal(-1)
 
-    # Mirror the admin recalc's FX basis: USD-quoted segments book P&L in
-    # INR using the rate snapshotted at open (fallback to the live rate).
-    is_usd = _mds.position_is_usd(position)
-    fx = position_fx_rate(position)  # the rate the wallet moved at (close → open → current)
+_LIVE_FILL = {"superseded_by_reopen": {"$ne": True}, "fifo_deleted": {"$ne": True}}
+_QTY = Decimal("1e-8")
+_OPEN_ORDER = [OrderStatus.OPEN.value, OrderStatus.PENDING.value, OrderStatus.PARTIAL.value]
 
-    updated = 0
-    for t in trades:
-        qty = abs(to_decimal(t.quantity))
-        if t.pnl_inr is None:
-            # Opening fill → new entry price.
-            t.price = Decimal128(str(quantize_basis(new_avg)))
-            t.value = to_decimal128(new_avg * to_decimal(t.quantity))
-        else:
-            # Closing fill → new close price + recomputed realised. Keep the
-            # fill's own brokerage; pnl_inr stays net of the close leg to
-            # match the matching-engine convention.
-            gross = (new_close - new_avg) * qty * sign * fx
-            close_brk = to_decimal(t.total_charges or t.brokerage or 0)
-            t.price = Decimal128(str(quantize_basis(new_close)))
-            t.value = to_decimal128(new_close * to_decimal(t.quantity))
-            t.pnl_inr = to_decimal128(quantize_money(gross - close_brk))
+
+def _restate(t: Any, qty: Decimal, price: Decimal) -> None:
+    """Fill `t` as `qty` @ `price`; its value and net amount follow."""
+    t.quantity = float(qty)
+    t.price = Decimal128(str(quantize_basis(price)))
+    t.value = to_decimal128(price * qty)
+    chg = to_decimal(t.total_charges)
+    t.net_amount = to_decimal128(to_decimal(t.value) + (chg if t.action == OrderAction.SELL else -chg))
+
+
+def _shifted(v: Any, by: Decimal) -> Decimal128:
+    return Decimal128(str(quantize_basis(to_decimal(v) + by)))
+
+
+async def _split_off_consumed(t: Any, keep: Decimal) -> None:
+    """Cut the units of fill `t` that closes already took into a fill of their
+    own, so the statement rows that billed them keep their price and charge
+    share. It lands 1 ms earlier so FIFO still takes it first; `t` keeps its id
+    (a per-fill SL/TP points at it), the `keep` units and the rest of the
+    charges."""
+    from app.services.matching_engine import _trade_number  # imports this module
+
+    total = abs(to_decimal(t.quantity))
+    used = total - keep
+    piece = Trade(**t.model_dump(exclude={"id", "revision_id"}))
+    piece.trade_number = _trade_number()
+    piece.executed_at = t.executed_at - timedelta(milliseconds=1)
+    for f in ("brokerage", "total_charges"):
+        share = quantize_money(to_decimal(getattr(t, f)) * used / total)
+        setattr(piece, f, to_decimal128(share))
+        setattr(t, f, to_decimal128(to_decimal(getattr(t, f)) - share))
+    _restate(piece, used, to_decimal(t.price))
+    _restate(t, keep, to_decimal(t.price))
+    await piece.insert()
+
+
+async def _orders_follow_fills(added: dict[Any, Decimal]) -> None:
+    """Each order's size moves by the units `added` to its fills, and its
+    average price follows them."""
+    for oid, more in added.items():
+        o = await Order.get(oid)
+        fills = await Trade.find(Trade.order_id == oid).to_list()
+        units = sum((abs(to_decimal(f.quantity)) for f in fills), ZERO)
+        if o is None or units <= 0:
+            continue
+        if more and o.filled_quantity:
+            r = (to_decimal(o.filled_quantity) + more) / to_decimal(o.filled_quantity)
+            o.quantity = float(to_decimal(o.quantity) + more)
+            o.filled_quantity = float(to_decimal(o.filled_quantity) + more)
+            o.lots = float(to_decimal(o.lots) * r)
+            o.margin_blocked = to_decimal128(to_decimal(o.margin_blocked) * r)
+        value = sum((to_decimal(f.price) * abs(to_decimal(f.quantity)) for f in fills), ZERO)
+        o.average_price = Decimal128(str(quantize_basis(value / units)))
+        await o.save()
+
+
+async def resync_position_fills(old: Position, new: Position) -> Decimal:
+    """Carry an admin edit (`old` → `new`, not yet saved) onto the fills that
+    every report is rebuilt from, so the statement says what the wallet does.
+    Returns the rupees the wallet must move (0 for an OPEN position).
+
+    OPEN — a quantity and/or entry-price edit reaches the lots the FIFO walk
+    still holds for the position: each is scaled by new/old units (a pyramid
+    keeps its ratio) and shifted by (new avg − their average) (spacing kept).
+    Units closes already took are cut off first and keep their price, so a
+    statement already sent does not move; closing fills are never touched.
+    opening_quantity moves with the units. When the walk holds none of the
+    position's units as lots (a reopen whose undone closes still drained them
+    — the re-close then bills off its own stamp —, a reversal's leg, a weekly
+    re-seed) the fills are left as they are.
+
+    CLOSED — every live close of the cycle is re-booked at its OWN close
+    price and fx: pnl_inr moves by sign × (Δclose − Δavg) × units × fx, and
+    the opening lots shift by Δavg (a specific-lot or pyramid history keeps its
+    shape). A close price can only be set when the cycle has exactly one
+    close (ConflictError otherwise, or when no close is found)."""
+    side = old.opened_side or (OrderAction.BUY if old.quantity >= 0 else OrderAction.SELL)
+    d_avg = to_decimal(new.avg_price) - to_decimal(old.avg_price)
+    if new.status == PositionStatus.OPEN:
+        await _resync_open_lots(old, new, side, d_avg)
+        return ZERO
+    return await _rebook_closed(old, new, side, d_avg)
+
+
+async def _resync_open_lots(old: Position, new: Position, side: OrderAction, d_avg: Decimal) -> None:
+    dq = abs(new.quantity) - abs(old.quantity)
+    if dq:
+        new.opening_quantity = float(old.opening_quantity or abs(old.quantity)) + dq
+    if not dq and not d_avg:
+        return
+    mine = {
+        t.id: t
+        for t in await Trade.find(
+            {**await position_fills_query(old), "action": side.value, "pnl_inr": None, **_LIVE_FILL}
+        ).to_list()
+    }
+    lots: list[dict[str, Any]] = []
+    await list_closed_trade_events_fifo(old.user_id, limit=0, lots=lots)
+    held = [(mine[f["tid"]], to_decimal(round(f["qty"], 8))) for f in lots if f.get("tid") in mine]
+    units = sum((u for _, u in held), ZERO)
+    if not held or abs(units - to_decimal(abs(old.quantity))) > _QTY:
+        logger.warning(
+            "position_fills_not_resynced",
+            extra={"pos_id": str(old.id), "lot_units": str(units), "qty": old.quantity},
+        )
+        return
+    k = to_decimal(abs(new.quantity)) / units
+    shift = ZERO
+    if d_avg:
+        shift = to_decimal(new.avg_price) - sum((to_decimal(t.price) * u for t, u in held), ZERO) / units
+    left = to_decimal(abs(new.quantity))
+    added: dict[Any, Decimal] = {}  # order id → units added to its fills
+    for i, (t, u) in enumerate(held):
+        size = left if i == len(held) - 1 else (u * k).quantize(_QTY)
+        left -= size
+        if abs(to_decimal(t.quantity)) - u > _QTY:
+            await _split_off_consumed(t, u)
+        _restate(t, size, to_decimal(t.price) + shift)
         await t.save()
-        updated += 1
-    return updated
+        added[t.order_id] = added.get(t.order_id, ZERO) + size - u
+        # A per-fill SL/TP parked on this lot exits what it now holds.
+        for o in await Order.find({"sl_tp_source_trade_id": t.id, "status": {"$in": _OPEN_ORDER}}).to_list():
+            r = size / u
+            o.quantity = float(to_decimal(o.quantity) * r)
+            o.pending_quantity = float(to_decimal(o.pending_quantity) * r)
+            o.lots = float(to_decimal(o.lots) * r)
+            if o.cost_basis_override is not None:
+                o.cost_basis_override = _shifted(o.cost_basis_override, shift)
+            await o.save()
+    await _orders_follow_fills(added)
+
+
+async def _rebook_closed(old: Position, new: Position, side: OrderAction, d_avg: Decimal) -> Decimal:
+    sign = Decimal(1) if side == OrderAction.BUY else Decimal(-1)
+    new_close = to_decimal(new.ltp)
+    set_close = new_close != to_decimal(old.ltp)
+    if not d_avg and not set_close:
+        return ZERO
+    q = await position_fills_query(old)
+    win = dict(q["executed_at"])
+    cycle = old.reopened_at or old.opened_at
+    if cycle:
+        win["$gte"] = max(win["$gte"], cycle - timedelta(seconds=1))
+    closes = await Trade.find(
+        {**q, "executed_at": win, "action": {"$ne": side.value}, "pnl_inr": {"$ne": None}, **_LIVE_FILL}
+    ).to_list()
+    settled = old.close_reason in ("WEEKLY_SETTLEMENT", "EXPIRY_SETTLED")  # a close with no fill
+    legs = len(closes) + int(settled)
+    if not legs:
+        raise ConflictError(
+            "No closing fill found for this position, so the statement cannot follow a price edit."
+        )
+    if set_close and legs != 1:
+        raise ConflictError(
+            f"This position closed in {legs} parts; a close price belongs to one close. "
+            "Edit the entry price instead."
+        )
+    native = inr = ZERO
+    touched: dict[Any, Decimal] = {}
+    for t in closes:
+        units = abs(to_decimal(t.quantity))
+        if t.closed_quantity is not None:
+            units = min(units, to_decimal(t.closed_quantity))
+        d = sign * ((new_close - to_decimal(t.price) if set_close else ZERO) - d_avg) * units
+        fx = to_decimal(t.fx_rate) if t.fx_rate is not None else ZERO  # None: booked 1:1
+        di = quantize_money(d * (fx if fx > 0 else Decimal(1)))
+        t.pnl_inr = to_decimal128(to_decimal(t.pnl_inr) + di)
+        if t.cost_basis_override is not None and d_avg:  # the lot it exited moved too
+            t.cost_basis_override = _shifted(t.cost_basis_override, d_avg)
+        if set_close:
+            _restate(t, abs(to_decimal(t.quantity)), new_close)
+        await t.save()
+        touched[t.order_id] = ZERO
+        native += d
+        inr += di
+    if settled:  # the walk bills it off the doc's avg_price / ltp
+        units = to_decimal(abs(old.quantity) or old.opening_quantity or 0)
+        d = sign * ((new_close - to_decimal(old.ltp) if set_close else ZERO) - d_avg) * units
+        native += d
+        inr += quantize_money(d * position_fx_rate(old))
+    if d_avg:
+        for t in await Trade.find({**q, "action": side.value, "pnl_inr": None, **_LIVE_FILL}).to_list():
+            _restate(t, abs(to_decimal(t.quantity)), to_decimal(t.price) + d_avg)
+            await t.save()
+            touched[t.order_id] = ZERO
+    await _orders_follow_fills(touched)
+    new.realized_pnl = to_decimal128(to_decimal(old.realized_pnl) + native)
+    return inr
 
 
 def _booked_gross(t: Any) -> Decimal | None:
@@ -1163,6 +1328,7 @@ async def list_closed_trade_events_fifo(
     *,
     skip: int = 0,
     limit: int = 25,
+    lots: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict], int]:
     """FIFO per-opening-fill closed blotter.
 
@@ -1183,6 +1349,8 @@ async def list_closed_trade_events_fifo(
     closing trade produces.
 
     Returns (page_events, total_count) — newest-close-first, paginated.
+    `lots`, when given, receives the lots still open at the end of the walk
+    (each with its opening fill's id as "tid").
     """
     from collections import deque
     from app.models.trade import Trade
@@ -1453,6 +1621,7 @@ async def list_closed_trade_events_fifo(
                 "side": side_str,
                 "open_brk": _charge(t),  # stored for pro-rata allocation on close
                 "original_qty": qty,     # original fill qty for correct pro-rata on partial closes
+                "tid": t.id,
             })
             continue
 
@@ -1617,6 +1786,9 @@ async def list_closed_trade_events_fifo(
 
             if front["qty"] < 1e-9:
                 del q[idx]
+
+    if lots is not None:
+        lots.extend(f for _q in open_queues.values() for f in _q)
 
     # Drop closing fills an admin REOPEN/DELETE later undid. They stay in the
     # collection (audit) and were processed above so the FIFO pairing of the

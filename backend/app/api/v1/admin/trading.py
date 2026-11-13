@@ -1269,47 +1269,8 @@ async def _supersede_settlement_pnl(p: Position) -> None:
         )
 
 
-async def _delete_window(p: Position) -> dict[str, Any]:
-    """The fills a delete of `p` takes back: its token and products over
-    [opened_at − 5s, (closed_at or now) + 3s]. A reopen keeps the first
-    opened_at, so that span can hold whole other positions on the key (one
-    opened and closed between the close and the reopen, a weekly predecessor)
-    — their fills are theirs, and stay."""
-    from datetime import timedelta
-
-    from app.utils.time_utils import now_utc
-
-    end = p.closed_at or now_utc()
-    lo = (p.opened_at or end) - timedelta(seconds=5)
-    hi = end + timedelta(seconds=3)
-    products = await position_service.fill_products(p, lo, end)
-    others = await Position.find(
-        {
-            "_id": {"$ne": p.id},
-            "user_id": p.user_id,
-            "instrument.token": p.instrument.token,
-            "product_type": {"$in": products},
-            "opened_at": {"$lte": hi},
-            "$or": [{"closed_at": None}, {"closed_at": {"$gte": lo}}],
-        }
-    ).to_list()
-    q: dict[str, Any] = {
-        "user_id": p.user_id,
-        "instrument.token": p.instrument.token,
-        "product_type": {"$in": products},
-        "executed_at": {"$gte": lo, "$lte": hi},
-    }
-    # ponytail: time spans, not ownership — a fill of `p` within 2s before
-    # another position opened is ceded to it. A Trade→Position link (§7.1)
-    # makes this exact.
-    spans = [
-        {"executed_at": {"$gte": o.opened_at - timedelta(seconds=2), "$lte": o.closed_at or hi}}
-        for o in others
-        if o.opened_at
-    ]
-    if spans:
-        q["$nor"] = spans
-    return q
+# The fills a delete of `p` takes back (the position's own fills).
+_delete_window = position_service.position_fills_query
 
 
 async def _net_delete_outstanding(user_id: PydanticObjectId) -> None:
@@ -1445,12 +1406,17 @@ async def admin_edit_position(
 
     OPEN-position fields:
         avg_price, quantity, opened_at, stop_loss, target
+        (quantity / avg_price also resize / reprice the open lots' fills;
+        a quantity may not flip or flatten the position)
 
     CLOSED-position fields (admin correction of a bad close):
+        avg_price, close_price — re-book each close on its fill; the
+                        difference is posted as a REVERSAL. close_price
+                        needs a single close (409 otherwise).
         realized_pnl  — override the booked realised. Difference vs
                         the previous value is posted to the user's
-                        wallet as a REVERSAL transaction so the
-                        ledger always reconciles.
+                        wallet as a REVERSAL transaction. Wallet-only:
+                        the fills, and so the statement, keep theirs.
         close_reason  — relabel (USER / SL_HIT / STOP_OUT / ADMIN).
                         Cosmetic, no money movement.
 
@@ -1461,6 +1427,13 @@ async def admin_edit_position(
     if p is None:
         raise HTTPException(status_code=404, detail="Position not found")
     await assert_user_in_scope(admin, p.user_id)
+    before = p.model_copy(deep=True)
+    if p.status == PositionStatus.CLOSED:
+        # Units, open time and brackets belong to an open position; a closed
+        # one's units are its fills.
+        bad = [k for k in ("quantity", "opened_at", "stop_loss", "target") if payload.get(k) is not None]
+        if bad:
+            raise HTTPException(status_code=400, detail=f"Cannot edit {', '.join(bad)} on a closed position")
 
     old_values: dict[str, Any] = {
         "avg_price": str(p.avg_price),
@@ -1488,6 +1461,11 @@ async def admin_edit_position(
             p.quantity = float(payload["quantity"])
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid quantity: {e}")
+        if before.quantity and (not p.quantity or (p.quantity > 0) != (before.quantity > 0)):
+            raise HTTPException(
+                status_code=400,
+                detail="A quantity edit cannot flip or flatten the position — square it off instead.",
+            )
     if "opened_at" in payload and payload["opened_at"] is not None:
         try:
             p.opened_at = datetime.fromisoformat(str(payload["opened_at"]).replace("Z", "+00:00"))
@@ -1502,28 +1480,19 @@ async def admin_edit_position(
 
     # ── CLOSED-row corrections ────────────────────────────────────────
     # Allow admin to edit avg_price (open price) and ltp (close price)
-    # on CLOSED rows. When either changes, realized_pnl is recalculated
-    # automatically so the delta flows through the REVERSAL wallet path.
-    # Also supports direct realized_pnl override for edge cases.
+    # on CLOSED rows. When either changes, the closes are re-booked on their
+    # fills (position_service.resync_position_fills) and the delta flows
+    # through the REVERSAL wallet path. A direct realized_pnl override is a
+    # wallet-only adjustment: the fills, and so the statement, keep theirs.
     realized_delta: Decimal | None = None
-    # Set when a CLOSED position's open/close PRICE is edited — drives the
-    # post-save resync that pushes the new prices onto the underlying Trade
-    # fills so the user's FIFO Closed blotter reflects the correction (the
-    # blotter derives entry/close/P&L from trades, not the Position doc).
-    resync_closed_fills = False
+    recalc_pnl = False
+    override_note: str | None = None
 
     if p.status == PositionStatus.CLOSED:
-        from decimal import Decimal as _Decimal
         from app.utils.decimal_utils import to_decimal as _td
-        from app.services import market_data_service as _mds
 
-        recalc_pnl = False
         if "avg_price" in payload and payload["avg_price"] is not None:
-            try:
-                p.avg_price = Decimal128(str(payload["avg_price"]))
-                recalc_pnl = True
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Invalid avg_price: {e}")
+            recalc_pnl = True
         if "close_price" in payload and payload["close_price"] is not None:
             try:
                 p.ltp = Decimal128(str(payload["close_price"]))
@@ -1531,29 +1500,7 @@ async def admin_edit_position(
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Invalid close_price: {e}")
 
-        if recalc_pnl:
-            # Recompute realized_pnl from the new open/close prices.
-            # sign = +1 for long (BUY), -1 for short (SELL).
-            try:
-                open_px = _td(p.avg_price)
-                close_px = _td(p.ltp)
-                abs_qty = _td(abs(p.opening_quantity or p.quantity or 0))
-                sign = _Decimal(1) if str(getattr(p, "opened_side", None) or "BUY").upper() == "BUY" else _Decimal(-1)
-                raw = (close_px - open_px) * abs_qty * sign
-                from app.services.position_service import position_fx_rate as _pfx
-                from app.utils.decimal_utils import quantize_money as _qm
-
-                # realized_pnl stays NATIVE; the wallet delta is in rupees.
-                fx = _pfx(p)
-                old_realized = _td(p.realized_pnl or 0)
-                new_realized = _qm(raw)
-                realized_delta = _qm((new_realized - old_realized) * fx)
-                p.realized_pnl = Decimal128(str(new_realized))
-                resync_closed_fills = True
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"PnL recalc failed: {e}")
-
-        # Direct realized_pnl override (takes precedence over recalc if both sent)
+        # Direct realized_pnl override (a price edit takes precedence if both sent)
         if (
             "realized_pnl" in payload
             and payload["realized_pnl"] is not None
@@ -1570,11 +1517,10 @@ async def admin_edit_position(
                 old_realized_inr = _qm(_td(p.realized_pnl or 0) * fx)
                 realized_delta = new_realized_inr - old_realized_inr
                 p.realized_pnl = Decimal128(str(_qm(new_realized_inr / fx)))
-                # Also push the correction onto the underlying fills so the
-                # user's FIFO Closed blotter matches the wallet, not just a
-                # price edit. (Was: only price edits resynced → a realized
-                # override left the user view stale, mismatching the wallet.)
-                resync_closed_fills = True
+                override_note = (
+                    f"Realized P&L override: wallet-only adjustment of ₹{realized_delta}; "
+                    "the fills, and so the FIFO statement, are not changed."
+                )
             except Exception as e:
                 raise HTTPException(
                     status_code=400, detail=f"Invalid realized_pnl: {e}"
@@ -1678,28 +1624,14 @@ async def admin_edit_position(
                 )
         p.margin_used = Decimal128(str(new_margin))
 
+    # Everything that reports the position is rebuilt from its fills: carry
+    # the quantity / price edit onto them before the doc changes.
+    if recalc_pnl or p.status == PositionStatus.OPEN:
+        _fills_delta = await position_service.resync_position_fills(before, p)
+        if recalc_pnl:
+            realized_delta = _fills_delta
+
     await p.save()
-
-    # ── Sync underlying Trade fills on a CLOSED price edit ────────────
-    # The user's Closed blotter is rebuilt FIFO from Trade fills, so an
-    # admin open/close-price correction on the Position doc alone never
-    # reached the user's history (admin view changed, user view didn't —
-    # operator-flagged). Push the new prices + recomputed P&L onto the
-    # matching fills. Best-effort: a targeting miss must not fail the edit
-    # (the Position + wallet REVERSAL are already correct), so log + go on.
-    if resync_closed_fills:
-        from app.services import position_service as _ps_fills
-
-        try:
-            n = await _ps_fills.resync_closed_position_fills(p)
-            logger.info(
-                "admin_edit_position_fills_resynced",
-                extra={"pos_id": str(p.id), "fills_updated": n},
-            )
-        except Exception:
-            logger.exception(
-                "admin_edit_position_fills_resync_failed", extra={"pos_id": str(p.id)}
-            )
 
     # ── Re-balance the wallet + resync derived state on an OPEN qty/avg edit
     # Move the margin delta on the wallet (block when the requirement grew,
@@ -1755,6 +1687,7 @@ async def admin_edit_position(
                 narration=(
                     f"Admin {admin.user_code} corrected realised P&L on "
                     f"{p.instrument.symbol} (delta {realized_delta})"
+                    + (" — wallet-only, fills unchanged" if override_note else "")
                 ),
                 reference_type="Position",
                 reference_id=str(p.id),
@@ -1795,6 +1728,8 @@ async def admin_edit_position(
         "opening_quantity": p.opening_quantity if p.opening_quantity is not None else abs(p.quantity or 0),
         "lot_size": getattr(p.instrument, "lot_size", None),
     }
+    if override_note:
+        edit_metadata["narration"] = override_note
     await log_event(
         action=AuditAction.POSITION_EDIT,
         entity_type="Position",
