@@ -149,8 +149,8 @@ async def test_the_trade_book_is_per_fill_and_billing_is_fifo_paired(w):
     # One sell, two FIFO rows: one per lot it took, each billed at the
     # average the wallet booked.
     rows, _, _ = await tradebook_builder.fifo_closed_rows(w.c.id, None, None)
-    paired = [(r["amount"], r["open_price"], r["close_price"]) for r in rows]
-    assert paired == [("10.00", "101.00", "110.00")] * 2
+    paired = [(r["qty"], r["buy_rate"], r["sell_rate"]) for r in rows]
+    assert paired == [(10, 101, 110)] * 2
 
 
 async def test_admin_reaches_both_documents_and_they_differ(w, handed, built):
@@ -190,5 +190,5 @@ async def test_the_client_and_the_admin_get_one_statement(w, handed, built):
     assert {**mine, "admin_brand_name": ""} == {**theirs, "admin_brand_name": ""}
     assert mine == await tradebook_builder.statement_payload(w.c, *tradebook_builder.window(day, day))
     assert [r["script"] for r in mine["closed_transactions"]] == ["TBKG", "TBKG"]
-    assert [d["script"] for d in mine["opened_deals"]] == ["TBVO"]
+    assert [d["script"] for d in mine["carry_forward"]] == ["TBVO"]
     _check_tables(built)

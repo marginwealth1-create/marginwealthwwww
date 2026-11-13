@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from typing import Any
+from xml.sax.saxutils import escape
 
 from beanie import PydanticObjectId
 from openpyxl import Workbook
@@ -946,8 +947,8 @@ def render_entity_users_pdf(
     meta_style = ParagraphStyle("meta", parent=styles["Normal"], fontSize=9, textColor=colors.grey)
 
     elements: list = []
-    elements.append(Paragraph(f"PNL Report — {entity_name}", h1))
-    elements.append(Paragraph(f"Period: {period_label}", meta_style))
+    elements.append(Paragraph(escape(f"PNL Report — {entity_name}"), h1))
+    elements.append(Paragraph(escape(f"Period: {period_label}"), meta_style))
     elements.append(Spacer(1, 8))
 
     headers = ["User ID", "Username", "Total PNL", "Net PNL", "Net BKG", "Settlement", "PNL-Sett."]
@@ -999,8 +1000,8 @@ def render_broker_totals_pdf(
     meta_style = ParagraphStyle("meta", parent=styles["Normal"], fontSize=9, textColor=colors.grey)
 
     elements: list = []
-    elements.append(Paragraph(f"Broker Summary — {entity_name}", h1))
-    elements.append(Paragraph(f"Period: {period_label}", meta_style))
+    elements.append(Paragraph(escape(f"Broker Summary — {entity_name}"), h1))
+    elements.append(Paragraph(escape(f"Period: {period_label}"), meta_style))
     elements.append(Spacer(1, 10))
 
     rows = [

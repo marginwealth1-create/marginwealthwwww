@@ -97,7 +97,7 @@ async def _wallet_booked(user: User) -> Decimal:
 
 async def _statement(user: User, lo=None, hi=None):
     rows, net, brk = await fifo_closed_rows(user.id, lo, hi)
-    total = sum((Decimal(str(r["total_pnl"])) for r in rows), Decimal(0)).quantize(CENT)
+    total = sum((Decimal(str(r["gross_pnl"])) for r in rows), Decimal(0)).quantize(CENT)
     assert Decimal(str(net)) == total
     return rows, total, Decimal(str(brk))
 

@@ -113,7 +113,7 @@ async def w(monkeypatch):
 
 
 def _closes(payload) -> list[tuple[str, str]]:
-    return [(r["time"], r["open_time"]) for r in payload["closed_transactions"] if r["type"] == "Close"]
+    return [(r["sell_time"], r["buy_time"]) for r in payload["closed_transactions"]]
 
 
 async def test_the_admin_bill_covers_the_whole_ist_day(w):

@@ -1497,6 +1497,9 @@ async def list_closed_trade_events_fifo(
             "instrument": _p.instrument,
             "product_type": _p.product_type,
             "pid": _p.id,
+            # The row's open leg: when this position opened, not the
+            # settlement instant.
+            "opened_at": _p.opened_at or _p.closed_at,
             "close_reason": _p.close_reason,
             # The rate the settlement moved the wallet at (1 for INR and for
             # USD positions booked before the conversion).
@@ -1604,7 +1607,7 @@ async def list_closed_trade_events_fifo(
                 "fx_rate": b["fx_rate"],
                 "brokerage": sum(a for _, a in _legs),
                 "legs": _legs,
-                "opened_at": b["ts"],
+                "opened_at": b["opened_at"],
                 "closed_at": b["ts"],
                 "instrument_token": b["key"][0],
                 "close_reason": b.get("close_reason", "WEEKLY_SETTLEMENT"),

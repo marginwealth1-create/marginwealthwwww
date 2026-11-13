@@ -110,7 +110,8 @@ async def _pnl_payload(user, from_date: datetime | None, to_date: datetime | Non
     # before `from_date`). Surfacing it lets the UI explain the gap instead of
     # the client reading it as "missing money".
     for agg in by_symbol.values():
-        agg["open_qty"] = int((agg.get("buy_qty") or 0) - (agg.get("sell_qty") or 0))
+        # Units, fractions kept (int() read a 0.05 BTC position as 0).
+        agg["open_qty"] = round((agg.get("buy_qty") or 0) - (agg.get("sell_qty") or 0), 8)
 
     net = round(total_realized_net, 2)                  # NET P&L (after brokerage)
     charges = round(total_charges, 2)

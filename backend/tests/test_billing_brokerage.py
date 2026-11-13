@@ -99,17 +99,17 @@ async def _statement(user: User, day: str):
     """The statement for one IST day, checked against itself and the ledger."""
     lo, hi = tradebook_builder.window(day, day)
     p = await tradebook_builder.statement_payload(user, lo, hi)
-    trades = [r for r in p["closed_transactions"] if r["type"] == "Close"]
+    trades = p["closed_transactions"]
     row_brk = sum((_d(r["brokerage"]) for r in trades), Decimal(0))
-    cf_brk = sum((_d(d["commission"]) for d in p["opened_deals"]), Decimal(0))
-    gross = sum((_d(r["total_pnl"]) for r in trades), Decimal(0)).quantize(CENT)
+    cf_brk = sum((_d(d["commission"]) for d in p["carry_forward"]), Decimal(0))
+    gross = sum((_d(r["gross_pnl"]) for r in trades), Decimal(0)).quantize(CENT)
     fin = {k: _d(v) for k, v in p["financial"].items()}
 
-    assert (row_brk + cf_brk).quantize(CENT) == fin["brokerage"] == _d(p["total_brokerage"])
+    assert (row_brk + cf_brk).quantize(CENT) == fin["brokerage"]
     assert fin["brokerage"] == -await _ledger(user, lo, hi, TransactionType.CHARGES)
     assert gross == fin["gross_pnl"] == await _ledger(user, lo, hi, TransactionType.PNL)
     assert fin["net_pnl"] == fin["gross_pnl"] - fin["brokerage"]
-    return SimpleNamespace(trades=trades, cf=p["opened_deals"], fin=fin, payload=p)
+    return SimpleNamespace(trades=trades, cf=p["carry_forward"], fin=fin, payload=p)
 
 
 async def _settle_weekly(user: User, monkeypatch, price: str) -> None:
@@ -161,7 +161,7 @@ async def test_a_close_bills_only_the_legs_charged_inside_the_window(w):
     # The week the position opened: nothing closed, its ₹10 sits on the CF row.
     opened = await _statement(w.c, opened_on)
     assert opened.trades == []
-    assert [(_d(d["amount"]), _d(d["commission"])) for d in opened.cf] == [(Decimal("10"), Decimal("10"))]
+    assert [(_d(d["qty"]), _d(d["commission"])) for d in opened.cf] == [(Decimal("10"), Decimal("10"))]
     assert opened.fin["brokerage"] == Decimal("10")  # was 0: closed rows only
 
     # The week it closed: the close leg alone, not October's open leg again.
@@ -179,7 +179,7 @@ async def test_a_partly_closed_lot_splits_its_open_leg_between_the_close_and_cf(
     # 10 + 5 open legs + 6 close = 21; the close row bills 6 of the first lot.
     assert [_d(r["brokerage"]) for r in s.trades] == [Decimal("12")]
     assert [_d(d["commission"]) for d in s.cf] == [Decimal("9")]
-    assert _d(s.cf[0]["amount"]) == Decimal("9")
+    assert _d(s.cf[0]["qty"]) == Decimal("9")
 
 
 async def test_cf_value_is_units_times_price_not_times_lot_size_again(w):
@@ -187,8 +187,8 @@ async def test_cf_value_is_units_times_price_not_times_lot_size_again(w):
     pos = await Position.find_one(Position.user_id == w.c.id)
     s = await _statement(w.c, _day(now_utc()))
     [cf] = s.cf
-    assert _d(cf["amount"]) == Decimal("1500")
-    assert _d(cf["value"]) == Decimal("1500") * _d(pos.ltp)  # ×75 printed 22,50,00,000
+    assert _d(cf["qty"]) == Decimal("1500")
+    assert _d(cf["value"]) == Decimal("1500") * _d(pos.avg_price)  # ×75 printed 22,50,00,000
     fill = await Trade.find_one(Trade.user_id == w.c.id)
     assert _d(cf["commission"]) == _d(fill.total_charges) > 0
 
@@ -203,7 +203,7 @@ async def test_an_expiry_settles_the_units_held_not_the_peak(w):
     s = await _statement(w.c, _day(now_utc()))
     expiry = [r for r in s.trades if r["comment"] == "Expiry settlement"]
     assert len(expiry) == 1
-    assert _d(expiry[0]["amount"]) == Decimal("75")  # was 150 (opening_quantity, the peak)
+    assert _d(expiry[0]["qty"]) == Decimal("75")  # was 150 (opening_quantity, the peak)
     assert _d(expiry[0]["brokerage"]) == Decimal("75")  # the drained half of the buy's ₹150
     assert s.fin["gross_pnl"] == Decimal("225")  # 75 + 75 × 2; was 375
     assert s.fin["brokerage"] == Decimal("225")

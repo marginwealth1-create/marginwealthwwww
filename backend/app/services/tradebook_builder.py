@@ -18,12 +18,11 @@ writes to the database.
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from app.core.exceptions import ValidationFailedError
-from app.models.order import Order, OrderStatus
 from app.models.position import Position, PositionStatus
 from app.models.position_settlement import PositionSettlement, PositionSettlementStatus
 from app.models.trade import LIVE_FILL, Trade
@@ -33,6 +32,66 @@ from app.utils.decimal_utils import quantize_money, to_decimal
 from app.utils.time_utils import UTC, end_of_day_ist, now_utc, start_of_day_ist, to_ist
 
 _SETTLED_COMMENT = {"WEEKLY_SETTLEMENT": "Weekly settlement", "EXPIRY_SETTLED": "Expiry settlement"}
+# The statement lists derivatives with their cash market: one NSE table, not
+# an NSE and an NFO one.
+_FOLD = {"NFO": "NSE", "BFO": "BSE"}
+
+
+def exchange_label(exchange: Any) -> str:
+    e = str(exchange or "")
+    return _FOLD.get(e, e)
+
+
+def pair_legs(side: str, entry: Any, close: Any, opened_at: Any, closed_at: Any) -> tuple[Any, Any, Any, Any]:
+    """One closed trade's legs as (buy_rate, sell_rate, buy_time, sell_time).
+
+    A long bought at the entry and sold at the close. A short SOLD at the
+    entry — first — and bought back at the close, so its sell time is the
+    EARLIER of the two."""
+    if side == "BUY":
+        return entry, close, opened_at, closed_at
+    return close, entry, closed_at, opened_at
+
+
+def script_wise(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per (exchange, script): units closed, average buy/sell rate as turnover
+    over quantity (weighted, not a mean of rates), the turnovers, first to
+    last trade time and the P&L. Blank times are skipped: "" sorts before
+    every real time."""
+    acc: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in rows:
+        a = acc.setdefault(
+            (r["exchange"], r["script"]),
+            {
+                "exchange": r["exchange"],
+                "script": r["script"],
+                **dict.fromkeys(
+                    ("qty", "buy_turnover", "sell_turnover", "brokerage", "gross_pnl"), Decimal(0)
+                ),
+                "times": [],
+            },
+        )
+        q = to_decimal(r["qty"])
+        a["qty"] += q
+        a["buy_turnover"] += to_decimal(r["buy_rate"]) * q
+        a["sell_turnover"] += to_decimal(r["sell_rate"]) * q
+        a["brokerage"] += to_decimal(r["brokerage"])
+        a["gross_pnl"] += to_decimal(r["gross_pnl"])
+        a["times"] += [t for t in (r["buy_time"], r["sell_time"]) if t]
+    out = []
+    for a in acc.values():
+        times, q = a.pop("times"), a["qty"]
+        out.append(
+            {
+                **a,
+                "avg_buy": a["buy_turnover"] / q if q else Decimal(0),
+                "avg_sell": a["sell_turnover"] / q if q else Decimal(0),
+                "net_pnl": a["gross_pnl"] - a["brokerage"],
+                "first_time": min(times, default=""),
+                "last_time": max(times, default=""),
+            }
+        )
+    return out
 
 
 def _ist_day(v: str) -> date:
@@ -115,32 +174,34 @@ async def fifo_closed_rows(
     gross_sum = Decimal(0)
     brk_sum = Decimal(0)
 
-    for ev in events:
-        if not inside(ev.get("closed_at")):
-            continue
+    # Oldest close first (stable: a close's sub-rows keep their order).
+    for ev in sorted(
+        (e for e in events if inside(e.get("closed_at"))),
+        key=lambda e: _naive(e["closed_at"]) or datetime.min,
+    ):
         inst = ev["instrument"]
-        qty = float(ev["qty"])
         # The walk's gross is native; brokerage is already in wallet units.
         gross_d = to_decimal(float(ev["gross_pnl"])) * to_decimal(float(ev.get("fx_rate") or 1))
-        brk = sum(float(a) for ts, a in ev.get("legs", ()) if inside(ts))
+        brk = to_decimal(sum(float(a) for ts, a in ev.get("legs", ()) if inside(ts)))
         gross_sum += gross_d
-        brk_sum += to_decimal(brk)
+        brk_sum += brk
+        buy, sell, buy_at, sell_at = pair_legs(
+            ev["opened_side"], ev["entry_price"], ev["close_price"], ev.get("opened_at"), ev.get("closed_at")
+        )
         rows.append(
             {
-                "time": _fmt_dt(ev.get("closed_at")),
-                "type": "Close",
                 "ticket_id": str(ev.get("_row_id") or "")[-8:],
+                "exchange": exchange_label(inst.exchange),
                 "script": inst.symbol,
-                "amount": f"{qty:,.2f}",
-                "type_detail": ev["opened_side"],
-                "open_time": _fmt_dt(ev.get("opened_at")),
-                "open_price": f"{float(ev['entry_price']):,.2f}",
-                "close_price": f"{float(ev['close_price']):,.2f}",
-                "dp_wd_aj": "",
-                "brokerage": brk,
-                "commission": brk,
-                "open_com": brk,
-                "total_pnl": float(gross_d),
+                "side": ev["opened_side"],
+                "qty": float(ev["qty"]),
+                "buy_rate": float(buy),
+                "sell_rate": float(sell),
+                "buy_time": _fmt_dt(buy_at),
+                "sell_time": _fmt_dt(sell_at),
+                "brokerage": float(brk),
+                "gross_pnl": float(gross_d),
+                "net_pnl": float(gross_d - brk),
                 "comment": _SETTLED_COMMENT.get(ev.get("close_reason") or "", ""),
             }
         )
@@ -250,22 +311,24 @@ async def trade_rows(
 async def statement_payload(
     user: Any, from_date: datetime | None, to_date: datetime | None, *, brand: str = ""
 ) -> dict[str, Any]:
-    """The Billing statement's payload for `user` over [from_date, to_date].
+    """The Billing statement's payload for `user` over [from_date, to_date],
+    in the operator's order (handoff §4.1): Brought Forward, Funds, the closed
+    trades (the PDF lists them per exchange), Script-wise P&L, Carry Forward
+    and Financial Standings.
 
     Its tables add up: Σ closed-row brokerage + Σ Carry Forward commission is
     Financial Standings' Brokerage — every charge on a fill executed in the
     window — and Σ closed-row Gross is its Gross PnL (what the wallet booked
     as P&L in the window); Net = Gross − Brokerage. Balance is the ledger's
-    balance at the end of the window."""
+    balance at the end of the window. Nothing here is a live price."""
     uid = user.id
     span = _span(from_date, to_date)
     inside = _between(from_date, to_date)
-    hi = _naive(to_date)
 
     lots: list[dict[str, Any]] = []
     closed_rows, gross, _ = await fifo_closed_rows(uid, from_date, to_date, lots=lots)
 
-    # ── Funds: settled money moves only ────────────────────────────────
+    # ── Funds: settled money moves, opening on the ledger's own balance ──
     money_types = [
         TransactionType.DEPOSIT,
         TransactionType.WITHDRAWAL,
@@ -280,38 +343,31 @@ async def statement_payload(
     }
     if span:
         tx_q["created_at"] = span
-    money_txs = await WalletTransaction.find(tx_q).sort("+created_at").to_list()
-    totals = {t: Decimal(0) for t in money_types}
-    for tx in money_txs:
-        totals[tx.transaction_type] += to_decimal(tx.amount)
-        closed_rows.append(
-            {
-                "time": _fmt_dt(tx.created_at),
-                "type": "Money",
-                "ticket_id": str(tx.id)[-8:] if tx.id else "",
-                "script": "",
-                "amount": "",
-                "type_detail": tx.transaction_type.value.title(),
-                "open_time": "",
-                "open_price": "",
-                "close_price": "",
-                "dp_wd_aj": f"{to_decimal(tx.amount):,.2f}",
-                "brokerage": 0,
-                "commission": 0,
-                "open_com": 0,
-                "total_pnl": 0,
-                "comment": tx.narration[:20] if tx.narration else "",
-            }
-        )
-    closed_rows.sort(key=lambda r: r.get("time", ""))
-    money_totals = {
-        "credit_in": 0.0,
-        "credit_out": 0.0,
-        "deposit": _money(totals[TransactionType.DEPOSIT]),
-        "withdraw": _money(totals[TransactionType.WITHDRAWAL]),
-        "adjustment": _money(totals[TransactionType.ADJUSTMENT]),
-        "bonus": _money(totals[TransactionType.BONUS]),
+    funds_rows = [
+        {
+            "time": _fmt_dt(tx.created_at),
+            "type": tx.transaction_type.value.title(),
+            "amount": _money(to_decimal(tx.amount)),
+            "comment": tx.narration or "",
+        }
+        for tx in await WalletTransaction.find(tx_q).sort("+created_at", "+_id").to_list()
+    ]
+    # A migration's outstanding row carries the outstanding, not the balance.
+    bal_q: dict[str, Any] = {
+        "user_id": uid,
+        "transaction_type": {"$ne": TransactionType.SETTLEMENT_OUTSTANDING_BOOKED.value},
     }
+    first = await WalletTransaction.find(
+        {**bal_q, **({"created_at": {"$gte": from_date}} if from_date else {})}
+    ).sort("+created_at", "+_id").first_or_none()
+    before = (
+        None
+        if first or from_date is None
+        else await WalletTransaction.find({**bal_q, "created_at": {"$lt": from_date}})
+        .sort("-created_at", "-_id")
+        .first_or_none()
+    )
+    opening = to_decimal(first.balance_before if first else before.balance_after if before else 0)
 
     # ── Everything charged in the window ───────────────────────────────
     fill_q: dict[str, Any] = {"user_id": uid, **LIVE_FILL}
@@ -322,27 +378,53 @@ async def statement_payload(
         Decimal(0),
     )
 
-    # ── Carry Forward: what was held at the end of the window ──────────
-    def held(p: Position) -> bool:
-        if hi is None:
-            return p.status == PositionStatus.OPEN
+    # ── Brought Forward / Carry Forward, off the Position docs ─────────
+    def held(p: Position, at: datetime) -> bool:
+        """Was `p` open at instant `at` (naive UTC)?"""
         opened, closed = _naive(p.opened_at), _naive(p.closed_at)
-        if opened is not None and opened > hi:
+        if opened is not None and opened > at:
             return False
-        if position_service.in_reopen_gap(p, hi.replace(tzinfo=UTC)):
+        if position_service.in_reopen_gap(p, at.replace(tzinfo=UTC)):
             return False
-        return p.status == PositionStatus.OPEN if closed is None else closed > hi
+        return p.status == PositionStatus.OPEN if closed is None else closed > at
 
-    opened_deals: list[dict[str, Any]] = []
-    for p in await Position.find(Position.user_id == uid).sort("+opened_at").to_list():
-        if not held(p):
+    def deal(p: Position, qty: Decimal) -> dict[str, Any]:
+        return {
+            "ticket_id": str(p.id)[-8:] if p.id else "",
+            "time": _fmt_dt(p.opened_at or p.created_at),
+            "exchange": exchange_label(p.instrument.exchange),
+            "script": p.instrument.symbol,
+            "side": _side(p),
+            "qty": float(qty),
+            # ponytail: the doc's avg_price now — exact unless the position
+            # traded after the instant shown; the walk's lots would pin it.
+            "price": float(to_decimal(p.avg_price)),
+        }
+
+    positions = await Position.find(Position.user_id == uid).sort("+opened_at").to_list()
+
+    # Open on the window's first instant, even if it closed inside it. The
+    # quantity is opening_quantity: `quantity` is 0 once a position closes.
+    # ponytail: opening_quantity is the lifecycle's peak, so an add made
+    # inside the window shows here too; the walk's lots at from_date are exact.
+    brought_forward = []
+    day_one = _naive(from_date - timedelta(microseconds=1)) if from_date else None
+    if day_one is not None:
+        for p in positions:
+            qty = abs(to_decimal(p.opening_quantity or 0)) or abs(to_decimal(p.quantity or 0))
+            if qty and held(p, day_one):
+                brought_forward.append(deal(p, qty))
+
+    hi = _naive(to_date)
+    carry_forward: list[dict[str, Any]] = []
+    for p in positions:
+        if not (p.status == PositionStatus.OPEN if hi is None else held(p, hi)):
             continue
         side = _side(p)
         token, product = p.instrument.token, p.product_type.value
         mine = [f for f in lots if f["key"] in ((token, ""), (token, product)) and f["side"] == side]
         # Units held then (the book at to_date); the doc's own qty is today's.
-        units = round(sum(float(f["qty"]) for f in mine), 8) if mine else abs(p.quantity)
-        qty = to_decimal(units)
+        units = to_decimal(round(sum(float(f["qty"]) for f in mine), 8) if mine else abs(p.quantity))
         # The opening legs of those units charged inside the window.
         commission = sum(
             (
@@ -352,52 +434,15 @@ async def statement_payload(
             ),
             Decimal(0),
         )
-        avg, ltp = to_decimal(p.avg_price), to_decimal(p.ltp)
-        sl = to_decimal(p.stop_loss) if p.stop_loss else Decimal(0)
-        tp = to_decimal(p.target) if p.target else Decimal(0)
-        opened_deals.append(
-            {
-                "ticket_id": str(p.id)[-8:] if p.id else "",
-                "time": _fmt_dt(p.opened_at or p.created_at),
-                "type_detail": side,
-                "amount": f"{qty:,.2f}",
-                "script": p.instrument.symbol,
-                "price": f"{avg:,.2f}",
-                "sl": f"{sl:,.2f}" if sl else "",
-                "tp": f"{tp:,.2f}" if tp else "",
-                "current_price": f"{ltp:,.2f}",
-                "commission": float(commission),
-                "total_pnl": float(to_decimal(p.unrealized_pnl)),
-                # Units × price: quantity is already in units, not lots.
-                "value": float(qty * ltp),
-                "comment": "",
-            }
-        )
-
-    # ── Pending orders (as they stand now) ─────────────────────────────
-    pending_orders = [
-        {
-            "order_id": o.order_number,
-            "type": "SLTP" if o.order_type.value in ("SL", "SL_M") else o.order_type.value,
-            "type_detail": "SL/TP" if o.order_type.value in ("SL", "SL_M") else o.action.value,
-            "amount": f"{o.quantity:,.2f}",
-            "script": o.instrument.symbol,
-            "price": f"{to_decimal(o.price):,.2f}" if o.price else "",
-            "sl": f"{to_decimal(o.bracket_stop_loss):,.2f}" if o.bracket_stop_loss else "",
-            "tp": f"{to_decimal(o.bracket_target):,.2f}" if o.bracket_target else "",
-            "time": _fmt_dt(o.created_at),
-            "comment": "",
-        }
-        for o in await Order.find(
-            {"user_id": uid, "status": {"$in": [OrderStatus.PENDING.value, OrderStatus.OPEN.value]}}
-        ).to_list()
-    ]
+        row = deal(p, units)
+        # Units × price: quantity is already in units, not lots.
+        value = units * to_decimal(row["price"])
+        carry_forward.append({**row, "commission": float(commission), "value": float(value)})
 
     # ── Financial Standings: four figures that reconcile with the above ─
-    bal_q: dict[str, Any] = {"user_id": uid}
-    if to_date is not None:
-        bal_q["created_at"] = {"$lte": to_date}
-    last = await WalletTransaction.find(bal_q).sort("-created_at", "-_id").first_or_none()
+    last = await WalletTransaction.find(
+        {**bal_q, **({"created_at": {"$lte": to_date}} if to_date is not None else {})}
+    ).sort("-created_at", "-_id").first_or_none()
     financial = {
         "balance": _money(to_decimal(last.balance_after) if last else Decimal(0)),
         "gross_pnl": gross,
@@ -409,11 +454,11 @@ async def statement_payload(
         "from_label": to_ist(from_date).date().isoformat() if from_date else "Beginning",
         "to_label": to_ist(to_date).date().isoformat() if to_date else "Now",
         "generated_at": _fmt_dt(now_utc()),
+        "brought_forward": brought_forward,
+        "funds": {"opening_balance": _money(opening), "rows": funds_rows},
         "closed_transactions": closed_rows,
-        "money_totals": money_totals,
-        "opened_deals": opened_deals,
-        "pending_orders": pending_orders,
+        "script_wise": script_wise(closed_rows),
+        "carry_forward": carry_forward,
         "financial": financial,
-        "total_brokerage": financial["brokerage"],
         "admin_brand_name": brand,
     }
