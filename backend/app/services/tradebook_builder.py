@@ -369,6 +369,42 @@ async def trade_rows(
     return out[:limit] if limit else out
 
 
+async def booked(
+    user_ids: list[Any], from_date: datetime | None, to_date: datetime | None
+) -> dict[Any, tuple[Decimal, Decimal]]:
+    """Each user's Billing statement Gross PnL and Brokerage over the window,
+    for many users in two queries (the accounts dashboard's rows and cards):
+    every close in the window at what the wallet booked on it, weekly and
+    expiry settlements at their settle price, undone fills out; brokerage is
+    every charge on a fill executed in the window. The walk prices a close
+    by the same stamp (_booked_gross), so this is the statement's Gross
+    without walking each history."""
+    span = _span(from_date, to_date)
+    out: dict[Any, list[Decimal]] = {}
+    fill_q: dict[str, Any] = {"user_id": {"$in": user_ids}, **LIVE_FILL}
+    if span:
+        fill_q["executed_at"] = span
+    for t in await Trade.find(fill_q).to_list():
+        charge = to_decimal(t.total_charges or t.brokerage or 0)
+        acc = out.setdefault(t.user_id, [Decimal(0), Decimal(0)])
+        acc[1] += charge
+        if t.pnl_inr is not None:  # a close: pnl_inr is net of its own charge
+            acc[0] += to_decimal(t.pnl_inr) + charge
+    pos_q: dict[str, Any] = {
+        "user_id": {"$in": user_ids},
+        "status": PositionStatus.CLOSED.value,
+        "close_reason": {"$in": ["WEEKLY_SETTLEMENT", "EXPIRY_SETTLED"]},
+    }
+    if span:
+        pos_q["closed_at"] = span
+    for p in await Position.find(pos_q).to_list():
+        units = abs(to_decimal(p.quantity or 0)) or abs(to_decimal(p.opening_quantity or 0))
+        sign = 1 if _side(p) == "BUY" else -1
+        move = (to_decimal(p.ltp) - to_decimal(p.avg_price)) * units * sign
+        out.setdefault(p.user_id, [Decimal(0), Decimal(0)])[0] += move * position_service.position_fx_rate(p)
+    return {uid: (quantize_money(g), quantize_money(b)) for uid, (g, b) in out.items()}
+
+
 async def statement_payload(
     user: Any, from_date: datetime | None, to_date: datetime | None, *, brand: str = ""
 ) -> dict[str, Any]:

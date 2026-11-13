@@ -12,6 +12,7 @@ All calculations verified per spec — see docstring at module top.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from io import BytesIO
@@ -29,7 +30,7 @@ from app.core.dependencies import (
     scoped_user_filter,
     scoped_user_ids,
 )
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import NotFoundError, ValidationFailedError
 from app.models.position import Position, PositionStatus
 from app.models.trade import Trade
 from app.models.transaction import TransactionType, WalletTransaction
@@ -37,6 +38,7 @@ from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.schemas.common import APIResponse
 from app.services import accounts_dashboard_service as ads
+from app.services import tradebook_builder
 from app.utils.decimal_utils import to_decimal
 
 router = APIRouter(prefix="/accounts", tags=["admin-accounts"])
@@ -233,22 +235,7 @@ async def accounts_summary(
     preset: str | None = Query(default=None),
     _: None = Depends(require_perm("users", "read")),
 ) -> APIResponse:
-    now_ist = datetime.now(IST)
-
-    start_utc: datetime | None = None
-    end_utc: datetime | None = None
-    if preset and preset in _WEEK_PRESETS:
-        s, e = _WEEK_PRESETS[preset](now_ist)
-        start_utc = _to_utc(s)
-        end_utc = _to_utc(e)
-    elif from_date or to_date:
-        try:
-            if from_date:
-                start_utc = _to_utc(datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=IST))
-            if to_date:
-                end_utc = _to_utc(datetime.strptime(to_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=IST))
-        except ValueError:
-            pass
+    start_utc, end_utc = _parse_dates(from_date, to_date, preset)
 
     entities: list[dict[str, Any]] = []
     # Comprehensive scope (incl. broker subtree for ADMIN) so the
@@ -390,13 +377,10 @@ def _parse_dates(
         start_utc = _to_utc(s)
         end_utc = _to_utc(e)
     elif from_date or to_date:
-        try:
-            if from_date:
-                start_utc = _to_utc(datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=IST))
-            if to_date:
-                end_utc = _to_utc(datetime.strptime(to_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=IST))
-        except ValueError:
-            pass
+        # Whole IST days, the Billing statement's own window, so a row reads
+        # that user's statement for the same dates.
+        with contextlib.suppress(ValidationFailedError):
+            start_utc, end_utc = tradebook_builder.window(from_date, to_date)
     return start_utc, end_utc
 
 

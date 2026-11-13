@@ -270,21 +270,11 @@ async def test_house_exposure_folds_every_pool(w):
 
 
 async def test_pnl_summary_cards_match_table_for_super_admins_staff(w):
-    for c, pnl in ((w.c_direct, "10"), (w.c_a2, "1000")):
-        await Position(
-            user_id=c.id,
-            instrument=_GOLD,
-            segment_type="MCX",
-            product_type="MIS",
-            quantity=0,
-            status=PositionStatus.CLOSED,
-            realized_pnl=Decimal128(pnl),
-            closed_at=now_utc(),
-        ).insert()
     own = (await trading.positions_pnl_summary(w.sa, None, True, None)).data
     staff = (await trading.positions_pnl_summary(w.sa_emp, None, False, None)).data
-    # Same direct book as the super-admin's own page (and the staff's table).
-    assert own["week_net_client_pnl"] == staff["week_net_client_pnl"] == 10
+    # Same direct book as the super-admin's own page (and the staff's table):
+    # the direct client's booked close (100), not a1's 200 or a2's 300.
+    assert own["week_net_client_pnl"] == staff["week_net_client_pnl"] == 100
 
 
 async def test_broadcast_stays_in_direct_pool(w):

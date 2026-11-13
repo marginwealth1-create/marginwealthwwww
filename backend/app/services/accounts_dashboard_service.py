@@ -6,7 +6,6 @@ but operates independently (no PnlSharingAgreement required).
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -34,13 +33,10 @@ from reportlab.platypus import (
 from app.core.dependencies import effective_scope_actor, scoped_user_filter
 from app.core.exceptions import InsufficientPermissionsError
 from app.models.pnl_sharing import AgreementStatus, AgreementType, PnlSharingAgreement
-from app.models.position import Position, PositionStatus
-from app.models.trade import Trade
 from app.models.transaction import TransactionType, WalletTransaction
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
-from app.services import market_data_service
-from app.services.admin_settlement_service import _realised_inr
+from app.services import tradebook_builder
 from app.utils.decimal_utils import quantize_money, to_decimal
 from app.utils.time_utils import IST
 
@@ -256,43 +252,17 @@ async def client_totals_for_users(
     numbers (operator: the two pages MUST match). Both callers pass a demo-free,
     non-CLOSED pool, so no user filtering happens here.
 
-    * net_client_pnl = Σ realized P&L of CLOSED positions closed in the window
-      (USD-quoted segments converted to INR via the position's locked rate).
-    * net_client_bkg = Σ |brokerage| of trades executed in the window, excluding
-      fills an admin reopen/delete undid (`superseded_by_reopen`).
+    * net_client_pnl / net_client_bkg = Σ the users' Billing statement Gross
+      PnL / Brokerage over the window (tradebook_builder.booked): a row and
+      the card read what the statement reads.
     * total_of_both  = broker view = −net_client_pnl + net_client_bkg.
     """
     net_client_pnl = Decimal("0")
     net_client_bkg = Decimal("0")
     if user_ids:
-        date_filter: dict[str, Any] | None = None
-        if start_utc or end_utc:
-            date_filter = {}
-            if start_utc:
-                date_filter["$gte"] = start_utc
-            if end_utc:
-                date_filter["$lte"] = end_utc
-
-        fallback_usd_inr = to_decimal(market_data_service.get_usd_inr_rate())
-        if date_filter:
-            positions = await Position.find({
-                "user_id": {"$in": user_ids},
-                "status": PositionStatus.CLOSED.value,
-                "closed_at": date_filter,
-            }).to_list()
-        else:
-            positions = await Position.find({"user_id": {"$in": user_ids}}).to_list()
-        for p in positions:
-            net_client_pnl += _realised_inr(p, fallback_usd_inr)
-
-        bkg_trade_q: dict[str, Any] = {
-            "user_id": {"$in": user_ids},
-            "superseded_by_reopen": {"$ne": True},
-        }
-        if date_filter:
-            bkg_trade_q["executed_at"] = date_filter
-        for t in await Trade.find(bkg_trade_q).to_list():
-            net_client_bkg += abs(to_decimal(t.brokerage))
+        for gross, bkg in (await tradebook_builder.booked(user_ids, start_utc, end_utc)).values():
+            net_client_pnl += gross
+            net_client_bkg += bkg
 
     return {
         "net_client_pnl": net_client_pnl,
@@ -634,7 +604,6 @@ async def get_entity_users(
         date_filter["$lte"] = end_utc
     has_date = bool(date_filter)
 
-    fallback_usd_inr = to_decimal(market_data_service.get_usd_inr_rate())
     user_ids = [u.id for u in users]
 
     # ── 5 batch $in queries instead of 417×4 per-user queries ───────
@@ -642,24 +611,8 @@ async def get_entity_users(
     # Position + Trade + Wallet + Settlement query PER USER — 1,668
     # queries for 417 users, spiking MongoDB CPU to 18-20%.  Now we
     # fetch everything in 5 bulk queries and aggregate in Python.
-    if has_date:
-        all_positions = await Position.find({
-            "user_id": {"$in": user_ids},
-            "status": PositionStatus.CLOSED.value,
-            "closed_at": date_filter,
-        }).to_list()
-    else:
-        all_positions = await Position.find({"user_id": {"$in": user_ids}}).to_list()
-
-    # Skip reopen/delete-superseded trades — their brokerage / turnover must
-    # not show in the per-user breakdown once the position is undone.
-    trade_q: dict[str, Any] = {
-        "user_id": {"$in": user_ids},
-        "superseded_by_reopen": {"$ne": True},
-    }
-    if has_date:
-        trade_q["executed_at"] = date_filter
-    all_trades = await Trade.find(trade_q).to_list()
+    # Net PNL / Net BKG: each user's Billing statement Gross / Brokerage.
+    booked_by_user_pnl = await tradebook_builder.booked(user_ids, start_utc, end_utc)
 
     all_wallets = await Wallet.find({"user_id": {"$in": user_ids}}).to_list()
 
@@ -680,14 +633,6 @@ async def get_entity_users(
         recovery_txns = []
 
     # Build per-user lookup dicts from the batch results
-    pos_by_user: dict = defaultdict(list)
-    for p in all_positions:
-        pos_by_user[p.user_id].append(p)
-
-    trades_by_user: dict = defaultdict(list)
-    for t in all_trades:
-        trades_by_user[t.user_id].append(t)
-
     wallet_by_user: dict = {w.user_id: w for w in all_wallets}
 
     booked_by_user: dict = defaultdict(Decimal)
@@ -702,14 +647,7 @@ async def get_entity_users(
     items = []
     for u in users:
         uid = u.id
-        net_pnl = sum(
-            (_realised_inr(p, fallback_usd_inr) for p in pos_by_user[uid]),
-            Decimal("0"),
-        )
-        net_bkg = sum(
-            (abs(to_decimal(t.brokerage)) for t in trades_by_user[uid]),
-            Decimal("0"),
-        )
+        net_pnl, net_bkg = booked_by_user_pnl.get(uid, (Decimal("0"), Decimal("0")))
         total_pnl = net_pnl - net_bkg
 
         wallet = wallet_by_user.get(uid)
