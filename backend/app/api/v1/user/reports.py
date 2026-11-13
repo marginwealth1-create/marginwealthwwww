@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
+from beanie import PydanticObjectId
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from app.core.config import settings
 from app.core.dependencies import CurrentUser
-from app.models.trade import Trade
+from app.models.position import Position, PositionStatus
+from app.models.position_settlement import PositionSettlement
+from app.models.trade import LIVE_FILL, Trade
+from app.models.transaction import TransactionType, WalletTransaction
 from app.schemas.common import APIResponse
 from app.services import report_pdf_service, tradebook_builder
+from app.utils.decimal_utils import quantize_money, to_decimal
 from app.utils.time_utils import now_ist, now_utc
 
 
@@ -34,131 +40,177 @@ router = APIRouter(prefix="/reports", tags=["user-reports"])
 # (Avoids drift where the PDF says one number and the JSON another.)
 
 
+# P&L the wallet books without writing a fill: a weekly or expiry settlement,
+# and the netting of opposite carried lots.
+_NO_FILL_PNL = ("POSITION_SETTLEMENT", "EXPIRY_SETTLEMENT", "POSITION_DEFRAG")
+
+
+async def _unfilled_pnl(uid: Any, f: datetime, t: datetime) -> list[tuple[str, Decimal]]:
+    """(script, rupees) for every wallet row in [f, t] that booked P&L with no
+    fill behind it — the PNL rows, plus the part of a loss past the cash that
+    went to settlement outstanding — each attributed through the record it
+    points at. A row an admin reopen / delete reversed is out, as their fills
+    are: a weekly row is flagged superseded_by_reopen; an expiry row stands
+    only while its position is still the one that expiry closed."""
+    rows = await WalletTransaction.find(
+        {
+            "user_id": uid,
+            "transaction_type": {
+                "$in": [TransactionType.PNL.value, TransactionType.SETTLEMENT_OUTSTANDING_BOOKED.value]
+            },
+            "reference_type": {"$in": list(_NO_FILL_PNL)},
+            "created_at": {"$gte": f, "$lte": t},
+            "superseded_by_reopen": {"$ne": True},
+        }
+    ).to_list()
+
+    def ids(*kinds: str) -> list[PydanticObjectId]:
+        return list(
+            {PydanticObjectId(r.reference_id) for r in rows if r.reference_type in kinds and r.reference_id}
+        )
+
+    weekly = {
+        str(s.id): s.symbol
+        for s in await PositionSettlement.find({"_id": {"$in": ids("POSITION_SETTLEMENT")}}).to_list()
+    }
+    pos = {
+        str(p.id): p
+        for p in await Position.find({"_id": {"$in": ids("EXPIRY_SETTLEMENT", "POSITION_DEFRAG")}}).to_list()
+    }
+    out: list[tuple[str, Decimal]] = []
+    for r in rows:
+        p = pos.get(r.reference_id or "")
+        if r.reference_type == "POSITION_SETTLEMENT":
+            sym = weekly.get(r.reference_id or "", "—")
+        elif r.reference_type == "EXPIRY_SETTLEMENT":
+            # Reopened (open, or closed again later) or deleted: reversed.
+            if (
+                p is None
+                or p.status != PositionStatus.CLOSED
+                or p.closed_at is None
+                or abs((p.closed_at - r.created_at).total_seconds()) > 60
+            ):
+                continue
+            sym = p.instrument.symbol
+        else:
+            # A netting that left the book flat deleted every lot; its
+            # narration names the script.
+            narrated = (r.narration or "").removeprefix("Auto-consolidate ").partition(": netted offset")[0]
+            sym = p.instrument.symbol if p else narrated
+        out.append((sym, to_decimal(r.amount)))
+    return out
+
+
 async def _pnl_payload(user, from_date: datetime | None, to_date: datetime | None) -> dict:
+    """Realised P&L per script over the window.
+
+    Gross is what the wallet booked as P&L: each close's raw P&L (pnl_inr is
+    net of that close's own charge, so the charge goes back on) plus the P&L
+    booked with no fill (`_unfilled_pnl`). Brokerage is every charge on a fill
+    in the window, opening legs included. Net = Gross − Brokerage, per script
+    and in total, so the script rows add up to the totals. Fills an admin
+    reopen / delete took back are out (LIVE_FILL), as is their P&L."""
     f = from_date or (now_utc() - timedelta(days=30))
     t = to_date or now_utc()
-    trades = await Trade.find(
-        Trade.user_id == user.id,
-        Trade.executed_at >= f,
-        Trade.executed_at <= t,
-    ).sort("+executed_at").to_list()
+    trades = (
+        await Trade.find({"user_id": user.id, **LIVE_FILL, "executed_at": {"$gte": f, "$lte": t}})
+        .sort("+executed_at")
+        .to_list()
+    )
 
-    total_buy = 0.0
-    total_sell = 0.0
-    total_charges = 0.0
-    # Canonical realised P&L = Σ Trade.pnl_inr — the matching engine sets it on
-    # CLOSING fills only, already FIFO quantity-matched against the opening
-    # fills and net of brokerage. The OLD formula (Σ sell_value − Σ buy_value)
-    # was WRONG whenever buy_qty ≠ sell_qty (open / partially-open / reopened
-    # positions): the unmatched opening leg's WHOLE notional surfaced as a
-    # phantom loss. CL29519361 SENSEX (1240 bought / 1040 sold) read −₹1.55 Cr
-    # instead of its real realised. Summing pnl_inr makes this report agree
-    # with the admin Position-mgmt + Accounts cards (which use the same field),
-    # so every page finally shows the same number.
-    total_realized_net = 0.0
-    # Count only the fills we actually aggregate (post the superseded skip),
-    # so the "Trades" tile agrees with the money below instead of including
-    # reopen-undone fills that contribute ₹0 to P&L / charges.
-    matched_trades = 0
+    zero = Decimal(0)
     by_symbol: dict[str, dict[str, Any]] = {}
-    for tr in trades:
-        # Skip closes an admin REOPEN/DELETE later undid — the admin cards net
-        # these out via the reversal correction, so skipping them here keeps
-        # the user report in lockstep with Position-mgmt / Accounts.
-        if getattr(tr, "superseded_by_reopen", False):
-            continue
-        matched_trades += 1
-        sym = tr.instrument.symbol
-        v = float(str(tr.value))
-        c = float(str(tr.total_charges))
-        total_charges += c
-        agg = by_symbol.setdefault(
+
+    def agg(sym: str) -> dict[str, Any]:
+        return by_symbol.setdefault(
             sym,
             {
                 "symbol": sym,
                 "buy_qty": 0,
                 "sell_qty": 0,
-                "buy_value": 0.0,
-                "sell_value": 0.0,
-                "charges": 0.0,
-                "realized_net": 0.0,
+                **dict.fromkeys(("buy_value", "sell_value", "charges", "gross", "settlement"), zero),
                 "trades": 0,
             },
         )
-        agg["trades"] += 1
+
+    for tr in trades:
+        a = agg(tr.instrument.symbol)
+        v = to_decimal(tr.value)
+        c = to_decimal(tr.total_charges or tr.brokerage or 0)
+        a["trades"] += 1
         if tr.action.value == "BUY":
-            agg["buy_qty"] += tr.quantity
-            agg["buy_value"] += v
-            total_buy += v
+            a["buy_qty"] += tr.quantity
+            a["buy_value"] += v
         else:
-            agg["sell_qty"] += tr.quantity
-            agg["sell_value"] += v
-            total_sell += v
-        agg["charges"] += c
+            a["sell_qty"] += tr.quantity
+            a["sell_value"] += v
+        a["charges"] += c
         if tr.pnl_inr is not None:
-            p = float(str(tr.pnl_inr))
-            agg["realized_net"] += p
-            total_realized_net += p
-        # Per-symbol NET P&L = canonical realised (net of brokerage).
-        agg["pnl"] = round(agg["realized_net"], 2)
+            a["gross"] += to_decimal(tr.pnl_inr) + c
+    for sym, amount in await _unfilled_pnl(user.id, f, t):
+        a = agg(sym)
+        a["gross"] += amount
+        a["settlement"] += amount
 
-    # Net OPEN (unmatched) qty per symbol = buy_qty − sell_qty. A non-zero
-    # value is exactly why a symbol's Buy/Sell VALUE columns don't tie out to
-    # its Net P&L: realised P&L only counts matched (closed) quantity, while
-    # the value columns are gross for the period. Positive = net long still
-    # running; negative = net short still running (or its opening leg fell
-    # before `from_date`). Surfacing it lets the UI explain the gap instead of
-    # the client reading it as "missing money".
-    for agg in by_symbol.values():
-        # Units, fractions kept (int() read a 0.05 BTC position as 0).
-        agg["open_qty"] = round((agg.get("buy_qty") or 0) - (agg.get("sell_qty") or 0), 8)
+    def money(d: Decimal) -> float:
+        return float(quantize_money(d))
 
-    net = round(total_realized_net, 2)                  # NET P&L (after brokerage)
-    charges = round(total_charges, 2)
-    realized = round(total_realized_net + charges, 2)   # GROSS P&L (before brokerage)
-    by_symbol_rows = list(by_symbol.values())
+    by_symbol_rows = []
+    for a in by_symbol.values():
+        gross, settled = quantize_money(a.pop("gross")), a.pop("settlement")
+        charges = quantize_money(a["charges"])
+        net = gross - charges
+        by_symbol_rows.append(
+            {
+                **a,
+                "buy_value": money(a["buy_value"]),
+                "sell_value": money(a["sell_value"]),
+                "charges": money(charges),
+                "settlement_pnl": money(settled),
+                "gross_pnl": money(gross),
+                "realized_net": money(net),
+                "pnl": money(net),
+                # Net OPEN (unmatched) units = buy − sell: why a script's
+                # Buy/Sell VALUE columns don't tie out to its P&L (realised
+                # P&L counts closed units only). Fractions kept.
+                "open_qty": round(a["buy_qty"] - a["sell_qty"], 8),
+            }
+        )
+
+    gross_total = sum((to_decimal(r["gross_pnl"]) for r in by_symbol_rows), zero)
+    charges_total = sum((to_decimal(r["charges"]) for r in by_symbol_rows), zero)
+    net_total = money(gross_total - charges_total)
     return {
         "from": f,
         "to": t,
-        # Count of fills that actually contribute to this report (superseded
-        # reopen-undone fills excluded) — keeps the tile consistent with money.
-        "total_trades": matched_trades,
+        "total_trades": len(trades),
         # Legacy + PDF-builder field names (do NOT remove — report_pdf_service
         # reads these directly).
-        "total_buy_value": round(total_buy, 2),
-        "total_sell_value": round(total_sell, 2),
-        "total_charges": charges,
-        "net_pnl": net,
+        "total_buy_value": money(sum((to_decimal(r["buy_value"]) for r in by_symbol_rows), zero)),
+        "total_sell_value": money(sum((to_decimal(r["sell_value"]) for r in by_symbol_rows), zero)),
+        "total_charges": money(charges_total),
+        "net_pnl": net_total,
         "by_symbol": by_symbol_rows,
         # APK-facing field names — match the PnlReport TypeScript schema in
-        # marginwealth-ind_apk/src/features/reports/api/reports.api.ts. Without
-        # these the mobile P&L screen reads `undefined` for every total
-        # and renders all ₹0.00 even when trades exist.
+        # marginwealth-ind_apk/src/features/reports/api/reports.api.ts.
         "rows": [
             {
                 "symbol": r["symbol"],
-                "net_pnl": round(float(r.get("realized_net") or 0), 2),
-                # Gross (before brokerage) = net realised + this symbol's charges.
-                # NOT (sell_value − buy_value) — that was the phantom-notional bug
-                # on unmatched buy/sell quantities.
-                "realized_pnl": round(
-                    float(r.get("realized_net") or 0) + float(r.get("charges") or 0),
-                    2,
-                ),
-                "brokerage": round(float(r.get("charges") or 0), 2),
-                # Real fill count for this symbol (was a bool→int that made
-                # every symbol show "1 trade" regardless of activity).
-                "trades": int(r.get("trades") or 0),
+                "net_pnl": r["realized_net"],
+                "realized_pnl": r["gross_pnl"],  # gross, before brokerage
+                "brokerage": r["charges"],
+                "settlement_pnl": r["settlement_pnl"],
+                "trades": r["trades"],
                 # Net unmatched qty so the APK can flag a still-open position.
-                "open_qty": int(r.get("open_qty") or 0),
+                "open_qty": int(r["open_qty"]),
             }
             for r in by_symbol_rows
         ],
-        "total_realized": realized,
+        "total_realized": money(gross_total),
         "total_unrealized": 0.0,
-        "total_brokerage": charges,
+        "total_brokerage": money(charges_total),
         "total_taxes": 0.0,
-        "total_net": net,
+        "total_net": net_total,
     }
 
 
