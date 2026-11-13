@@ -17,17 +17,7 @@ import { PeriodToggle } from "@/components/pnl-sharing/PeriodToggle";
 import { SettlementHistoryTable } from "@/components/pnl-sharing/SettlementHistoryTable";
 import { Button } from "@/components/ui/button";
 import { PnlSharingAPI, type SettlementCadence } from "@/lib/api/pnl-sharing";
-
-function triggerDownload(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
+import { saveBlob } from "@/lib/utils";
 
 function periodBounds(cadence: SettlementCadence): { from: string; to: string } {
   const now = new Date();
@@ -192,7 +182,7 @@ export default function PnlSharingDetailPage() {
                 agreement.id,
                 { period: cadence, from, to, format: "pdf" },
               );
-              triggerDownload(blob, filename);
+              saveBlob(blob, filename);
             } catch (e) {
               const err = e as { message?: string };
               toast.error(err?.message ?? "PDF download failed");
@@ -204,7 +194,7 @@ export default function PnlSharingDetailPage() {
                 agreement.id,
                 { period: cadence, from, to, format: "excel" },
               );
-              triggerDownload(blob, filename);
+              saveBlob(blob, filename);
             } catch (e) {
               const err = e as { message?: string };
               toast.error(err?.message ?? "Excel download failed");

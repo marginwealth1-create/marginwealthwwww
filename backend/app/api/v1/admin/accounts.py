@@ -493,7 +493,7 @@ async def export_entity_users_excel(
         pool_clause=clause, user_id=user_id,
     )
     label = _period_label(from_date, to_date, preset)
-    data = ads.render_entity_users_excel(entity_name, users_data, label)
+    data = await asyncio.to_thread(ads.render_entity_users_excel, entity_name, users_data, label)
     filename = f"pnl_{entity_name}_{from_date or 'all'}_{to_date or 'time'}.xlsx"
 
     return StreamingResponse(
@@ -527,7 +527,7 @@ async def export_entity_users_pdf(
         pool_clause=clause, user_id=user_id,
     )
     label = _period_label(from_date, to_date, preset)
-    data = ads.render_entity_users_pdf(entity_name, users_data, label)
+    data = await asyncio.to_thread(ads.render_entity_users_pdf, entity_name, users_data, label)
     filename = f"pnl_{entity_name}_{from_date or 'all'}_{to_date or 'time'}.pdf"
 
     return StreamingResponse(
@@ -556,7 +556,7 @@ async def export_broker_totals_excel(
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
     totals = await ads.compute_broker_totals(entity.id, start_utc, end_utc, clause)
     label = _period_label(from_date, to_date, preset)
-    data = ads.render_broker_totals_excel(totals, entity_name, label)
+    data = await asyncio.to_thread(ads.render_broker_totals_excel, totals, entity_name, label)
     filename = f"broker_summary_{entity_name}_{from_date or 'all'}_{to_date or 'time'}.xlsx"
 
     return StreamingResponse(
@@ -585,7 +585,7 @@ async def export_broker_totals_pdf(
     start_utc, end_utc = _parse_dates(from_date, to_date, preset)
     totals = await ads.compute_broker_totals(entity.id, start_utc, end_utc, clause)
     label = _period_label(from_date, to_date, preset)
-    data = ads.render_broker_totals_pdf(totals, entity_name, label)
+    data = await asyncio.to_thread(ads.render_broker_totals_pdf, totals, entity_name, label)
     filename = f"broker_summary_{entity_name}_{from_date or 'all'}_{to_date or 'time'}.pdf"
 
     return StreamingResponse(

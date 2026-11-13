@@ -69,3 +69,18 @@ export function formatPercent(
   if (!Number.isFinite(n)) return "0.00%";
   return `${n >= 0 ? "+" : ""}${n.toFixed(fractionDigits)}%`;
 }
+
+/** Save a fetched blob as a file. click() only STARTS the download, so the
+ *  object URL is revoked a minute later, not on the next line — revoking at
+ *  once loses the race (WebKit especially) and the button silently does
+ *  nothing (§4.5). */
+export function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}

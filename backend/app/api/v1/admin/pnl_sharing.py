@@ -11,6 +11,7 @@ each handler:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from io import BytesIO
 
@@ -382,12 +383,12 @@ async def download_report(
 
     if format == "pdf":
         from app.services.pnl_sharing_pdf_service import render_report_pdf
-        data = render_report_pdf(response)
+        data = await asyncio.to_thread(render_report_pdf, response)
         media_type = "application/pdf"
         ext = "pdf"
     else:  # excel
         from app.services.pnl_sharing_excel_service import render_report_excel
-        data = render_report_excel(response)
+        data = await asyncio.to_thread(render_report_excel, response)
         media_type = (
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )

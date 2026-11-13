@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
@@ -204,7 +205,7 @@ async def tradebook_pdf(
     lo, hi = tradebook_builder.window(from_date, to_date)
     brand = admin.brand_name or getattr(admin, "full_name", "") or ""
     payload = await tradebook_builder.statement_payload(user, lo, hi, brand=brand)
-    pdf_bytes = report_pdf_service.build_full_tradebook_pdf(user, payload)
+    pdf_bytes = await asyncio.to_thread(report_pdf_service.build_full_tradebook_pdf, user, payload)
     stamp = now_ist().strftime("%Y%m%d")
     code = getattr(user, "user_code", "") or "user"
     return _pdf(pdf_bytes, f"tradebook_{_slug(user.full_name)}_{code}_{_slug(brand)}_{stamp}.pdf")
@@ -223,7 +224,7 @@ async def trade_book_pdf(
     user = await _tradebook_user(admin, user_id)
     lo, hi = tradebook_builder.window(from_date, to_date)
     rows = await tradebook_builder.trade_rows(user.id, lo, hi)
-    pdf_bytes = report_pdf_service.build_tradebook_pdf(user, rows)
+    pdf_bytes = await asyncio.to_thread(report_pdf_service.build_tradebook_pdf, user, rows)
     stamp = now_ist().strftime("%Y%m%d")
     code = getattr(user, "user_code", "") or "user"
     return _pdf(pdf_bytes, f"tradebook_fills_{_slug(user.full_name)}_{code}_{stamp}.pdf")

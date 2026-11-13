@@ -4,6 +4,7 @@ import { useState, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { UsersAPI, ReportsAdminAPI } from "@/lib/api";
 import { istWeekSoFar } from "@/lib/time";
+import { saveBlob } from "@/lib/utils";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -52,16 +53,9 @@ export default function TradebookPage() {
       const fetchPdf = doc === "billing" ? ReportsAdminAPI.tradebookPdf : ReportsAdminAPI.tradeBookPdf;
       const blob = await fetchPdf(selectedUser._id || selectedUser.id, fromDate || undefined, toDate || undefined);
 
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
       const code = selectedUser.user_code || "user";
       const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-      a.href = url;
-      a.download = `${doc === "billing" ? "billing" : "tradebook"}_${code}_${stamp}.pdf`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      saveBlob(blob, `${doc === "billing" ? "billing" : "tradebook"}_${code}_${stamp}.pdf`);
       toast.success("PDF downloaded");
     } catch (err: any) {
       toast.error(err?.message || "Failed to generate PDF");
@@ -193,10 +187,11 @@ export default function TradebookPage() {
           <div className="text-sm text-muted-foreground space-y-2">
             <p className="font-medium text-foreground">Billing includes:</p>
             <ul className="list-disc pl-5 space-y-1">
-              <li>Closed Transactions (FIFO-paired trades, settlements, deposits/withdrawals)</li>
-              <li>Money Totals (Deposit, Withdrawal, Adjustment, Bonus)</li>
-              <li>Opened Deals (positions held at the end of the period)</li>
-              <li>Pending Orders (LIMIT, SL, SL-M orders waiting to trigger)</li>
+              <li>Brought Forward (positions open when the period started)</li>
+              <li>Funds Transactions (from the opening balance)</li>
+              <li>Trades List per exchange (FIFO-paired, buy and sell legs on one line, Gross and Net PL)</li>
+              <li>Script-wise P&amp;L</li>
+              <li>Carry Forward (positions open when the period ended)</li>
               <li>Financial Standings (Balance, Gross PnL, Brokerage, Net PnL)</li>
             </ul>
             <p className="font-medium text-foreground">Trade Book: every fill, newest first, with each settlement&apos;s legs.</p>

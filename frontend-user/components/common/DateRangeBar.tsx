@@ -15,8 +15,7 @@ interface Props {
   onChange: (next: DateRange) => void;
   className?: string;
   /** Show ONLY the From → To date inputs — no preset pills, no Custom toggle.
-   *  Used by the tradebook where the operator wants a plain "from date to
-   *  date" download picker and nothing else. */
+   *  The tradebook puts its own IST calendar-period pills beside it. */
   simple?: boolean;
 }
 

@@ -5,6 +5,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Download, Pencil, Trash2, Upload } from "lucide-react";
 import { ChartLevelsAPI, type ChartLevelRow } from "@/lib/api";
+import { saveBlob } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -82,16 +83,9 @@ export default function ChartLevelsPage() {
     setBusy(true);
     try {
       const blob = await ChartLevelsAPI.template(segment);
-      // Object URL + synthetic click — the request needs the auth header, so
-      // a plain <a href> to the endpoint would 401.
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `chart-levels-${segment}.xlsx`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
+      // Blob + synthetic click — the request needs the auth header, so a
+      // plain <a href> to the endpoint would 401.
+      saveBlob(blob, `chart-levels-${segment}.xlsx`);
     } catch {
       toast.error("Could not build the template");
     } finally {

@@ -67,9 +67,9 @@ export function ReportPdfButton({ kind, params, label = "Download PDF" }: Props)
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      // Microtask delay so Firefox finalises the download before the URL
-      // is revoked. Chromium is fine either way.
-      setTimeout(() => URL.revokeObjectURL(url), 0);
+      // click() only STARTS the download: revoking on the next tick loses the
+      // race (WebKit especially) and the button silently does nothing (§4.5).
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
     } catch (e) {
       // eslint-disable-next-line no-console
       console.error("PDF download failed", e);

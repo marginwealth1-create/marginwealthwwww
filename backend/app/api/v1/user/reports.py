@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -329,7 +330,7 @@ async def pnl_report_pdf(
     to_date: datetime | None = None,
 ):
     payload = await _pnl_payload(user, from_date, to_date)
-    pdf = report_pdf_service.build_pnl_pdf(user, payload)
+    pdf = await asyncio.to_thread(report_pdf_service.build_pnl_pdf, user, payload)
     stamp = datetime.now().strftime("%Y%m%d")
     return _pdf_response(pdf, f"{_brand_slug()}_pnl_{stamp}.pdf")
 
@@ -344,7 +345,7 @@ async def tradebook_pdf(
 ):
     lo, hi = tradebook_builder.window(from_date, to_date)
     rows = await tradebook_builder.trade_rows(user.id, lo, hi, limit)
-    pdf = report_pdf_service.build_tradebook_pdf(user, rows)
+    pdf = await asyncio.to_thread(report_pdf_service.build_tradebook_pdf, user, rows)
     stamp = now_ist().strftime("%Y%m%d")
     return _pdf_response(pdf, f"{_brand_slug()}_tradebook_{stamp}.pdf")
 
@@ -356,7 +357,7 @@ async def brokerage_pdf(
     to_date: datetime | None = None,
 ):
     payload = await _brokerage_payload(user, from_date, to_date)
-    pdf = report_pdf_service.build_brokerage_pdf(user, payload)
+    pdf = await asyncio.to_thread(report_pdf_service.build_brokerage_pdf, user, payload)
     stamp = datetime.now().strftime("%Y%m%d")
     return _pdf_response(pdf, f"{_brand_slug()}_brokerage_{stamp}.pdf")
 
@@ -364,7 +365,7 @@ async def brokerage_pdf(
 @router.get("/tax/pdf")
 async def tax_pdf(user: CurrentUser):
     payload = await _tax_payload(user)
-    pdf = report_pdf_service.build_tax_pdf(user, payload)
+    pdf = await asyncio.to_thread(report_pdf_service.build_tax_pdf, user, payload)
     stamp = datetime.now().strftime("%Y%m%d")
     return _pdf_response(pdf, f"{_brand_slug()}_tax_{stamp}.pdf")
 
@@ -375,7 +376,7 @@ async def margin_pdf(user: CurrentUser):
     s = await wallet_service.summary(user.id)
     if hasattr(s, "model_dump"):
         s = s.model_dump(mode="json")
-    pdf = report_pdf_service.build_margin_pdf(user, s)
+    pdf = await asyncio.to_thread(report_pdf_service.build_margin_pdf, user, s)
     stamp = datetime.now().strftime("%Y%m%d")
     return _pdf_response(pdf, f"{_brand_slug()}_margin_{stamp}.pdf")
 
@@ -400,7 +401,7 @@ async def tradebook_full_pdf(
         raise HTTPException(status_code=400, detail="Maximum date range is 1 month")
 
     payload = await tradebook_builder.statement_payload(user, lo, hi)
-    pdf_bytes = report_pdf_service.build_full_tradebook_pdf(user, payload)
+    pdf_bytes = await asyncio.to_thread(report_pdf_service.build_full_tradebook_pdf, user, payload)
     stamp = now_ist().strftime("%Y%m%d")
     name = (getattr(user, "full_name", "") or "").strip().replace(" ", "_")
     code = getattr(user, "user_code", "") or "user"

@@ -26,7 +26,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/common/PageHeader";
 import { useAdminAuthStore } from "@/stores/authStore";
-import { cn } from "@/lib/utils";
+import { cn, saveBlob } from "@/lib/utils";
 
 const CHART_GREEN = "#10b981";
 const CHART_RED = "#ef4444";
@@ -49,19 +49,10 @@ const BROKER_TABS: TabDef[] = [
   { value: "sub_brokers", label: "Sub-Brokers", icon: <UserPlus className="size-3.5" /> },
 ];
 
-function downloadBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
 /** Row download: save the blob, or toast why it failed (no silent no-op). */
 async function saveOrToast(fetchBlob: () => Promise<Blob>, filename: string) {
   try {
-    downloadBlob(await fetchBlob(), filename);
+    saveBlob(await fetchBlob(), filename);
   } catch (err) {
     toast.error(err instanceof Error ? err.message : "Download failed");
   }
@@ -89,7 +80,7 @@ function downloadCSV(entities: AccountEntity[], grandTotal?: AccountEntity) {
     ),
   ];
   const blob = new Blob([csvRows.join("\n")], { type: "text/csv" });
-  downloadBlob(blob, `accounts_${new Date().toISOString().slice(0, 10)}.csv`);
+  saveBlob(blob, `accounts_${new Date().toISOString().slice(0, 10)}.csv`);
 }
 
 /* ═══════════════════════════════════════════════════════════════════ */
@@ -467,10 +458,10 @@ function BrokerEntityCard({
                     size="sm"
                     onClick={async (ev) => {
                       ev.stopPropagation();
-                      try {
-                        const blob = await AccountsAPI.exportBrokerTotalsExcel(e.id, dateParams);
-                        downloadBlob(blob, `${e.user_code || e.name}_summary.xlsx`);
-                      } catch {}
+                      await saveOrToast(
+                        () => AccountsAPI.exportBrokerTotalsExcel(e.id, dateParams),
+                        `${e.user_code || e.name}_summary.xlsx`,
+                      );
                     }}
                   >
                     <Download className="size-3 mr-1" /> Export Excel
@@ -480,10 +471,10 @@ function BrokerEntityCard({
                     size="sm"
                     onClick={async (ev) => {
                       ev.stopPropagation();
-                      try {
-                        const blob = await AccountsAPI.exportBrokerTotalsPdf(e.id, dateParams);
-                        downloadBlob(blob, `${e.user_code || e.name}_summary.pdf`);
-                      } catch {}
+                      await saveOrToast(
+                        () => AccountsAPI.exportBrokerTotalsPdf(e.id, dateParams),
+                        `${e.user_code || e.name}_summary.pdf`,
+                      );
                     }}
                   >
                     <FileText className="size-3 mr-1" /> Export PDF
@@ -783,18 +774,10 @@ function UserPnlTable({
     }),
   });
 
-  const handleDownloadExcel = async () => {
-    try {
-      const blob = await AccountsAPI.exportEntityUsersExcel(entityId, dateParams);
-      downloadBlob(blob, `pnl_all_${entityName}.xlsx`);
-    } catch {}
-  };
-  const handleDownloadPdf = async () => {
-    try {
-      const blob = await AccountsAPI.exportEntityUsersPdf(entityId, dateParams);
-      downloadBlob(blob, `pnl_all_${entityName}.pdf`);
-    } catch {}
-  };
+  const handleDownloadExcel = () =>
+    saveOrToast(() => AccountsAPI.exportEntityUsersExcel(entityId, dateParams), `pnl_all_${entityName}.xlsx`);
+  const handleDownloadPdf = () =>
+    saveOrToast(() => AccountsAPI.exportEntityUsersPdf(entityId, dateParams), `pnl_all_${entityName}.pdf`);
 
   const items = data?.items ?? [];
   const meta = data?.meta;
