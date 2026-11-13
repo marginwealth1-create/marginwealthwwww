@@ -447,6 +447,7 @@ async def execute_market_order(
     raw_pnl_inr_dec: Decimal | None = None
     fill_fx: Decimal | None = None
     lot_basis: Decimal | None = None  # the specific-lot basis actually applied
+    lot_tapped: Decimal | None = None  # the lot the client exited, applied or not
     closed_qty: Decimal | None = None
     if is_closing and existing_pos is not None:
         cur_qty = to_decimal(existing_pos.quantity)
@@ -465,9 +466,8 @@ async def execute_market_order(
             and order.created_at.replace(tzinfo=None) < existing_pos.opened_at.replace(tzinfo=None)
         ):
             _cbo = None
-        lot_basis = position_service.basis_override(
-            existing_pos, closed_qty, to_decimal(_cbo) if _cbo is not None else None
-        )
+        lot_tapped = to_decimal(_cbo) if _cbo is not None else None
+        lot_basis = position_service.basis_override(existing_pos, closed_qty, lot_tapped)
         if lot_basis is not None:
             avg = lot_basis
         sign = Decimal(1) if cur_qty > 0 else Decimal(-1)
@@ -511,10 +511,10 @@ async def execute_market_order(
         ),
         pnl_inr=Decimal128(str(pnl_inr_dec)) if pnl_inr_dec is not None else None,
         closed_quantity=float(closed_qty) if closed_qty is not None else None,
-        # Carry the specific-lot basis onto the Trade — only when it was applied
-        # — so the FIFO closed-blotter pairs this close with the SAME lot the
-        # P&L booked against. None for every average-price close.
-        cost_basis_override=_money(lot_basis),
+        # The lot the client exited, even when the money booked at the average
+        # (lot_basis None): the Active tab and the FIFO walk take THAT lot off
+        # the book; the walk prices the row off pnl_inr either way.
+        cost_basis_override=_money(lot_tapped),
         expected_price=_money(to_decimal(expected_price) if expected_price else None),
         reference_ltp=_money(raw_ltp),
         bid_at_fill=_money(bid),

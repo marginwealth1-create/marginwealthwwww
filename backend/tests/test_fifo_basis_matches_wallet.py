@@ -227,3 +227,23 @@ async def test_a_parked_exit_from_before_the_settlement_books_at_the_average(c, 
 
     b = await _billed_as_booked(c)
     assert b.realized == Decimal("850")
+
+
+async def test_an_exit_booked_at_the_average_still_leaves_the_tapped_lot(c, monkeypatch):
+    # Lot C (50) is worth more than the book can carry after an average close,
+    # so the engine books the exit at the average (+1000) — but it is still lot
+    # C the client exited: the Active tab must not show it again.
+    await market(c, "BUY", 100, "10")
+    await market(c, "BUY", 100, "30")
+    await market(c, "BUY", 100, "50")  # avg 30
+    await market(c, "SELL", 150, "40")  # +1500: the walk takes A and half of B
+    await market(c, "SELL", 100, "40", basis="50")  # +1000 at the average
+
+    async def _ltp(_token):
+        return Decimal("40")
+
+    monkeypatch.setattr(market_data_service, "get_ltp", _ltp)
+    [row] = (await user_positions.list_active_trades(c)).data
+    assert (row["quantity"], row["price"]) == (50.0, "30.00")  # was 50 @ 50.00, the lot just exited
+    b = await _billed_as_booked(c)
+    assert b.realized == Decimal("2500")

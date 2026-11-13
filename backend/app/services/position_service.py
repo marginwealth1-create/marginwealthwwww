@@ -7,7 +7,8 @@ and for CNC trades writes/updates the long-term Holding record.
 
 from __future__ import annotations
 
-from datetime import datetime
+from bisect import bisect_left
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -1229,10 +1230,14 @@ async def list_closed_trade_events_fifo(
     for _p in _all_pos:
         if _p.opened_at:
             _opened.setdefault(_p.instrument.token, []).append(_naive(_p.opened_at))
+    for _v in _opened.values():
+        _v.sort()
 
     def _opened_by(t: Any) -> bool:
         ts = _naive(t.executed_at)
-        return any(abs((o - ts).total_seconds()) <= 2 for o in _opened.get(t.instrument.token, ()))
+        o = _opened.get(t.instrument.token, [])
+        i = bisect_left(o, ts - timedelta(seconds=2))
+        return i < len(o) and o[i] <= ts + timedelta(seconds=2)
 
     def _against(lots: Any, side: str) -> bool:
         """Does the book hold any lot a `side` fill can close?"""
@@ -1629,24 +1634,26 @@ async def list_closed_trade_events_fifo(
     # (Settlement events were already stamped WEEKLY_SETTLEMENT inline above;
     # the 30s match below leaves them untouched.)
     if events:
-        # (token, product_type) → [(closed_at, close_reason), ...]
+        # (token, product_type) → [(closed_at, close_reason), ...] by closed_at;
+        # the nearest close is one of the two around the row's (bisect — a
+        # scan per row was quadratic in a long history on one script).
         _pos_map: dict[tuple, list] = {}
         for _p in closed_pos:
             _k = _bookkey(_p.instrument.token, _p.product_type.value)
             if _p.closed_at:
-                _pos_map.setdefault(_k, []).append((_p.closed_at, _p.close_reason or "USER"))
+                _pos_map.setdefault(_k, []).append((_naive(_p.closed_at), _p.close_reason or "USER"))
+        for _v in _pos_map.values():
+            _v.sort(key=lambda x: x[0])
         for ev in events:
             if ev.get("close_reason"):
                 continue  # already set (e.g. inline settlement rows)
             _k = _bookkey(ev["instrument_token"], ev["product_type"].value)
             _entries = _pos_map.get(_k)
             if _entries:
-                _cat = ev["closed_at"]
-                _best = min(
-                    _entries,
-                    key=lambda x: abs((x[0].replace(tzinfo=None) - _cat.replace(tzinfo=None)).total_seconds()),
-                )
-                if abs((_best[0].replace(tzinfo=None) - _cat.replace(tzinfo=None)).total_seconds()) < 30:
+                _cat = _naive(ev["closed_at"])
+                _i = bisect_left(_entries, _cat, key=lambda x: x[0])
+                _best = min(_entries[max(_i - 1, 0) : _i + 1], key=lambda x: abs((x[0] - _cat).total_seconds()))
+                if abs((_best[0] - _cat).total_seconds()) < 30:
                     ev["close_reason"] = _best[1]
 
         # A PARTIAL close leaves the position open, so no Position doc carries

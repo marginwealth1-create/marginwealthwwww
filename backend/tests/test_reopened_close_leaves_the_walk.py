@@ -25,6 +25,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import pytest_asyncio
 from beanie import init_beanie
 from bson import Decimal128
@@ -282,3 +283,30 @@ async def test_a_carried_positions_reopen_stamps_its_pre_carry_close(w):
     [row] = b.rows
     assert await _paired_with(row, opened), _show(b)
     assert b.brokerage == b.charges == Decimal("20"), _show(b)
+
+
+@pytest.mark.parametrize(
+    "book",
+    [
+        ("BUY", "SELL", "120", "115"),  # long: the lot tapped sits above the average
+        ("SELL", "BUY", "100", "105"),  # short: below it
+    ],
+)
+async def test_a_reopen_restores_what_the_units_cost_not_a_re_derived_average(w, book):
+    # A specific-lot Exit re-derives the survivors' average (110 → 106.67 for
+    # the long). The reopen put all 20 units back at that average, though they
+    # cost 110: the re-close booked +166.67 on a flat book that made +100.
+    side, back, tapped, close = book
+    for px in ("100", "120"):
+        await market(w.c, side, 10, px)
+    await market(w.c, back, 5, close, basis=tapped)
+    await market(w.c, back, 15, close)
+    await _later(w, minutes=10)
+    p = await _reopen(w)
+    assert Decimal(str((await Position.get(p.id)).avg_price)) == Decimal("110")
+    await _later(w, minutes=10)
+    await market(w.c, back, 20, close)
+
+    b = await _books(w)
+    assert b.oracle == b.realized == Decimal("100"), _show(b)
+    assert b.gross == b.oracle, _show(b)

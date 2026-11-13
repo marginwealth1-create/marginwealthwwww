@@ -17,6 +17,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from app.utils.decimal_utils import quantize_money, to_decimal
+
 
 def _fmt_dt(dt: datetime | None) -> str:
     # Identical to the format both reports.py files already use, so nothing
@@ -48,7 +50,6 @@ async def fifo_closed_rows(
     wallet's units: a USD row converts at the rate the wallet booked it.
     """
     from app.services import position_service
-    from app.utils.decimal_utils import quantize_money, to_decimal
 
     # limit huge → every event.
     events, _total = await position_service.list_closed_trade_events_fifo(

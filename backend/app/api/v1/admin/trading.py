@@ -1880,7 +1880,7 @@ async def admin_reopen_position(
     from app.models.transaction import TransactionType
     from app.services import position_service as _ps
     from app.services import wallet_service as _ws
-    from app.utils.decimal_utils import to_decimal as _td
+    from app.utils.decimal_utils import quantize_basis, to_decimal as _td
     from app.utils.time_utils import now_utc as _now_utc
 
     # ── 1) Wallet reversal of the realised P&L ──────────────────────
@@ -2088,11 +2088,11 @@ async def admin_reopen_position(
             # keep lots the position no longer holds, or re-pair a close
             # already billed; those keep the flag alone (walked, rows hidden).
             _set: dict[str, Any] = {"superseded_by_reopen": True}
-            _undone = await _TradeSup.find(_sup_q).to_list()
-            _units = sum(
-                min(abs(t.quantity), t.closed_quantity if t.closed_quantity is not None else abs(t.quantity))
-                for t in _undone
-            )
+            _undone = [
+                (t, abs(t.quantity) if t.closed_quantity is None else min(abs(t.quantity), t.closed_quantity))
+                for t in await _TradeSup.find(_sup_q).to_list()
+            ]
+            _units = sum(q for _, q in _undone)
             _since = await _TradeSup.find_one(
                 {
                     "user_id": p.user_id,
@@ -2102,8 +2102,19 @@ async def admin_reopen_position(
                     "superseded_at": None,
                 }
             )
-            if abs(_units - opening_qty) < 1e-9 and _since is None:
-                _set["superseded_at"] = _now_utc()
+            if abs(_units - opening_qty) < 1e-9:
+                # The undone closes took exactly the units coming back, so
+                # those units cost what the closes released: close value ∓ the
+                # gross each booked. A specific-lot Exit had re-derived the
+                # average off the survivors; restored at that, the re-close
+                # booked the difference a second time.
+                _cost = sum(
+                    (_td(t.price) * _td(q) - sign * _ps._booked_gross(t) for t, q in _undone),
+                    _Decimal(0),
+                )
+                p.avg_price = Decimal128(str(quantize_basis(_cost / _td(opening_qty))))
+                if _since is None:
+                    _set["superseded_at"] = _now_utc()
             await _TradeSup.get_motor_collection().update_many(_sup_q, {"$set": _set})
     except Exception:
         logger.exception("reopen_supersede_trades_failed", extra={"pos_id": str(p.id)})
