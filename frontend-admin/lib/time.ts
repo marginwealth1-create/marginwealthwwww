@@ -32,3 +32,13 @@ export function localInputToIso(v: string): string | undefined {
   const d = new Date(`${withSecs}+05:30`); // interpret AS IST, not device-local
   return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
 }
+
+const ymd = (d: Date) => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+
+/** This IST week so far as plain dates, [Monday, today] — whatever the
+ *  device timezone (a browser-local Monday is Sunday's week before 05:30 IST). */
+export function istWeekSoFar(now: Date = new Date()): [string, string] {
+  const ist = new Date(now.getTime() + IST_OFFSET_MS); // read UTC parts = IST wall-clock
+  const sinceMonday = (ist.getUTCDay() + 6) % 7;
+  return [ymd(new Date(ist.getTime() - sinceMonday * 86_400_000)), ymd(ist)];
+}

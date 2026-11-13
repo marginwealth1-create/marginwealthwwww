@@ -2,7 +2,7 @@
 // --experimental-strip-types). Runs under several device timezones, because the
 // bug it guards (§6.3) only showed on a machine whose clock is not UTC.
 import assert from "node:assert/strict";
-import { isoToLocalInput, localInputToIso } from "./time.ts";
+import { istWeekSoFar, isoToLocalInput, localInputToIso } from "./time.ts";
 
 const naive = "2026-11-12T04:30:15.123000"; // backend naive UTC = 10:00:15 IST
 const aware = "2026-11-12T04:30:15.123000+00:00"; // tz_aware Mongo client
@@ -23,5 +23,10 @@ for (const tz of ["Asia/Kolkata", "UTC", "America/New_York"]) {
   assert.equal(isoToLocalInput("2026-11-11T20:00:00Z"), "2026-11-12T01:30", tz);
   assert.equal(isoToLocalInput(""), "", tz);
   assert.equal(localInputToIso(""), undefined, tz);
+  // Mon 9 Nov 00:10 IST is Sunday 18:40 UTC: still the week of the 9th.
+  assert.deepEqual(istWeekSoFar(new Date("2026-11-08T18:40:00Z")), ["2026-11-09", "2026-11-09"], tz);
+  // Sun 15 Nov 23:50 IST closes that week; Fri 13 Nov is inside it.
+  assert.deepEqual(istWeekSoFar(new Date("2026-11-15T18:20:00Z")), ["2026-11-09", "2026-11-15"], tz);
+  assert.deepEqual(istWeekSoFar(new Date("2026-11-13T06:00:00Z")), ["2026-11-09", "2026-11-13"], tz);
 }
 console.log("lib/time.ts ok");

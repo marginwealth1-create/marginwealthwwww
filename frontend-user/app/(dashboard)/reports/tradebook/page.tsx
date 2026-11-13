@@ -3,16 +3,13 @@
 import { useState } from "react";
 import { PageHeader } from "@/components/common/PageHeader";
 import { ReportPdfButton } from "@/components/common/ReportPdfButton";
-import { DateRangeBar, toIsoFrom, toIsoTo, type DateRange } from "@/components/common/DateRangeBar";
+import { DateRangeBar, type DateRange } from "@/components/common/DateRangeBar";
 import { Card } from "@/components/ui/card";
 
-// Reports = ONE deliverable: pick a date range and download the tradebook.
-// A SINGLE "Full Tradebook" download. Its net P&L is the canonical
-// Σ Trade.pnl_inr — byte-for-byte the same figure as the /pnl report AND the
-// admin-side download (both call build_full_tradebook_pdf). The old
-// "Simple PDF" was removed on purpose: it listed raw trades and derived its
-// total from sell−buy value, so its P&L never matched the canonical number —
-// the "tradebook aur pdf alag P&L" bug.
+// Two documents for one date range. The Billing statement is the FIFO-paired
+// statement, the same one the admin downloads (one backend assembly); its P&L
+// is what the wallet booked. The Trade Book lists every fill as executed. The
+// dates go as plain YYYY-MM-DD: the backend reads them as whole IST days.
 export default function TradebookPage() {
   const [range, setRange] = useState<DateRange>(() => {
     const to = new Date();
@@ -34,15 +31,20 @@ export default function TradebookPage() {
       <DateRangeBar simple value={range} onChange={setRange} />
 
       <Card className="p-4">
-        <div className="text-sm font-medium">Download tradebook</div>
+        <div className="text-sm font-medium">Download</div>
         <div className="mt-1 text-xs text-muted-foreground">
           For the selected period ({range.from} → {range.to}).
         </div>
-        <div className="mt-3">
+        <div className="mt-3 flex flex-wrap gap-2">
           <ReportPdfButton
             kind="tradebook/full"
-            params={{ from_date: toIsoFrom(range.from), to_date: toIsoTo(range.to) }}
-            label="Full Tradebook"
+            params={{ from_date: range.from, to_date: range.to }}
+            label="Billing statement"
+          />
+          <ReportPdfButton
+            kind="tradebook"
+            params={{ from_date: range.from, to_date: range.to }}
+            label="Trade Book"
           />
         </div>
       </Card>

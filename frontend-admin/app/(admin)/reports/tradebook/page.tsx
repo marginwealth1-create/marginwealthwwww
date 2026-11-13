@@ -3,6 +3,7 @@
 import { useState, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { UsersAPI, ReportsAdminAPI } from "@/lib/api";
+import { istWeekSoFar } from "@/lib/time";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,9 +15,11 @@ import { toast } from "sonner";
 export default function TradebookPage() {
   const [search, setSearch] = useState("");
   const [selectedUser, setSelectedUser] = useState<any>(null);
-  const [fromDate, setFromDate] = useState("");
-  const [toDate, setToDate] = useState("");
-  const [downloading, setDownloading] = useState(false);
+  // Opens on this IST week, the period the ledger settles; clear the dates
+  // for the whole history.
+  const [fromDate, setFromDate] = useState(() => istWeekSoFar()[0]);
+  const [toDate, setToDate] = useState(() => istWeekSoFar()[1]);
+  const [downloading, setDownloading] = useState<"billing" | "trades" | null>(null);
   const [showDropdown, setShowDropdown] = useState(false);
 
   const { data: usersData } = useQuery({
@@ -38,41 +41,38 @@ export default function TradebookPage() {
     setShowDropdown(false);
   }, []);
 
-  const handleDownload = useCallback(async () => {
+  const handleDownload = useCallback(async (doc: "billing" | "trades") => {
     if (!selectedUser) {
       toast.error("Please select a user first");
       return;
     }
 
-    setDownloading(true);
+    setDownloading(doc);
     try {
-      const blob = await ReportsAdminAPI.tradebookPdf(
-        selectedUser._id || selectedUser.id,
-        fromDate || undefined,
-        toDate || undefined,
-      );
+      const fetchPdf = doc === "billing" ? ReportsAdminAPI.tradebookPdf : ReportsAdminAPI.tradeBookPdf;
+      const blob = await fetchPdf(selectedUser._id || selectedUser.id, fromDate || undefined, toDate || undefined);
 
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       const code = selectedUser.user_code || "user";
       const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
       a.href = url;
-      a.download = `tradebook_${code}_${stamp}.pdf`;
+      a.download = `${doc === "billing" ? "billing" : "tradebook"}_${code}_${stamp}.pdf`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      toast.success("Tradebook PDF downloaded");
+      toast.success("PDF downloaded");
     } catch (err: any) {
-      toast.error(err?.message || "Failed to generate tradebook PDF");
+      toast.error(err?.message || "Failed to generate PDF");
     } finally {
-      setDownloading(false);
+      setDownloading(null);
     }
   }, [selectedUser, fromDate, toDate]);
 
   return (
     <div className="space-y-4">
-      <PageHeader title="Tradebook PDF" description="Generate ARK Trader-style tradebook PDF per user" />
+      <PageHeader title="Billing & Trade Book" description="A client's billing statement (FIFO) or trade book (every fill), per IST day range" />
 
       <Card>
         <CardHeader>
@@ -161,24 +161,29 @@ export default function TradebookPage() {
             </div>
           </div>
 
-          {/* Download button */}
-          <Button
-            onClick={handleDownload}
-            disabled={!selectedUser || downloading}
-            className="w-full bg-emerald-600 hover:bg-emerald-700 sm:w-auto"
-          >
-            {downloading ? (
-              <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Generating PDF...
-              </>
-            ) : (
-              <>
-                <Download className="mr-2 h-4 w-4" />
-                Download Tradebook PDF
-              </>
-            )}
-          </Button>
+          {/* Download buttons: the two documents */}
+          <div className="flex flex-col gap-2 sm:flex-row">
+            {(
+              [
+                ["billing", "Download Billing PDF"],
+                ["trades", "Download Trade Book PDF"],
+              ] as const
+            ).map(([doc, label]) => (
+              <Button
+                key={doc}
+                onClick={() => handleDownload(doc)}
+                disabled={!selectedUser || downloading !== null}
+                className="w-full bg-emerald-600 hover:bg-emerald-700 sm:w-auto"
+              >
+                {downloading === doc ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Download className="mr-2 h-4 w-4" />
+                )}
+                {downloading === doc ? "Generating PDF..." : label}
+              </Button>
+            ))}
+          </div>
         </CardContent>
       </Card>
 
@@ -186,14 +191,15 @@ export default function TradebookPage() {
       <Card>
         <CardContent className="pt-6">
           <div className="text-sm text-muted-foreground space-y-2">
-            <p className="font-medium text-foreground">PDF includes:</p>
+            <p className="font-medium text-foreground">Billing includes:</p>
             <ul className="list-disc pl-5 space-y-1">
-              <li>Closed Transactions (trades + SL/TP triggers + deposits/withdrawals)</li>
+              <li>Closed Transactions (FIFO-paired trades, settlements, deposits/withdrawals)</li>
               <li>Money Totals (Deposit, Withdrawal, Adjustment, Bonus)</li>
-              <li>Opened Deals (current open positions with unrealized P&L)</li>
+              <li>Opened Deals (positions held at the end of the period)</li>
               <li>Pending Orders (LIMIT, SL, SL-M orders waiting to trigger)</li>
-              <li>Financial Standings (Balance, Equity, Margin, Free Margin, Margin Level %)</li>
+              <li>Financial Standings (Balance, Gross PnL, Brokerage, Net PnL)</li>
             </ul>
+            <p className="font-medium text-foreground">Trade Book: every fill, newest first, with each settlement&apos;s legs.</p>
           </div>
         </CardContent>
       </Card>

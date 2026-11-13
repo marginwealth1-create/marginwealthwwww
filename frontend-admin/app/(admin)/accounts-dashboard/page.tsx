@@ -1082,16 +1082,30 @@ function UserPnlRow({
           >
             <FileText className="size-3 mr-0.5" /> PDF
           </Button>
-          {/* Full FIFO trade book — trade-by-trade incl. WEEKLY SETTLEMENT rows
-              (operator: weekly settlement should show in the trade book too). */}
+          {/* Billing: the FIFO statement (incl. weekly settlement rows). */}
           <Button
             variant="outline"
             size="sm"
             className="h-7 text-[10px] px-2"
-            title="Full trade book (incl. weekly settlement)"
+            title="Billing statement (FIFO, incl. weekly settlement)"
             onClick={async () => {
               await saveOrToast(
                 () => ReportsAdminAPI.tradebookPdf(u.user_id, dateParams.from_date, dateParams.to_date),
+                `billing_${u.user_code}.pdf`,
+              );
+            }}
+          >
+            <BookOpen className="size-3 mr-0.5" /> Billing
+          </Button>
+          {/* Trade Book: one row per fill, as executed. */}
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-[10px] px-2"
+            title="Trade book (one row per fill)"
+            onClick={async () => {
+              await saveOrToast(
+                () => ReportsAdminAPI.tradeBookPdf(u.user_id, dateParams.from_date, dateParams.to_date),
                 `tradebook_${u.user_code}.pdf`,
               );
             }}
@@ -1193,7 +1207,7 @@ function UserPnlCard({
         >
           <FileText className="size-3 mr-1" /> PDF
         </Button>
-        {/* Full FIFO trade book — incl. weekly settlement rows. */}
+        {/* Billing: the FIFO statement (incl. weekly settlement rows). */}
         <Button
           variant="outline"
           size="sm"
@@ -1201,6 +1215,20 @@ function UserPnlCard({
           onClick={async () => {
             await saveOrToast(
               () => ReportsAdminAPI.tradebookPdf(u.user_id, dateParams.from_date, dateParams.to_date),
+              `billing_${u.user_code}.pdf`,
+            );
+          }}
+        >
+          <BookOpen className="size-3 mr-1" /> Billing
+        </Button>
+        {/* Trade Book: one row per fill, as executed. */}
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 text-[10px]"
+          onClick={async () => {
+            await saveOrToast(
+              () => ReportsAdminAPI.tradeBookPdf(u.user_id, dateParams.from_date, dateParams.to_date),
               `tradebook_${u.user_code}.pdf`,
             );
           }}

@@ -743,21 +743,22 @@ export const ReportsAdminAPI = {
   financial: () => unwrap<any>(api.get("/admin/reports/financial")),
   trades: () => unwrap<any>(api.get("/admin/reports/trades")),
   compliance: () => unwrap<any>(api.get("/admin/reports/compliance")),
-  tradebookPdf: async (
-    userId: string,
-    fromDate?: string,
-    toDate?: string,
-  ): Promise<Blob> => {
-    const params: Record<string, string> = { user_id: userId };
-    if (fromDate) params.from_date = fromDate;
-    if (toDate) params.to_date = toDate;
-    const res = await api.get("/admin/reports/tradebook/pdf", {
-      params,
-      responseType: "blob",
-    });
-    return res.data;
-  },
+  // Billing statement: the client's trades FIFO-paired. Dates are plain
+  // YYYY-MM-DD, read by the backend as whole IST days.
+  tradebookPdf: (userId: string, fromDate?: string, toDate?: string): Promise<Blob> =>
+    userPdf("/admin/reports/tradebook/pdf", userId, fromDate, toDate),
+  // Trade Book: one row per fill, newest first.
+  tradeBookPdf: (userId: string, fromDate?: string, toDate?: string): Promise<Blob> =>
+    userPdf("/admin/reports/trade-book/pdf", userId, fromDate, toDate),
 };
+
+async function userPdf(path: string, userId: string, fromDate?: string, toDate?: string): Promise<Blob> {
+  const params: Record<string, string> = { user_id: userId };
+  if (fromDate) params.from_date = fromDate;
+  if (toDate) params.to_date = toDate;
+  const res = await api.get(path, { params, responseType: "blob" });
+  return res.data;
+}
 
 export type MetaApiSettings = {
   enabled: boolean;

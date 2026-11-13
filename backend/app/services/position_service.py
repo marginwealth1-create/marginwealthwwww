@@ -32,7 +32,7 @@ from app.utils.decimal_utils import (
     to_decimal,
     to_decimal128,
 )
-from app.utils.time_utils import now_utc
+from app.utils.time_utils import UTC, now_utc
 
 import logging
 
@@ -500,7 +500,9 @@ async def settle_expired_position(
             str(quantize_money(to_decimal(pos.realized_pnl) + realized_native))
         )
         pos.unrealized_pnl = Decimal128("0")
-        pos.quantity = 0.0
+        # quantity stays: the units this settlement closed (as a weekly
+        # settlement leaves it). Zeroed, every reader fell back to the peak
+        # opening_quantity and settled units already sold.
         pos.margin_used = Decimal128("0")
         if (
             is_usd
@@ -1357,6 +1359,7 @@ async def list_closed_trade_events_fifo(
     skip: int = 0,
     limit: int = 25,
     lots: list[dict[str, Any]] | None = None,
+    until: datetime | None = None,
 ) -> tuple[list[dict], int]:
     """FIFO per-opening-fill closed blotter.
 
@@ -1378,7 +1381,12 @@ async def list_closed_trade_events_fifo(
 
     Returns (page_events, total_count) — newest-close-first, paginated.
     `lots`, when given, receives the lots still open at the end of the walk
-    (each with its opening fill's id as "tid").
+    (each with its opening fill's id as "tid" and its book as "key"). `until`
+    stops the walk there: the events up to it are unchanged and `lots` is the
+    book as it stood then. Every event's "legs" are its brokerage as
+    (charged_at, amount) — the opening fills' shares and the close's own — so
+    a statement can bill only the legs charged inside its window; "brokerage"
+    is their sum.
     """
     from collections import deque
     from app.models.trade import Trade
@@ -1524,31 +1532,15 @@ async def list_closed_trade_events_fifo(
         _timeline.append((_naive(b["ts"]), 1, _i, "settle", b))
     _timeline.sort(key=lambda x: (x[0], x[1], x[2]))
 
+    _until = None
+    if until is not None:
+        _until = (until.astimezone(UTC) if until.tzinfo else until).replace(tzinfo=None)
     for _ts, _ord, _idx, _kind, _obj in _timeline:
+        if _until is not None and _ts > _until:
+            break
         if _kind == "settle":
             b = _obj
             sign = 1.0 if b["side"] == "BUY" else -1.0
-            # Native gross like every row here; fx_rate converts it to what
-            # the wallet booked.
-            gross = (b["settle_price"] - b["entry_price"]) * b["qty"] * sign
-            events.append({
-                "_row_id": f"wsettle_{b['pid']}",
-                "_closed_at": b["ts"],
-                "_superseded": False,
-                "instrument": b["instrument"],
-                "product_type": b["product_type"],
-                "opened_side": b["side"],
-                "entry_price": b["entry_price"],
-                "close_price": b["settle_price"],
-                "qty": b["qty"],
-                "gross_pnl": gross,
-                "fx_rate": b["fx_rate"],
-                "brokerage": 0.0,  # weekly settlement charges no brokerage
-                "opened_at": b["ts"],
-                "closed_at": b["ts"],
-                "instrument_token": b["key"][0],
-                "close_reason": b.get("close_reason", "WEEKLY_SETTLEMENT"),
-            })
             # The original opening fills are now closed out by this settlement.
             # A settlement closes the ENTIRE position for this token at the
             # settle price, so we must drain its opening fills before reseeding.
@@ -1579,7 +1571,10 @@ async def list_closed_trade_events_fifo(
                 ),
                 key=lambda k: _naive(open_queues[k][0]["opened_at"]),
             )
-            # Only the settled side's lots: the position held one side.
+            # Only the settled side's lots: the position held one side. The
+            # settlement charges nothing itself; its row carries the opening
+            # legs of the units it takes off the book (they were lost).
+            _legs: list[tuple[Any, float]] = []
             for _bk in _drain_keys:
                 _bq = open_queues[_bk]
                 for _f in _bq:
@@ -1588,9 +1583,32 @@ async def list_closed_trade_events_fifo(
                     if _f["side"] != b["side"]:
                         continue
                     _take = min(float(_f["qty"]), _remaining)
+                    if _f.get("original_qty"):
+                        _legs.append((_f["opened_at"], _f.get("open_brk", 0.0) * _take / _f["original_qty"]))
                     _f["qty"] = float(_f["qty"]) - _take
                     _remaining -= _take
                 open_queues[_bk] = deque(_f for _f in _bq if _f["qty"] > 1e-9)
+            # Native gross like every row here; fx_rate converts it to what
+            # the wallet booked.
+            events.append({
+                "_row_id": f"wsettle_{b['pid']}",
+                "_closed_at": b["ts"],
+                "_superseded": False,
+                "instrument": b["instrument"],
+                "product_type": b["product_type"],
+                "opened_side": b["side"],
+                "entry_price": b["entry_price"],
+                "close_price": b["settle_price"],
+                "qty": b["qty"],
+                "gross_pnl": (b["settle_price"] - b["entry_price"]) * b["qty"] * sign,
+                "fx_rate": b["fx_rate"],
+                "brokerage": sum(a for _, a in _legs),
+                "legs": _legs,
+                "opened_at": b["ts"],
+                "closed_at": b["ts"],
+                "instrument_token": b["key"][0],
+                "close_reason": b.get("close_reason", "WEEKLY_SETTLEMENT"),
+            })
             # WEEKLY re-opens at the settlement price (reseed one fill under the
             # settled key so the next close prices off it); EXPIRY is terminal
             # (contract dead) — leave the queues empty, no reseed.
@@ -1713,6 +1731,7 @@ async def list_closed_trade_events_fifo(
                     "gross_pnl": gross,
                     "fx_rate": float(str(t.fx_rate)) if getattr(t, "fx_rate", None) is not None else None,
                     "brokerage": close_brk,
+                    "legs": [(t.executed_at, close_brk)],
                     # No surviving opening fill — the position's own
                     # opened_at is filled in below; close time is the last resort.
                     "opened_at": t.executed_at,
@@ -1803,6 +1822,7 @@ async def list_closed_trade_events_fifo(
                 "gross_pnl": gross,
                 "fx_rate": float(str(t.fx_rate)) if getattr(t, "fx_rate", None) is not None else None,
                 "brokerage": brk_alloc,
+                "legs": [(front["opened_at"], open_brk_alloc), (t.executed_at, close_brk_alloc)],
                 "opened_at": front["opened_at"],
                 "closed_at": t.executed_at,
                 "instrument_token": t.instrument.token,
@@ -1816,7 +1836,7 @@ async def list_closed_trade_events_fifo(
                 del q[idx]
 
     if lots is not None:
-        lots.extend(f for _q in open_queues.values() for f in _q)
+        lots.extend({**f, "key": _k} for _k, _q in open_queues.items() for f in _q)
 
     # Drop closing fills an admin REOPEN/DELETE later undid. They stay in the
     # collection (audit) and were processed above so the FIFO pairing of the
