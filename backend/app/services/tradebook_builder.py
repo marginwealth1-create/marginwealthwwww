@@ -28,6 +28,7 @@ from app.models.position_settlement import PositionSettlement, PositionSettlemen
 from app.models.trade import LIVE_FILL, Trade
 from app.models.transaction import TransactionStatus, TransactionType, WalletTransaction
 from app.services import position_service
+from app.services.market_data_service import is_usd_quoted_segment
 from app.utils.decimal_utils import quantize_money, to_decimal
 from app.utils.time_utils import UTC, end_of_day_ist, now_utc, start_of_day_ist, to_ist
 
@@ -65,6 +66,7 @@ def script_wise(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             {
                 "exchange": r["exchange"],
                 "script": r["script"],
+                "usd": r.get("usd", False),
                 **dict.fromkeys(
                     ("qty", "buy_turnover", "sell_turnover", "brokerage", "gross_pnl"), Decimal(0)
                 ),
@@ -143,10 +145,59 @@ def _money(v: Decimal) -> float:
     return float(quantize_money(v))
 
 
+def _paise(exact: list[Decimal]) -> list[Decimal]:
+    """Each amount to the paisa with the rounding carried forward, so the
+    printed amounts add up to their rounded total (a close split over three
+    lots printed 40.38 thrice under a booked 121.15)."""
+    out, cum, done = [], Decimal(0), Decimal(0)
+    for v in exact:
+        cum += v
+        out.append(quantize_money(cum) - done)
+        done += out[-1]
+    return out
+
+
 def _side(p: Position) -> str:
     if p.opened_side is not None:
         return p.opened_side.value
     return "BUY" if float(p.quantity or 0) >= 0 else "SELL"
+
+
+def _held(p: Position, at: datetime) -> bool:
+    """Was `p` open at instant `at` (naive UTC)?"""
+    opened, closed = _naive(p.opened_at), _naive(p.closed_at)
+    if opened is not None and opened > at:
+        return False
+    if position_service.in_reopen_gap(p, at.replace(tzinfo=UTC)):
+        return False
+    return p.status == PositionStatus.OPEN if closed is None else closed > at
+
+
+def _deal(
+    p: Position, book: list[dict[str, Any]], fallback: Decimal
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """A Brought / Carry Forward row for `p` off `book`, the walk's lots as
+    they stood at the boundary: the units held and the engine's average
+    then, so this week's BF is last week's CF and a later add rewrites
+    neither (opening_quantity is the lifecycle's peak, avg_price today's).
+    Also returns the lots it read."""
+    side = _side(p)
+    token, product = p.instrument.token, p.product_type.value
+    mine = [f for f in book if f["key"] in ((token, ""), (token, product)) and f["side"] == side]
+    avg = mine[0].get("avg") if mine else None
+    row = {
+        "ticket_id": str(p.id)[-8:] if p.id else "",
+        "time": _fmt_dt(p.opened_at or p.created_at),
+        "exchange": exchange_label(p.instrument.exchange),
+        "script": p.instrument.symbol,
+        "usd": is_usd_quoted_segment(p.instrument.segment),
+        "side": side,
+        # ponytail: a position with no lots in the walk (legacy, or admin-made
+        # with no fill) falls back to its doc as it is today.
+        "qty": round(sum(float(f["qty"]) for f in mine), 8) if mine else float(fallback),
+        "price": float(to_decimal(avg if avg is not None else p.avg_price)),
+    }
+    return row, mine
 
 
 async def fifo_closed_rows(
@@ -193,6 +244,7 @@ async def fifo_closed_rows(
                 "ticket_id": str(ev.get("_row_id") or "")[-8:],
                 "exchange": exchange_label(inst.exchange),
                 "script": inst.symbol,
+                "usd": is_usd_quoted_segment(inst.segment),
                 "side": ev["opened_side"],
                 "qty": float(ev["qty"]),
                 "buy_rate": float(buy),
@@ -236,6 +288,7 @@ async def trade_rows(
             "order_id": str(t.order_id),
             "symbol": t.instrument.symbol,
             "exchange": str(t.instrument.exchange),
+            "usd": is_usd_quoted_segment(t.instrument.segment),
             "action": t.action.value,
             "quantity": t.quantity,
             "price": str(t.price),
@@ -290,6 +343,7 @@ async def trade_rows(
                     "order_id": str(order_id),
                     "symbol": p.instrument.symbol,
                     "exchange": str(p.instrument.exchange),
+                    "usd": is_usd_quoted_segment(p.instrument.segment),
                     "action": action,
                     "quantity": qty,
                     "price": str(p.ltp),
@@ -326,7 +380,7 @@ async def statement_payload(
     inside = _between(from_date, to_date)
 
     lots: list[dict[str, Any]] = []
-    closed_rows, gross, _ = await fifo_closed_rows(uid, from_date, to_date, lots=lots)
+    closed_rows, _, _ = await fifo_closed_rows(uid, from_date, to_date, lots=lots)
 
     # ── Funds: settled money moves, opening on the ledger's own balance ──
     money_types = [
@@ -378,53 +432,32 @@ async def statement_payload(
         Decimal(0),
     )
 
-    # ── Brought Forward / Carry Forward, off the Position docs ─────────
-    def held(p: Position, at: datetime) -> bool:
-        """Was `p` open at instant `at` (naive UTC)?"""
-        opened, closed = _naive(p.opened_at), _naive(p.closed_at)
-        if opened is not None and opened > at:
-            return False
-        if position_service.in_reopen_gap(p, at.replace(tzinfo=UTC)):
-            return False
-        return p.status == PositionStatus.OPEN if closed is None else closed > at
-
-    def deal(p: Position, qty: Decimal) -> dict[str, Any]:
-        return {
-            "ticket_id": str(p.id)[-8:] if p.id else "",
-            "time": _fmt_dt(p.opened_at or p.created_at),
-            "exchange": exchange_label(p.instrument.exchange),
-            "script": p.instrument.symbol,
-            "side": _side(p),
-            "qty": float(qty),
-            # ponytail: the doc's avg_price now — exact unless the position
-            # traded after the instant shown; the walk's lots would pin it.
-            "price": float(to_decimal(p.avg_price)),
-        }
-
     positions = await Position.find(Position.user_id == uid).sort("+opened_at").to_list()
 
-    # Open on the window's first instant, even if it closed inside it. The
-    # quantity is opening_quantity: `quantity` is 0 once a position closes.
-    # ponytail: opening_quantity is the lifecycle's peak, so an add made
-    # inside the window shows here too; the walk's lots at from_date are exact.
+    # ── Brought / Carry Forward: which positions off the Position docs, their
+    # units and price off the walk's book at the boundary (`_deal`).
+    # Brought Forward: open on the window's first instant, even if it closed
+    # inside it.
     brought_forward = []
     day_one = _naive(from_date - timedelta(microseconds=1)) if from_date else None
     if day_one is not None:
+        bf_lots: list[dict[str, Any]] = []
+        # ponytail: a second walk of the whole history for the book at
+        # day one; snapshot it in the one walk if statements get slow.
+        await position_service.list_closed_trade_events_fifo(
+            uid, skip=0, limit=1, lots=bf_lots, until=day_one
+        )
         for p in positions:
-            qty = abs(to_decimal(p.opening_quantity or 0)) or abs(to_decimal(p.quantity or 0))
-            if qty and held(p, day_one):
-                brought_forward.append(deal(p, qty))
+            peak = abs(to_decimal(p.opening_quantity or 0)) or abs(to_decimal(p.quantity or 0))
+            if peak and _held(p, day_one):
+                brought_forward.append(_deal(p, bf_lots, peak)[0])
 
     hi = _naive(to_date)
     carry_forward: list[dict[str, Any]] = []
     for p in positions:
-        if not (p.status == PositionStatus.OPEN if hi is None else held(p, hi)):
+        if not (p.status == PositionStatus.OPEN if hi is None else _held(p, hi)):
             continue
-        side = _side(p)
-        token, product = p.instrument.token, p.product_type.value
-        mine = [f for f in lots if f["key"] in ((token, ""), (token, product)) and f["side"] == side]
-        # Units held then (the book at to_date); the doc's own qty is today's.
-        units = to_decimal(round(sum(float(f["qty"]) for f in mine), 8) if mine else abs(p.quantity))
+        row, mine = _deal(p, lots, abs(to_decimal(p.quantity)))
         # The opening legs of those units charged inside the window.
         commission = sum(
             (
@@ -434,10 +467,22 @@ async def statement_payload(
             ),
             Decimal(0),
         )
-        row = deal(p, units)
         # Units × price: quantity is already in units, not lots.
-        value = units * to_decimal(row["price"])
-        carry_forward.append({**row, "commission": float(commission), "value": float(value)})
+        value = to_decimal(row["qty"]) * to_decimal(row["price"])
+        carry_forward.append({**row, "commission": commission, "value": float(value)})
+
+    # ── To the paisa, rounding carried forward, so the printed rows add up
+    # to the printed totals and to Financial Standings. Brokerage runs on
+    # through Carry Forward: their sum is everything charged in the window.
+    grossed = _paise([to_decimal(r["gross_pnl"]) for r in closed_rows])
+    billed = _paise(
+        [to_decimal(r["brokerage"]) for r in closed_rows] + [d["commission"] for d in carry_forward]
+    )
+    for r, g, b in zip(closed_rows, grossed, billed, strict=False):
+        r.update(gross_pnl=float(g), brokerage=float(b), net_pnl=float(g - b))
+    for d, b in zip(carry_forward, billed[len(closed_rows) :], strict=True):
+        d["commission"] = float(b)
+    gross = sum(grossed, Decimal(0))
 
     # ── Financial Standings: four figures that reconcile with the above ─
     last = await WalletTransaction.find(
@@ -445,9 +490,9 @@ async def statement_payload(
     ).sort("-created_at", "-_id").first_or_none()
     financial = {
         "balance": _money(to_decimal(last.balance_after) if last else Decimal(0)),
-        "gross_pnl": gross,
+        "gross_pnl": _money(gross),
         "brokerage": _money(brokerage),
-        "net_pnl": _money(to_decimal(gross) - brokerage),
+        "net_pnl": _money(gross - brokerage),
     }
 
     return {

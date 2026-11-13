@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import os
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 from xml.sax.saxutils import escape
 
@@ -193,6 +194,23 @@ def _fmt_rate(v: Any, exchange: Any = "") -> str:
         return ""
     whole, frac = f"{_num(v):,.{6 if str(exchange) in _FINE_RATE else 2}f}".split(".")
     return f"{whole}.{frac.rstrip('0').ljust(2, '0')}"
+
+
+def _usd(text: str, usd: Any) -> str:
+    """A USD-quoted rate or notional says so: the P&L and charges printed
+    beside it are rupees, so 61,000 → 60,000 on 0.25 BTC beside a Gross of
+    24,250 read as broken arithmetic."""
+    return f"${text}" if usd and text else text
+
+
+def _fmt_value(v: Any, usd: Any) -> str:
+    """A notional in its own currency: a USD fill's value printed with ₹."""
+    return _usd(f"{_num(v):,.2f}", True) if usd else _fmt_money(v)
+
+
+def _dsum(values: Any) -> Decimal:
+    """Printed amounts summed exactly, so a Totals line is its rows' sum."""
+    return sum((Decimal(str(_num(v))) for v in values), Decimal(0))
 
 
 def _fmt_date(v: Any) -> str:
@@ -476,7 +494,7 @@ def build_tradebook_pdf(user, rows: list[dict]) -> bytes:
     styles = _styles()
     doc, buf = _doc()
     elems = _header(
-        "Tradebook",
+        "Trade Book",
         f"{len(rows)} trades",
         _user_label(user),
         styles,
@@ -493,8 +511,8 @@ def build_tradebook_pdf(user, rows: list[dict]) -> bytes:
                 r.get("symbol") or "—",
                 side,
                 _fmt_qty(r.get("quantity")),
-                _fmt_rate(r.get("price"), r.get("exchange")),
-                _fmt_money(r.get("value")),
+                _usd(_fmt_rate(r.get("price"), r.get("exchange")), r.get("usd")),
+                _fmt_value(r.get("value"), r.get("usd")),
                 _fmt_money(r.get("total_charges")),
             ],
         )
@@ -584,7 +602,7 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
         buf, pagesize=landscape(A4),
         leftMargin=10 * mm, rightMargin=10 * mm,
         topMargin=12 * mm, bottomMargin=12 * mm,
-        title="Trade Book",
+        title="Billing Statement",
     )
     page_w = landscape(A4)[0] - 20 * mm
 
@@ -605,7 +623,7 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
                 styles["title"],
             ),
             Paragraph(
-                f"<font name='{_FONT_BOLD}' size='16' color='#263C9C'>Trade Book</font>",
+                f"<font name='{_FONT_BOLD}' size='16' color='#263C9C'>Billing Statement</font>",
                 styles["title"],
             ),
             Paragraph(
@@ -709,7 +727,7 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
         [
             [
                 d["ticket_id"], d["time"], d["script"], d["side"],
-                _fmt_qty(d["qty"]), _fmt_rate(d["price"], d["exchange"]),
+                _fmt_qty(d["qty"]), _usd(_fmt_rate(d["price"], d["exchange"]), d.get("usd")),
             ]
             for d in payload.get("brought_forward", [])
         ],
@@ -725,7 +743,7 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
         [10, 8, 8, 24],
         [["", "Opening Balance", amt(funds.get("opening_balance")), ""]]
         + [[m["time"], m["type"], amt(m["amount"]), m["comment"]] for m in money],
-        ["", "Net Funds", amt(sum(_num(m["amount"]) for m in money)), ""],
+        ["", "Net Funds", amt(_dsum(m["amount"] for m in money)), ""],
     )
 
     # ── 3. One Trades List per exchange; both legs on one line ─────────
@@ -734,10 +752,10 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
     exchanges = sorted(
         {r["exchange"] for r in closed}, key=lambda e: (order.index(e) if e in order else len(order), e)
     )
-    segments: list[tuple[str, float, float]] = []
+    segments: list[tuple[str, Decimal, Decimal]] = []
     for ex in exchanges:
         rows = [r for r in closed if r["exchange"] == ex]
-        brk, gross = sum(_num(r["brokerage"]) for r in rows), sum(_num(r["gross_pnl"]) for r in rows)
+        brk, gross = _dsum(r["brokerage"] for r in rows), _dsum(r["gross_pnl"] for r in rows)
         segments.append((ex, brk, gross))
         section(f"{ex} Trades List")
         table(
@@ -747,7 +765,8 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
             [
                 [
                     r["ticket_id"], r["script"], _fmt_qty(r["qty"]),
-                    _fmt_rate(r["buy_rate"], ex), _fmt_rate(r["sell_rate"], ex),
+                    _usd(_fmt_rate(r["buy_rate"], ex), r.get("usd")),
+                    _usd(_fmt_rate(r["sell_rate"], ex), r.get("usd")),
                     r["buy_time"], r["sell_time"],
                     amt(r["brokerage"]), amt(r["gross_pnl"]), amt(r["net_pnl"]), r["comment"],
                 ]
@@ -769,24 +788,26 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
         [
             [
                 s["exchange"], s["script"], _fmt_qty(s["qty"]),
-                _fmt_rate(s["avg_buy"], s["exchange"]), _fmt_rate(s["avg_sell"], s["exchange"]),
-                amt(s["buy_turnover"]), amt(s["sell_turnover"]), s["first_time"], s["last_time"],
+                _usd(_fmt_rate(s["avg_buy"], s["exchange"]), s.get("usd")),
+                _usd(_fmt_rate(s["avg_sell"], s["exchange"]), s.get("usd")),
+                _usd(amt(s["buy_turnover"]), s.get("usd")), _usd(amt(s["sell_turnover"]), s.get("usd")),
+                s["first_time"], s["last_time"],
                 amt(s["brokerage"]), amt(s["gross_pnl"]), amt(s["net_pnl"]),
             ]
             for s in sw
         ],
         [
             "", "Totals", "", "", "", "", "", "", "",
-            amt(sum(_num(s["brokerage"]) for s in sw)),
-            amt(sum(_num(s["gross_pnl"]) for s in sw)),
-            amt(sum(_num(s["net_pnl"]) for s in sw)),
+            amt(_dsum(s["brokerage"] for s in sw)),
+            amt(_dsum(s["gross_pnl"] for s in sw)),
+            amt(_dsum(s["net_pnl"] for s in sw)),
         ],
         empty="No closed trades in this period.",
     )
 
     # ── 5. Carry Forward: what the period hands on (no live price) ─────
     cf = payload.get("carry_forward", [])
-    cf_com = sum(_num(d["commission"]) for d in cf)
+    cf_com = _dsum(d["commission"] for d in cf)
     section("Carry Forward")
     table(
         ["Ticket Id", "Open Time", "Script", "Side", "Qty", "Price", "Commission", "Value"],
@@ -794,7 +815,8 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
         [
             [
                 d["ticket_id"], d["time"], d["script"], d["side"], _fmt_qty(d["qty"]),
-                _fmt_rate(d["price"], d["exchange"]), amt(d["commission"]), amt(d["value"]),
+                _usd(_fmt_rate(d["price"], d["exchange"]), d.get("usd")), amt(d["commission"]),
+                _usd(amt(d["value"]), d.get("usd")),
             ]
             for d in cf
         ],
@@ -805,7 +827,7 @@ def build_full_tradebook_pdf(user, payload: dict) -> bytes:
     # ── 6. All Segments: the one overall figure, back together ─────────
     # The carried positions' opening charges are the period's too.
     if cf_com:
-        segments.append(("Carry Forward", cf_com, 0.0))
+        segments.append(("Carry Forward", cf_com, Decimal(0)))
     section("All Segments")
     table(
         ["Segment", "Brokerage", "Gross PL", "Net PL"],

@@ -17,21 +17,24 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import pytest_asyncio
 from beanie import init_beanie
 from bson import Decimal128
+from fastapi import FastAPI, HTTPException
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from app.api.v1.admin import reports as admin_reports
 from app.api.v1.user import reports as user_reports
 from app.core.config import settings
 from app.core.database import _document_models
-from app.core.exceptions import ValidationFailedError
+from app.core.dependencies import get_current_user
+from app.core.exceptions import ValidationFailedError, register_exception_handlers
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.services import report_pdf_service, tradebook_builder
-from app.utils.time_utils import IST, UTC
+from app.utils.time_utils import IST, UTC, now_utc
 from tests._real_fill import market, set_commission_per_lot
 
 _DB = f"{settings.MONGODB_DB_NAME}_test_statement_ist_window"
@@ -141,3 +144,49 @@ async def test_both_trade_books_cover_the_whole_ist_day_and_print_ist(w):
         ("BUY", 10, Decimal("100")),
     ]
     assert report_pdf_service._fmt_date(admin_rows[0]["executed_at"]) == "02 Nov 2026, 23:50"
+
+
+async def _get(w, path: str, **params) -> httpx.Response:
+    """`path` on the client's reports router, its query parsed as FastAPI does."""
+    app = FastAPI()
+    register_exception_handlers(app)
+    app.include_router(user_reports.router)
+    app.dependency_overrides[get_current_user] = lambda: w.c
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        return await c.get(path, params=params)
+
+
+async def test_the_pnl_and_brokerage_reports_cover_the_whole_ist_day(w):
+    """A plain date was parsed as a UTC midnight: 2 Nov to 2 Nov was the
+    instant 05:30 IST and found nothing; the Billing statement for the same
+    dates covers the whole IST day (G1)."""
+    pnl = (await _get(w, "/reports/pnl", from_date=DAY, to_date=DAY)).json()["data"]
+    assert (pnl["total_trades"], pnl["total_realized"], pnl["total_brokerage"]) == (3, 100.0, 23.0)
+    brk = (await _get(w, "/reports/brokerage", from_date=DAY, to_date=DAY)).json()["data"]
+    assert (brk["trade_count"], brk["totals"]["total"]) == (3, 23.0)
+    for path in ("/reports/pnl/pdf", "/reports/brokerage/pdf"):
+        assert (await _get(w, path, from_date=DAY, to_date=DAY)).status_code == 200
+
+
+async def test_the_clients_trade_book_pdf_is_bounded_like_the_billing_statement(w):
+    """No dates rendered every fill the account ever had (20,000 rows took
+    14.5 s): it now opens on the last 30 days and refuses more than a month,
+    as the Billing statement does."""
+    await market(w.c, "BUY", 2, "99", at=now_utc() - timedelta(days=40))
+    await market(w.c, "BUY", 4, "98")
+    await user_reports.tradebook_pdf(user=w.c, from_date=None, to_date=None, limit=None)
+    qtys = [r["quantity"] for r in w.got["build_tradebook_pdf"]]
+    assert 4 in qtys and 2 not in qtys
+    for lo, hi in (("2026-01-01", DAY), ("2026-01-01", None)):  # an open end was no bound either
+        with pytest.raises(HTTPException):
+            await user_reports.tradebook_pdf(user=w.c, from_date=lo, to_date=hi, limit=None)
+    assert (await _get(w, "/reports/tradebook", limit=0)).status_code == 422  # returned every row
+
+
+async def test_the_billing_statement_is_named_billing_on_both_sides(w):
+    admin = await admin_reports.tradebook_pdf(
+        user_id=str(w.c.id), admin=w.sa, _=None, from_date=DAY, to_date=DAY
+    )
+    client = await user_reports.tradebook_full_pdf(user=w.c, from_date=DAY, to_date=DAY)
+    for resp in (admin, client):
+        assert resp.headers["content-disposition"].startswith('attachment; filename="billing_')

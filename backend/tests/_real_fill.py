@@ -17,9 +17,12 @@ from bson import Decimal128
 from app.models._base import Exchange, OrderAction, OrderType, ProductType
 from app.models.netting import NettingFieldsRequired, NettingSegment
 from app.models.order import InstrumentRef, Order
+from app.models.position import Position, PositionStatus
+from app.models.position_settlement import SettlementBatch
 from app.models.trade import Trade
 from app.models.user import User
-from app.services import market_data_service, matching_engine, wallet_service
+from app.services import market_data_service, matching_engine, wallet_service, weekly_settlement_service
+from app.utils.time_utils import now_utc
 
 # Fake token: no live quote can exist for it, so the fill books at cached_ltp.
 INSTRUMENT = InstrumentRef(
@@ -121,3 +124,18 @@ async def later(db, *, minutes: float = 0, seconds: float = 0) -> None:
                 }
             }
         await db[coll].update_many({}, [{"$set": shift}])
+
+
+async def settle_weekly(user: User, monkeypatch, price: str) -> None:
+    """The real weekly settlement of `user`'s open position at `price`: it
+    closes the position and re-opens the units there, writing no fill."""
+
+    async def _ltp(_token):
+        return Decimal(price)
+
+    monkeypatch.setattr(market_data_service, "get_ltp", _ltp)
+    batch = SettlementBatch(run_key=f"T{price}", week_key=f"2026-W{price}", started_at=now_utc())
+    await batch.insert()
+    pos = await Position.find_one(Position.user_id == user.id, Position.status == PositionStatus.OPEN)
+    settled = await weekly_settlement_service._settle_one_position(pos, batch=batch, fx_rate=Decimal(1))
+    assert settled == "settled"

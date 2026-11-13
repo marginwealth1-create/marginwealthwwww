@@ -208,7 +208,7 @@ async def tradebook_pdf(
     pdf_bytes = await asyncio.to_thread(report_pdf_service.build_full_tradebook_pdf, user, payload)
     stamp = now_ist().strftime("%Y%m%d")
     code = getattr(user, "user_code", "") or "user"
-    return _pdf(pdf_bytes, f"tradebook_{_slug(user.full_name)}_{code}_{_slug(brand)}_{stamp}.pdf")
+    return _pdf(pdf_bytes, f"billing_{_slug(user.full_name)}_{code}_{_slug(brand)}_{stamp}.pdf")
 
 
 @router.get("/trade-book/pdf")

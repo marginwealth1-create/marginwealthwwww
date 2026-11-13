@@ -31,14 +31,14 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from app.core.config import settings
 from app.core.database import _document_models
 from app.models.position import Position, PositionStatus
-from app.models.position_settlement import SettlementBatch
 from app.models.trade import Trade
 from app.models.transaction import TransactionType, WalletTransaction
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
-from app.services import market_data_service, position_service, tradebook_builder, weekly_settlement_service
+from app.services import position_service, tradebook_builder
 from app.utils.time_utils import now_utc, to_ist
 from tests._real_fill import INSTRUMENT, later, market, set_commission_per_lot
+from tests._real_fill import settle_weekly as _settle_weekly
 
 _DB = f"{settings.MONGODB_DB_NAME}_test_billing_brokerage"
 CENT = Decimal("0.01")
@@ -110,18 +110,6 @@ async def _statement(user: User, day: str):
     assert gross == fin["gross_pnl"] == await _ledger(user, lo, hi, TransactionType.PNL)
     assert fin["net_pnl"] == fin["gross_pnl"] - fin["brokerage"]
     return SimpleNamespace(trades=trades, cf=p["carry_forward"], fin=fin, payload=p)
-
-
-async def _settle_weekly(user: User, monkeypatch, price: str) -> None:
-    async def _ltp(_token):
-        return Decimal(price)
-
-    monkeypatch.setattr(market_data_service, "get_ltp", _ltp)
-    batch = SettlementBatch(run_key=f"T{price}", week_key=f"2026-W{price}", started_at=now_utc())
-    await batch.insert()
-    pos = await Position.find_one(Position.user_id == user.id, Position.status == PositionStatus.OPEN)
-    settled = await weekly_settlement_service._settle_one_position(pos, batch=batch, fx_rate=Decimal(1))
-    assert settled == "settled"
 
 
 async def test_a_weekly_settlement_row_carries_the_opening_leg_it_drained(w, monkeypatch):

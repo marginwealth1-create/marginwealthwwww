@@ -1383,7 +1383,10 @@ async def list_closed_trade_events_fifo(
     `lots`, when given, receives the lots still open at the end of the walk
     (each with its opening fill's id as "tid" and its book as "key"). `until`
     stops the walk there: the events up to it are unchanged and `lots` is the
-    book as it stood then. Every event's "legs" are its brokerage as
+    book as it stood then; each lot's "avg" is its book's engine average then
+    (what Position.avg_price read at that instant — weighted on adds, kept on
+    a close, re-derived on a specific-lot close, the settle price on a weekly
+    re-open). Every event's "legs" are its brokerage as
     (charged_at, amount) — the opening fills' shares and the close's own — so
     a statement can bill only the legs charged inside its window; "brokerage"
     is their sum.
@@ -1517,6 +1520,10 @@ async def list_closed_trade_events_fifo(
     # Per (token, product_type): deque of open fills (front = oldest = next to close).
     # Each fill: {"price": float, "qty": float, "opened_at": datetime, "side": "BUY"|"SELL"}
     open_queues: dict[tuple[str, str], deque] = {}
+    # The engine's average per book, replayed with apply_fill's rules: a
+    # statement's Brought / Carry Forward prices a position as it stood at
+    # its boundary, not at today's avg_price (a later add rewrote both).
+    _avg: dict[tuple[str, str], Decimal] = {}
     events: list[dict] = []
 
     # Merge real trades with settlement boundaries into ONE chronological
@@ -1625,6 +1632,7 @@ async def list_closed_trade_events_fifo(
                     "open_brk": 0.0,
                     "original_qty": b["qty"],
                 })
+                _avg[b["key"]] = to_decimal(b["settle_price"])
             continue
 
         t = _obj
@@ -1637,6 +1645,7 @@ async def list_closed_trade_events_fifo(
         side_str = "BUY" if is_buy else "SELL"
 
         q = own_q = open_queues.setdefault(key, deque())
+        qkey = key
 
         # Cross-product-type fallback: admin force-closes sometimes record
         # the closing fill with a different product_type than the opening fill
@@ -1649,7 +1658,7 @@ async def list_closed_trade_events_fifo(
                 None,
             )
             if alt_key:
-                q = open_queues[alt_key]
+                q, qkey = open_queues[alt_key], alt_key
 
         # Primary signal: pnl_inr set = closing fill; None = opening fill.
         # Legacy fallback: fills booked before pnl_inr existed carry none, so
@@ -1663,6 +1672,13 @@ async def list_closed_trade_events_fifo(
         )
 
         if not is_closing:
+            _held = to_decimal(sum(f["qty"] for f in q if f["side"] == side_str))
+            _px = to_decimal(t.price)
+            _avg[key] = (
+                quantize_basis((_avg[key] * _held + _px * to_decimal(qty)) / (_held + to_decimal(qty)))
+                if _held > 0 and key in _avg
+                else _px
+            )
             q.append({
                 "price": price,
                 "qty": qty,
@@ -1683,6 +1699,7 @@ async def list_closed_trade_events_fifo(
             _closed = min(qty, float(t.closed_quantity))
             _excess = qty - _closed
             if _excess > 1e-9:
+                _avg[key] = to_decimal(t.price)  # the flip opens the other side here
                 own_q.append({
                     "price": price,
                     "qty": _excess,
@@ -1770,6 +1787,7 @@ async def list_closed_trade_events_fifo(
                 _basis = float(str(t.cost_basis_override))
         except Exception:
             _basis = None
+        _before = to_decimal(sum(f["qty"] for f in q if f["side"] != side_str))
 
         while remaining > 1e-9:
             # A close takes only lots of the OTHER side: a book holding both
@@ -1838,8 +1856,16 @@ async def list_closed_trade_events_fifo(
             if front["qty"] < 1e-9:
                 del q[idx]
 
+        # A specific-lot close of part of the book re-derives the survivors'
+        # average as the engine does (basis_override); any other close keeps it.
+        _took = to_decimal(_closed - remaining)
+        if _basis is not None and qkey in _avg and _before - _took > 0:
+            _b = to_decimal(t.cost_basis_override)
+            if _avg[qkey] * _before >= _b * _took:
+                _avg[qkey] = quantize_basis((_avg[qkey] * _before - _b * _took) / (_before - _took))
+
     if lots is not None:
-        lots.extend({**f, "key": _k} for _k, _q in open_queues.items() for f in _q)
+        lots.extend({**f, "key": _k, "avg": _avg.get(_k)} for _k, _q in open_queues.items() for f in _q)
 
     # Drop closing fills an admin REOPEN/DELETE later undid. They stay in the
     # collection (audit) and were processed above so the FIFO pairing of the

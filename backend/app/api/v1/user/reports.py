@@ -20,7 +20,7 @@ from app.models.transaction import TransactionType, WalletTransaction
 from app.schemas.common import APIResponse
 from app.services import report_pdf_service, tradebook_builder
 from app.utils.decimal_utils import quantize_money, to_decimal
-from app.utils.time_utils import now_ist, now_utc
+from app.utils.time_utils import now_ist, now_utc, to_ist
 
 
 def _brand_slug() -> str:
@@ -260,10 +260,12 @@ async def _tax_payload(user) -> dict:
 @router.get("/pnl", response_model=APIResponse[dict])
 async def pnl_report(
     user: CurrentUser,
-    from_date: datetime | None = None,
-    to_date: datetime | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
 ):
-    return APIResponse(data=await _pnl_payload(user, from_date, to_date))
+    """Dates are whole IST days (YYYY-MM-DD); an older app's ISO instant
+    counts as the IST day it falls on."""
+    return APIResponse(data=await _pnl_payload(user, *tradebook_builder.window(from_date, to_date)))
 
 
 @router.get("/tradebook", response_model=APIResponse[list])
@@ -271,7 +273,7 @@ async def tradebook(
     user: CurrentUser,
     from_date: str | None = None,
     to_date: str | None = None,
-    limit: int = Query(default=500, le=2000),
+    limit: int = Query(default=500, ge=1, le=2000),
 ):
     """The Trade Book: one row per fill, newest first. Dates are whole IST
     days (YYYY-MM-DD)."""
@@ -282,10 +284,10 @@ async def tradebook(
 @router.get("/brokerage", response_model=APIResponse[dict])
 async def brokerage_summary(
     user: CurrentUser,
-    from_date: datetime | None = None,
-    to_date: datetime | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
 ):
-    return APIResponse(data=await _brokerage_payload(user, from_date, to_date))
+    return APIResponse(data=await _brokerage_payload(user, *tradebook_builder.window(from_date, to_date)))
 
 
 @router.get("/tax", response_model=APIResponse[dict])
@@ -298,6 +300,20 @@ async def margin_report(user: CurrentUser):
     from app.services import wallet_service
     s = await wallet_service.summary(user.id)
     return APIResponse(data=s)
+
+
+def _client_window(from_date: str | None, to_date: str | None) -> tuple[datetime | None, datetime | None]:
+    """The client's document window: whole IST days, at most a month. No end
+    → today; no start → the 30 days before the end (an open end was no bound:
+    lifetime rendered every fill)."""
+    lo, hi = tradebook_builder.window(from_date, to_date or str(now_ist().date()))
+    assert hi is not None
+    if lo is None:
+        lo, _ = tradebook_builder.window(str(to_ist(hi).date() - timedelta(days=30)), None)
+    # Whole days: 1 Jul → 1 Aug is 31 days and 23:59:59.999, so `.days` is 31.
+    if lo is not None and (hi - lo).days > 31:
+        raise HTTPException(status_code=400, detail="Maximum date range is 1 month")
+    return lo, hi
 
 
 # ── PDF endpoints ────────────────────────────────────────────────────
@@ -326,10 +342,10 @@ def _pdf_response(data: bytes, filename: str) -> StreamingResponse:
 @router.get("/pnl/pdf")
 async def pnl_report_pdf(
     user: CurrentUser,
-    from_date: datetime | None = None,
-    to_date: datetime | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
 ):
-    payload = await _pnl_payload(user, from_date, to_date)
+    payload = await _pnl_payload(user, *tradebook_builder.window(from_date, to_date))
     pdf = await asyncio.to_thread(report_pdf_service.build_pnl_pdf, user, payload)
     stamp = datetime.now().strftime("%Y%m%d")
     return _pdf_response(pdf, f"{_brand_slug()}_pnl_{stamp}.pdf")
@@ -341,9 +357,11 @@ async def tradebook_pdf(
     from_date: str | None = None,
     to_date: str | None = None,
     # None → every fill in the window: a cut-off book printed no notice.
-    limit: int | None = Query(default=None, le=2000),
+    limit: int | None = Query(default=None, ge=1, le=2000),
 ):
-    lo, hi = tradebook_builder.window(from_date, to_date)
+    """The client's Trade Book. Same window as the Billing statement: none →
+    the last 30 days, at most a month (lifetime rendered every fill)."""
+    lo, hi = _client_window(from_date, to_date)
     rows = await tradebook_builder.trade_rows(user.id, lo, hi, limit)
     pdf = await asyncio.to_thread(report_pdf_service.build_tradebook_pdf, user, rows)
     stamp = now_ist().strftime("%Y%m%d")
@@ -353,10 +371,10 @@ async def tradebook_pdf(
 @router.get("/brokerage/pdf")
 async def brokerage_pdf(
     user: CurrentUser,
-    from_date: datetime | None = None,
-    to_date: datetime | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
 ):
-    payload = await _brokerage_payload(user, from_date, to_date)
+    payload = await _brokerage_payload(user, *tradebook_builder.window(from_date, to_date))
     pdf = await asyncio.to_thread(report_pdf_service.build_brokerage_pdf, user, payload)
     stamp = datetime.now().strftime("%Y%m%d")
     return _pdf_response(pdf, f"{_brand_slug()}_brokerage_{stamp}.pdf")
@@ -392,17 +410,10 @@ async def tradebook_full_pdf(
 ):
     """The client's own Billing statement. Dates are whole IST days
     (YYYY-MM-DD); none → the last 30 days; at most a month."""
-    lo, hi = tradebook_builder.window(from_date, to_date)
-    if lo is None and hi is None:
-        today = now_ist().date()
-        lo, hi = tradebook_builder.window(str(today - timedelta(days=30)), str(today))
-    # Whole days: 1 Jul → 1 Aug is 31 days and 23:59:59.999, so `.days` is 31.
-    if lo and hi and (hi - lo).days > 31:
-        raise HTTPException(status_code=400, detail="Maximum date range is 1 month")
-
+    lo, hi = _client_window(from_date, to_date)
     payload = await tradebook_builder.statement_payload(user, lo, hi)
     pdf_bytes = await asyncio.to_thread(report_pdf_service.build_full_tradebook_pdf, user, payload)
     stamp = now_ist().strftime("%Y%m%d")
     name = (getattr(user, "full_name", "") or "").strip().replace(" ", "_")
     code = getattr(user, "user_code", "") or "user"
-    return _pdf_response(pdf_bytes, f"tradebook_{name}_{code}_{stamp}.pdf")
+    return _pdf_response(pdf_bytes, f"billing_{name}_{code}_{stamp}.pdf")

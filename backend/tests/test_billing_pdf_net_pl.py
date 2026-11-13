@@ -47,6 +47,7 @@ NIFTY = InstrumentRef(
 )
 GOLD = InstrumentRef(token="TGLD1", symbol="GOLD26DECFUT", exchange=Exchange.MCX, segment="MCX_FUTURE")
 EURUSD = InstrumentRef(token="TEUR1", symbol="EURUSD", exchange=Exchange.CRYPTO, segment="FOREX")
+BTCUSD = InstrumentRef(token="TBTC1", symbol="BTCUSD", exchange=Exchange.CRYPTO, segment="CRYPTO_SPOT")
 TRADES_HEAD = [
     "Ticket Id", "Script", "Qty", "Buy Rate", "Sell Rate", "Buy Time", "Sell Time",
     "Brokerage", "Gross PL", "Net PL", "Comment",
@@ -120,6 +121,11 @@ def _check_tables(doc: SimpleDocTemplate, flowables: list) -> None:
         assert sum(t._argW) == pytest.approx(doc.width)
 
 
+def _cells(t: Table) -> list[Paragraph]:
+    return [p for r in t._cellvalues for c in r for p in (c if isinstance(c, (list, tuple)) else [c])
+            if isinstance(p, Paragraph)]  # fmt: skip
+
+
 def _sections(flowables: list) -> dict[str, list[list[str]]]:
     """Heading → the text of the table under it ([] when it has none)."""
     out: dict[str, list[list[str]]] = {}
@@ -164,10 +170,11 @@ async def _book(w) -> str:
 async def bill(w):
     """The client's own Billing PDF for today, as ReportLab was handed it."""
     day = await _book(w)
-    await user_reports.tradebook_full_pdf(user=w.c, from_date=day, to_date=day)
+    resp = await user_reports.tradebook_full_pdf(user=w.c, from_date=day, to_date=day)
     [(doc, flowables)] = w.docs
     lo, hi = tradebook_builder.window(day, day)
     return SimpleNamespace(
+        disposition=resp.headers["content-disposition"],
         doc=doc,
         flowables=flowables,
         s=_sections(flowables),
@@ -197,6 +204,12 @@ async def test_the_sections_come_in_the_operators_order_and_every_table_fits(bil
         "All Segments",
         "Financial Standings",
     ]
+    # The Billing statement says so: it was headed "Trade Book", the per-fill
+    # document's name, and saved as tradebook_*.pdf.
+    assert bill.doc.title == "Billing Statement"
+    heads = [f.getPlainText() for f in bill.flowables if isinstance(f, Table) for f in _cells(f)]
+    assert "Billing Statement" in heads and "Trade Book" not in heads
+    assert bill.disposition.startswith('attachment; filename="billing_')
     # The account line is escaped too (an unclosed "<Traders>" 500'd the PDF).
     assert any(isinstance(f, Paragraph) and "A&B <Traders>" in f.getPlainText() for f in bill.flowables)
 
@@ -237,10 +250,14 @@ async def test_one_trade_a_line_with_gross_and_net_per_exchange(bill):
         gross_all += g
     assert gross_all == bill.fin["gross_pnl"]
 
-    # Rates at the market's precision (2 dp printed 1.09), fractional units kept.
+    # Rates at the market's precision (2 dp printed 1.09), fractional units
+    # kept; a USD rate says so beside Gross / Net in rupees.
     crypto = bill.s["CRYPTO Trades List"][1:-1]
     eur = [(r[col["Qty"]], r[col["Buy Rate"]], r[col["Sell Rate"]]) for r in crypto]
-    assert eur == [("0.5", "1.086667", "1.10"), ("1", "1.086667", "1.10")]
+    assert eur == [("0.5", "$1.086667", "$1.10"), ("1", "$1.086667", "$1.10")]
+    sw_head, *sw = bill.s["Script-wise P&L"]
+    [eur_sw] = [r for r in sw if r[sw_head.index("Script")] == "EURUSD"]
+    assert [eur_sw[sw_head.index(h)] for h in ("Avg Buy", "Sell Turnover")] == ["$1.086667", "$1.65"]
 
 
 async def test_script_wise_averages_are_turnover_weighted(bill):
@@ -292,6 +309,8 @@ async def test_all_segments_is_financial_standings_is_the_ledger(w, bill):
 
 
 async def test_the_trade_book_and_pnl_pdfs_keep_fractions_and_precision(w):
+    await market(w.c, "SELL", 0.25, "61000", instrument=BTCUSD)
+    await later(w.db, seconds=5)
     await market(w.c, "BUY", 0.05, "1.08345", instrument=EURUSD)
     await later(w.db, seconds=5)
     await market(w.c, "BUY", 1500, "200", instrument=MM)
@@ -305,8 +324,12 @@ async def test_the_trade_book_and_pnl_pdfs_keep_fractions_and_precision(w):
     _check_tables(pnl_doc, pnl)
 
     [[head, *rows]] = _tables(tb, 8)
-    got = [(r[head.index("Symbol")], r[head.index("Qty")], r[head.index("Price")]) for r in rows]
-    assert got == [("M&M", "1,500", "200.00"), ("EURUSD", "0.05", "1.08")]  # Qty printed 0
+    got = [tuple(r[head.index(h)] for h in ("Symbol", "Qty", "Price", "Value")) for r in rows]
+    assert got == [
+        ("M&M", "1,500", "200.00", "₹300,000.00"),
+        ("EURUSD", "0.05", "$1.08", "$0.05"),  # Qty printed 0
+        ("BTCUSD", "0.25", "$61,000.00", "$15,250.00"),  # a dollar notional printed ₹15,250.00
+    ]
     # The engine fills at 2 dp today; a finer price prints in full.
     assert report_pdf_service._fmt_rate("1.08345", "CRYPTO") == "1.08345"
     assert report_pdf_service._fmt_rate(1.0834512, "CDS") == "1.083451"
@@ -316,6 +339,33 @@ async def test_the_trade_book_and_pnl_pdfs_keep_fractions_and_precision(w):
     assert by_symbol[0][-1] == "P&L"  # printed "P&L;"
     assert by_symbol[1][:3] == ["M&M", "0.05", "1,500"]
     assert any(isinstance(f, Paragraph) and f.getPlainText() == "Tax P&L (simplified)" for f in tax)
+
+
+async def test_the_printed_rows_add_up_to_the_printed_totals(w):
+    """A close FIFO-split over three lots printed Gross 40.38 three times
+    (121.14) under a Totals line, All Segments and Financial Standings of
+    121.15 — what the wallet booked. Each row is cut to the paisa with the
+    rounding carried forward, and every total is the sum of the rows."""
+    for px in ("1000", "1010", "1020.50"):
+        await market(w.c, "BUY", 1, px, instrument=MM)
+    await market(w.c, "SELL", 3, "1050.55", instrument=MM)  # books 121.15 off the 1010.166667 average
+    day = to_ist(now_utc()).date().isoformat()
+    await user_reports.tradebook_full_pdf(user=w.c, from_date=day, to_date=day)
+    [(doc, flowables)] = w.docs
+    _check_tables(doc, flowables)
+    s = _sections(flowables)
+    col = {h: i for i, h in enumerate(TRADES_HEAD)}
+    rows, totals = s["NSE Trades List"][1:-1], s["NSE Trades List"][-1]
+    assert len(rows) == 3
+    for h in ("Brokerage", "Gross PL", "Net PL"):
+        assert sum((_d(r[col[h]]) for r in rows), Decimal(0)) == _d(totals[col[h]]), h
+    seg_head, *seg = s["All Segments"]
+    fin = w.got["payload"]["financial"]
+    for h, k in (("Gross PL", "gross_pnl"), ("Brokerage", "brokerage"), ("Net PL", "net_pnl")):
+        assert _d(totals[col[h]]) == _d(seg[-1][seg_head.index(h)]) == Decimal(str(fin[k])), h
+    pnl = {"user_id": w.c.id, "transaction_type": TransactionType.PNL.value}
+    booked = sum((b.amount.to_decimal() for b in await WalletTransaction.find(pnl).to_list()), Decimal(0))
+    assert _d(totals[col["Gross PL"]]) == booked == Decimal("121.15")
 
 
 def test_script_wise_skips_blank_times():
