@@ -21,6 +21,7 @@ blotter gross.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -39,7 +40,8 @@ from app.models.position import Position
 from app.models.trade import Trade
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
-from app.services import market_data_service, position_service
+from app.services import market_data_service, position_service, tradebook_builder
+from app.utils.time_utils import now_utc, to_ist
 from tests._real_fill import INSTRUMENT, later, market, set_commission_per_lot
 
 _DB = f"{settings.MONGODB_DB_NAME}_test_reopened_close_leaves_the_walk"
@@ -183,6 +185,32 @@ async def test_a_close_flagged_before_the_stamp_is_still_walked(w):
     [row] = b.rows
     assert (row["qty"], row["gross_pnl"], row["brokerage"]) == (10.0, 300.0, 10.0), _show(b)
     assert not await _paired_with(row, f.opened), _show(b)
+
+
+async def test_a_legacy_reopen_carries_forward_the_units_it_held(w):
+    # The flag-only close took the lot, so the walk held nothing for the
+    # restored units: Carry Forward fell back to today's quantity (0 once
+    # the re-close came) while the next day's Brought Forward read the peak.
+    await market(w.c, "BUY", 10, "100")
+    await _later(w, minutes=1)
+    await market(w.c, "SELL", 10, "110")
+    await _later(w, minutes=10)
+    await _reopen(w)
+    await Trade.get_motor_collection().update_many({}, {"$unset": {"superseded_at": ""}})
+    await _later(w, minutes=2 * 24 * 60)  # held over two IST midnights
+    await market(w.c, "SELL", 10, "130")
+
+    async def on(days_ago: int) -> dict:
+        day = to_ist(now_utc() - timedelta(days=days_ago)).date().isoformat()
+        return await tradebook_builder.statement_payload(w.c, *tradebook_builder.window(day, day))
+
+    def book(rows) -> list:
+        return [(r["side"], r["qty"], r["price"]) for r in rows]
+
+    d2, d1, d0 = await on(2), await on(1), await on(0)
+    assert book(d2["carry_forward"]) == [("BUY", 10, 100)]  # was 0 units
+    assert book(d1["brought_forward"]) == book(d1["carry_forward"]) == book(d2["carry_forward"])
+    assert book(d0["brought_forward"]) == book(d1["carry_forward"])
 
 
 async def test_a_reopen_after_a_later_round_trip_keeps_the_legacy_flag(w):

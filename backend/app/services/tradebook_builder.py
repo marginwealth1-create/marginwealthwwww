@@ -173,6 +173,13 @@ def _held(p: Position, at: datetime) -> bool:
     return p.status == PositionStatus.OPEN if closed is None else closed > at
 
 
+def _units(p: Position) -> Decimal:
+    """BF/CF's units when the walk holds no lot for `p` (one fallback for
+    both, so this week's BF is last week's CF): the quantity, kept on a
+    settlement close and on an open position, else the peak a close zeroed."""
+    return abs(to_decimal(p.quantity or 0)) or abs(to_decimal(p.opening_quantity or 0))
+
+
 def _deal(
     p: Position, book: list[dict[str, Any]], fallback: Decimal
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -448,16 +455,15 @@ async def statement_payload(
             uid, skip=0, limit=1, lots=bf_lots, until=day_one
         )
         for p in positions:
-            peak = abs(to_decimal(p.opening_quantity or 0)) or abs(to_decimal(p.quantity or 0))
-            if peak and _held(p, day_one):
-                brought_forward.append(_deal(p, bf_lots, peak)[0])
+            if _units(p) and _held(p, day_one):
+                brought_forward.append(_deal(p, bf_lots, _units(p))[0])
 
     hi = _naive(to_date)
     carry_forward: list[dict[str, Any]] = []
     for p in positions:
         if not (p.status == PositionStatus.OPEN if hi is None else _held(p, hi)):
             continue
-        row, mine = _deal(p, lots, abs(to_decimal(p.quantity)))
+        row, mine = _deal(p, lots, _units(p))
         # The opening legs of those units charged inside the window.
         commission = sum(
             (
