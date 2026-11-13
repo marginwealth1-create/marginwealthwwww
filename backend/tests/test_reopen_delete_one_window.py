@@ -253,6 +253,24 @@ async def test_a_double_delete_refunds_once(w):
     assert await Position.get(p.id) is None
 
 
+async def test_a_loss_closed_in_two_parts_is_refunded_in_full(w):
+    # The shortfall was |whole realized| − |nearest PNL row|, so the earlier
+    # partial's loss read as a settlement shortfall: a phantom RECOVERY row
+    # and the client ₹50 short in cash.
+    async def cash() -> Decimal:
+        return Decimal(str((await Wallet.find_one(Wallet.user_id == w.c.id)).available_balance))
+
+    start = await cash()
+    await market(w.c, "BUY", 10, "100")
+    await market(w.c, "SELL", 5, "90")  # -50
+    await market(w.c, "SELL", 5, "80")  # -100
+    await _later(w, minutes=10)
+
+    await trading.delete_position(str((await _only(w.c)).id), w.sa, None)
+    assert await _rows(w.c, TransactionType.SETTLEMENT_OUTSTANDING_RECOVERY) == []
+    assert await cash() == start
+
+
 async def _closed_row(w, p: Position) -> dict:
     rows = (
         await trading.list_positions(

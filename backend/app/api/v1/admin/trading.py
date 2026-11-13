@@ -3038,34 +3038,41 @@ async def delete_position(
         # reversed the FULL ₹1,13,900 → ₹38,574 phantom cash + settlement never
         # cleared, because the old symbol-in-narration BOOKED scan missed it.
         #
-        # PRIMARY (reliable): derive booked_total from the close's own PNL
-        # ledger row — its amount IS the true available debit, so
-        #   booked_total = |realized| − |pnl_row_amount|.
-        # The PNL row always names the symbol ("Realized loss on {symbol}
-        # close"), so this resolves even when the separate BOOKED row's
-        # narration/window doesn't. FALLBACK: scan the explicit BOOKED rows.
+        # PRIMARY (reliable): derive booked_total per close from its own PNL
+        # ledger row (reference_id = the close's order id) — its amount IS the
+        # true available debit, so a close's shortfall is
+        #   |raw loss of the close| − |its PNL row amounts|.
+        # Comparing the WHOLE realized with only the nearest row (the old
+        # rule) read every earlier partial close of a loss as a shortfall: a
+        # phantom RECOVERY row and the client short in cash.
+        # FALLBACK: scan the explicit BOOKED rows.
         booked_total = _Decimal("0")
         if p.closed_at is not None:
             lo = p.closed_at - _td_delta(seconds=90)
             hi = p.closed_at + _td_delta(seconds=90)
             sym = p.instrument.symbol
-            # (1) Derive from the close's PNL row = the actual available debit.
+            # (1) Per close: raw loss vs the PNL row it actually debited.
             try:
+                raw_by_order: dict[str, _Decimal] = {}
+                for t in _live:
+                    if t.pnl_inr is not None:
+                        k = str(t.order_id)
+                        raw_by_order[k] = (
+                            raw_by_order.get(k, _Decimal("0")) + to_decimal(t.pnl_inr) + _charges([t])
+                        )
                 pnl_rows = await _WT.find(
                     _WT.user_id == p.user_id,
                     _WT.transaction_type == TransactionType.PNL,
-                    _WT.created_at >= lo,
-                    _WT.created_at <= hi,
+                    {"reference_id": {"$in": list(raw_by_order)}},
                 ).to_list()
-                cand = [r for r in pnl_rows if sym in (r.narration or "")]
-                if cand and realized < _Decimal("0"):
-                    cand.sort(
-                        key=lambda r: abs((r.created_at - p.closed_at).total_seconds())
+                debit_by_order: dict[str, _Decimal] = {}
+                for r in pnl_rows:
+                    debit_by_order[r.reference_id] = (
+                        debit_by_order.get(r.reference_id, _Decimal("0")) + abs(to_decimal(r.amount or 0))
                     )
-                    actual_debit = abs(to_decimal(cand[0].amount or 0))
-                    derived = abs(realized) - actual_debit
-                    if derived > _Decimal("0"):
-                        booked_total = derived
+                for k, raw in raw_by_order.items():
+                    if raw < 0 and k in debit_by_order:
+                        booked_total += max(_Decimal("0"), abs(raw) - debit_by_order[k])
             except Exception:
                 booked_total = _Decimal("0")
             # (2) Fallback: explicit BOOKED rows scanned by symbol + window.
