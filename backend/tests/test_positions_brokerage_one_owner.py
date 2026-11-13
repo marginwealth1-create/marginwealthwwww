@@ -34,7 +34,7 @@ from app.models.trade import LIVE_FILL, Trade
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.services import accounts_dashboard_service as ads
-from app.services import tradebook_builder
+from app.services import position_service, tradebook_builder
 from app.utils.decimal_utils import to_decimal
 from app.utils.time_utils import now_utc
 from tests._real_fill import INSTRUMENT, later, market, set_commission_per_lot
@@ -156,3 +156,22 @@ async def test_every_fill_is_billed_on_one_row(w):
     mine = {ids[d["id"]]: Decimal(d["charges"]) for d in (await positions_api.open_positions(w.c)).data}
     assert mine == {"carried": 10, "m3": 4}
     assert (await Position.get(pos["m3"].id)).status == PositionStatus.OPEN
+
+
+async def test_the_legs_dialog_and_the_fill_window_read_the_one_owner(w):
+    """The row's netting dialog and position_fills_query (the fills a delete,
+    reopen or edit of the row reaches) list exactly the fills the row bills:
+    the carried NRML row its own MIS-stamped opening fill and none of the MIS
+    round trips, the reopened row none of its neighbour's legs."""
+    pos = await _scalper_day(w)
+    rows = {k: await Position.get(p.id) for k, p in pos.items()}  # m3 was reopened since
+    owned = await position_service.own_fills(list(rows.values()))
+    assert len(owned[rows["carried"].id]) == 1
+    for k, p in rows.items():
+        mine = owned[p.id]
+        legs = (await trading.position_netting_entries(str(p.id), w.a1, None)).data["entries"]
+        got = [(e["executed_at"], e["side"], e["volume"]) for e in legs]
+        want = [(t.executed_at.isoformat(), t.action.value, float(t.quantity)) for t in mine]
+        assert got == want, k
+        q = await position_service.position_fills_query(p)
+        assert {t.id for t in await Trade.find({**q, **LIVE_FILL}).to_list()} == {t.id for t in mine}, k

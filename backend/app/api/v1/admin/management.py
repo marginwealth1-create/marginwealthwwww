@@ -505,7 +505,6 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
     )
     from app.models.user import UserStatus
     from app.models.wallet import Wallet
-    from app.services import market_data_service
     from app.utils.decimal_utils import to_decimal
 
     sa = await mgmt._get_sub_admin_or_404(sub_admin_id)
@@ -515,9 +514,9 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
 
     # Resolve the trading-client pool comprehensively (directly-assigned +
     # whole broker subtree), broker/sub-broker LOGIN rows excluded. All
-    # statuses are kept here so wallet / all-time PNL / trade rollups still
-    # cover closed users' history (the Today / This week cards read the
-    # Accounts pool); the counts below split active vs non-closed.
+    # statuses are kept here so wallet / trade rollups still cover closed
+    # users' history (the realised P&L cards read the Accounts pool); the
+    # counts below split active vs non-closed.
     coll = User.get_motor_collection()
     clause = await _admin_pool_clause(sa.id)
     cursor = coll.find(
@@ -600,37 +599,16 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
         # only moves on an admin manual BROKERAGE entry.
         wallet_sum["total_brokerage"] += to_decimal(w.total_brokerage) + to_decimal(w.total_charges)
 
-    # All-time realised (positions closed). Reuses the USD-quoted
-    # FX-conversion pattern from /admin/users/{id}/live-trade-stats.
-    fallback_usd_inr = to_decimal(market_data_service.get_usd_inr_rate())
-
-    def _is_usd(p) -> bool:
-        return market_data_service.position_is_usd(p)
-
-    def _realised_inr(p) -> _D:
-        raw = to_decimal(p.realized_pnl)
-        if not _is_usd(p):
-            return raw
-        rate = (
-            to_decimal(p.open_usd_inr_rate)
-            if p.open_usd_inr_rate is not None
-            else fallback_usd_inr
-        )
-        return raw * rate
-
-    # Today / This week realised: the Billing statement Gross PnL
-    # (tradebook_builder.booked) of the admin's Accounts-dashboard pool —
-    # demo and CLOSED clients out — every close in the window at what the
-    # wallet booked, settlements included, undone fills out; a partial close
-    # of a position still open counts.
+    # Today / This week / All-time realised: the Billing statement Gross PnL
+    # (tradebook_builder.booked; all-time = no window) of the admin's
+    # Accounts-dashboard pool — demo and CLOSED clients out — every close in
+    # the window at what the wallet booked, settlements included, undone fills
+    # out; a partial close of a position still open counts.
     pnl_pool = await _entity_pool_ids(sa.id, _UR.ADMIN.value)
-    today_realised, week_realised = [
-        (await client_totals_for_users(pnl_pool, *windows[k]))["net_client_pnl"] for k in ("today", "week")
+    today_realised, week_realised, all_time_realised = [
+        (await client_totals_for_users(pnl_pool, *w))["net_client_pnl"]
+        for w in (windows["today"], windows["week"], (None, None))
     ]
-    all_closed = await Position.find(
-        {**user_q, "status": PositionStatus.CLOSED.value}
-    ).to_list()
-    all_time_realised = sum((_realised_inr(p) for p in all_closed), _D("0"))
 
     # Open unrealised — sum of stored unrealized_pnl on currently OPEN positions
     open_positions = await Position.find(

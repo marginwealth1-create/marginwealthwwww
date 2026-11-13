@@ -1318,7 +1318,7 @@ async def live_trade_stats(
                            Users list's Weekly PnL
       • weekly_trades    — positions closed this IST week
                            (also split into wins / losses)
-      • closed_pnl_all   — realised P&L lifetime
+      • closed_pnl_all_time — lifetime Billing statement Gross P&L
       • all_time_trades  — closed-position count lifetime
       • open_positions   — list of currently-open positions (symbol,
                            qty, avg, ltp, floating P&L per row)
@@ -1382,9 +1382,13 @@ async def live_trade_stats(
     ).to_list()
 
     weekly_net = await tradebook_builder.net([target.id], week_start, week_end)
+    # The lifetime statement's Gross: a partial close of a position still open,
+    # settlements and the rate each close booked at in; undone fills out.
+    all_realised, _ = (await tradebook_builder.booked([target.id], None, None)).get(
+        target.id, (Decimal(0), Decimal(0))
+    )
     weekly_wins = sum(1 for p in weekly_closed if _realised_inr(p) > 0)
     weekly_losses = sum(1 for p in weekly_closed if _realised_inr(p) < 0)
-    all_realised = sum(_realised_inr(p) for p in all_closed)
     all_wins = sum(1 for p in all_closed if _realised_inr(p) > 0)
     all_losses = sum(1 for p in all_closed if _realised_inr(p) < 0)
 
@@ -1519,7 +1523,7 @@ async def live_trade_stats(
             "weekly_trades": len(weekly_closed),
             "weekly_wins": weekly_wins,
             "weekly_losses": weekly_losses,
-            "closed_pnl_all_time": round(all_realised, 2),
+            "closed_pnl_all_time": float(all_realised),
             "all_time_trades": len(all_closed),
             "all_time_wins": all_wins,
             "all_time_losses": all_losses,

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, time as dtime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,7 @@ from app.core.dependencies import CurrentAdmin, require_perm, scoped_user_ids
 from app.models.transaction import CASH_TYPES, SYSTEM_ADJUSTMENT_PATTERNS, TransactionType, WalletTransaction
 from app.models.user import User, UserRole
 from app.schemas.common import APIResponse
+from app.utils.decimal_utils import quantize_money, to_decimal
 
 router = APIRouter(prefix="/money-transactions", tags=["admin-money-transactions"])
 
@@ -101,12 +103,9 @@ def _date_match(from_utc: datetime | None, to_utc: datetime | None) -> dict:
     return {"created_at": rng}
 
 
-def _abs(x: float) -> float:
-    return abs(round(float(x or 0.0), 2))
-
-
-def _pos(x: float) -> float:
-    return round(float(x or 0.0), 2)
+def _paise(x: object) -> Decimal:
+    """A $sum of Decimal128 amounts (an int 0 when nothing matched), in paise."""
+    return quantize_money(to_decimal(x))
 
 
 def _empty_user_totals() -> dict[str, float]:
@@ -135,7 +134,7 @@ async def money_by_user(
         "status": "COMPLETED",
         **_date_match(from_utc, to_utc),
     }
-    amt = {"$toDouble": "$amount"}
+    amt = "$amount"  # Decimal128: $sum adds decimals exactly
     # System-generated ADJUSTMENT corrections to exclude from add_fund /
     # deduct. ADJUSTMENT is overloaded: operator-driven Add/Deduct
     # Fund + a few automatic recovery entries (initial-balance credit
@@ -172,7 +171,7 @@ async def money_by_user(
         },
     ]
 
-    raw: dict[str, dict[str, float]] = {}
+    raw: dict[str, dict[str, Any]] = {}
     async for row in WalletTransaction.get_motor_collection().aggregate(pipeline):
         raw[str(row["_id"])] = row
 
@@ -198,17 +197,15 @@ async def money_by_user(
         return "Direct", ""
 
     users: list[dict[str, Any]] = []
-    tot = _empty_user_totals()
+    tot = dict.fromkeys(_empty_user_totals(), Decimal(0))
     for uid, g in raw.items():
-        deposit = _pos(g.get("deposit", 0))
-        add_fund = _pos(g.get("add_fund", 0))
-        withdraw = _abs(g.get("withdraw", 0))
-        deduct = _abs(g.get("deduct", 0))
-        settled = _abs(g.get("settled", 0))
-        total_in = round(deposit + add_fund, 2)
-        total_out = round(withdraw + deduct, 2)
+        v = {k: _paise(g.get(k)) for k in ("deposit", "add_fund")}
+        v |= {k: abs(_paise(g.get(k))) for k in ("withdraw", "deduct", "settled")}
+        v["total_in"] = v["deposit"] + v["add_fund"]
+        v["total_out"] = v["withdraw"] + v["deduct"]
+        v["net"] = v["total_in"] - v["total_out"]
         # Drop phantom rows — nothing actually moved this window.
-        if total_in == 0 and total_out == 0 and settled == 0:
+        if not (v["total_in"] or v["total_out"] or v["settled"]):
             continue
         u = udocs.get(uid)
         owner_kind, owner_name = _owner(u) if u else ("Direct", "")
@@ -218,26 +215,14 @@ async def money_by_user(
             "full_name": (u.full_name if u else None) or "—",
             "owner_kind": owner_kind,
             "owner_name": owner_name,
-            "deposit": deposit,
-            "add_fund": add_fund,
-            "withdraw": withdraw,
-            "deduct": deduct,
-            "settled": settled,
-            "total_in": total_in,
-            "total_out": total_out,
-            "net": round(total_in - total_out, 2),
+            **{k: float(x) for k, x in v.items()},
         })
-        tot["deposit"] = round(tot["deposit"] + deposit, 2)
-        tot["add_fund"] = round(tot["add_fund"] + add_fund, 2)
-        tot["withdraw"] = round(tot["withdraw"] + withdraw, 2)
-        tot["deduct"] = round(tot["deduct"] + deduct, 2)
-        tot["settled"] = round(tot["settled"] + settled, 2)
-        tot["total_in"] = round(tot["total_in"] + total_in, 2)
-        tot["total_out"] = round(tot["total_out"] + total_out, 2)
-    tot["net"] = round(tot["total_in"] - tot["total_out"], 2)
+        for k, x in v.items():
+            tot[k] += x
 
     users.sort(key=lambda r: r["total_in"], reverse=True)
-    return APIResponse(data={"totals": tot, "users": users, "filter": {"label": label}})
+    totals = {k: float(x) for k, x in tot.items()}
+    return APIResponse(data={"totals": totals, "users": users, "filter": {"label": label}})
 
 
 # ── BROKERS view ──────────────────────────────────────────────────────────
@@ -277,7 +262,7 @@ async def money_by_broker(
         "status": "COMPLETED",
         **_date_match(from_utc, to_utc),
     }
-    amt = {"$toDouble": "$amount"}
+    amt = "$amount"  # Decimal128: $sum adds decimals exactly
     # Same system-correction filter as the per-user aggregation above —
     # excludes initial-balance credits, bogus-fill reversal credits,
     # and any future "Reversal trade=" recovery entry. Keeps admin
@@ -295,9 +280,8 @@ async def money_by_broker(
             {"$not": _is_system_adj_byb},
         ]
     }
-    dep_by_client: dict[str, float] = {}
-    add_fund_total = 0.0
-    total_deposit = 0.0
+    dep_by_client: dict[str, Decimal] = {}
+    add_fund_total = total_deposit = Decimal(0)
     async for row in WalletTransaction.get_motor_collection().aggregate([
         {"$match": dmatch},
         {"$group": {
@@ -306,10 +290,10 @@ async def money_by_broker(
             "add_fund": {"$sum": {"$cond": [{"$and": [_is_operator_adj_byb, {"$gt": [amt, 0]}]}, amt, 0]}},
         }},
     ]):
-        dep = _pos(row.get("deposit", 0))
+        dep = _paise(row.get("deposit"))
         dep_by_client[str(row["_id"])] = dep
-        total_deposit = round(total_deposit + dep, 2)
-        add_fund_total = round(add_fund_total + _pos(row.get("add_fund", 0)), 2)
+        total_deposit += dep
+        add_fund_total += _paise(row.get("add_fund"))
 
     # Brokers referenced by the in-scope clients (ancestry / direct).
     broker_id_set: set[PydanticObjectId] = set()
@@ -330,16 +314,15 @@ async def money_by_broker(
             {"_id": {"$in": list(broker_id_set)}, "role": UserRole.BROKER.value}
         ).to_list()
         for b in bdocs:
-            subtree_dep = 0.0
-            direct_dep = 0.0
+            subtree_dep = direct_dep = Decimal(0)
             subtree_users = 0
             for c in clients:
                 cid = str(c["_id"])
                 if b.id in (c.get("broker_ancestry") or []):
                     subtree_users += 1
-                    subtree_dep = round(subtree_dep + dep_by_client.get(cid, 0.0), 2)
+                    subtree_dep += dep_by_client.get(cid, Decimal(0))
                 if c.get("assigned_broker_id") == b.id:
-                    direct_dep = round(direct_dep + dep_by_client.get(cid, 0.0), 2)
+                    direct_dep += dep_by_client.get(cid, Decimal(0))
             parent = b.broker_ancestry or []
             brokers_out.append({
                 "broker_id": str(b.id),
@@ -347,16 +330,16 @@ async def money_by_broker(
                 "full_name": b.full_name or b.user_code,
                 "is_sub": bool(parent),
                 "parent_broker_id": str(parent[-1]) if parent else None,
-                "deposit": subtree_dep,
-                "deposit_direct": direct_dep,
+                "deposit": float(subtree_dep),
+                "deposit_direct": float(direct_dep),
                 "users_count": subtree_users,
             })
         brokers_out.sort(key=lambda r: r["deposit"], reverse=True)
 
     return APIResponse(data={
         "totals": {
-            "total_deposit": total_deposit,
-            "admin_add_fund": add_fund_total,
+            "total_deposit": float(total_deposit),
+            "admin_add_fund": float(add_fund_total),
             "brokers": len(brokers_out),
             "users_under_brokers": users_under_brokers,
         },

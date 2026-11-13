@@ -1024,75 +1024,12 @@ async def list_closed_trade_events(
     return events[:limit]
 
 
-async def fill_products(p: Position, lo: datetime, hi: datetime) -> list[str]:
-    """Product books whose fills belong to `p` over [lo, hi]. A carried
-    position was opened as MIS and flipped to NRML at the EOD rollover, so its
-    opening (and pre-rollover partial-close) fills are MIS while the doc says
-    NRML — count those too, unless a separate MIS position on the same token
-    overlaps the window (then they're that position's fills)."""
-    products = [p.product_type.value]
-    if p.product_type == ProductType.NRML:
-        other = await Position.find_one(
-            {
-                "_id": {"$ne": p.id},
-                "user_id": p.user_id,
-                "instrument.token": p.instrument.token,
-                "product_type": ProductType.MIS.value,
-                "opened_at": {"$lte": hi},
-                "$or": [{"closed_at": None}, {"closed_at": {"$gte": lo}}],
-            }
-        )
-        if other is None:
-            products.append(ProductType.MIS.value)
-    return products
-
-
 async def position_fills_query(p: Position) -> dict[str, Any]:
-    """The fills that are `p`'s: its token and products over
-    [opened_at − 5s, (closed_at or now) + 3s]. A reopen keeps the first
-    opened_at, so that span can hold whole other positions on the key (one
-    opened and closed between the close and the reopen, a weekly predecessor)
-    — their fills are theirs, and stay out."""
-    end = p.closed_at or now_utc()
-    lo = (p.opened_at or end) - timedelta(seconds=5)
-    hi = end + timedelta(seconds=3)
-    products = await fill_products(p, lo, end)
-    others = await Position.find(
-        {
-            "_id": {"$ne": p.id},
-            "user_id": p.user_id,
-            "instrument.token": p.instrument.token,
-            "product_type": {"$in": products},
-            "opened_at": {"$lte": hi},
-            "$or": [{"closed_at": None}, {"closed_at": {"$gte": lo}}],
-        }
-    ).to_list()
-    q: dict[str, Any] = {
-        "user_id": p.user_id,
-        "instrument.token": p.instrument.token,
-        "product_type": {"$in": products},
-        "executed_at": {"$gte": lo, "$lte": hi},
-    }
-    # ponytail: time spans, not ownership — a fill of `p` within 2s before
-    # another position opened is ceded to it. A Trade→Position link (§7.1)
-    # makes this exact. Another position's span leaves out the gaps it sat
-    # closed in (`p` may have traded in one).
-    spans = [
-        {
-            "executed_at": {"$gte": o.opened_at - timedelta(seconds=2), "$lte": o.closed_at or hi},
-            **({"$nor": reopen_gap_clauses(o)} if o.reopen_gaps else {}),
-        }
-        for o in others
-        if o.opened_at
-    ] + reopen_gap_clauses(p)
-    if spans:
-        q["$nor"] = spans
-    return q
-
-
-def reopen_gap_clauses(p: Position) -> list[dict[str, Any]]:
-    """`$nor` clauses for the fills inside `p`'s reopen gaps (not its own)."""
-    return [{"executed_at": {"$gt": lo, "$lt": hi}} for lo, hi in p.reopen_gaps or []]
+    """The fills that are `p`'s — each fill has ONE owner (`own_fills`), the
+    one its Positions row bills — taken-back ones included, so a delete also
+    reaches the closes a reopen undid; a reader rebuilding the book splices
+    LIVE_FILL."""
+    return {"_id": {"$in": [t.id for t in (await own_fills([p], live=False))[p.id]]}}
 
 
 def in_reopen_gap(p: Position, ts: datetime) -> bool:
@@ -1115,7 +1052,7 @@ def _own_rank(p: Position, t: Trade) -> tuple[bool, bool, timedelta, float] | No
     return (off > timedelta(seconds=1), carried, off, newest)
 
 
-async def own_fills(rows: list[Position]) -> dict[Any, list[Trade]]:
+async def own_fills(rows: list[Position], *, live: bool = True) -> dict[Any, list[Trade]]:
     """Each live fill on the rows' (user, token) books, given to exactly ONE
     position — the one that held the book when it executed — so overlapping
     same-token positions (a scalper's re-entry, a reopened row, a carried
@@ -1125,7 +1062,8 @@ async def own_fills(rows: list[Position]) -> dict[Any, list[Trade]]:
     1 s — the engine stamps the Trade just before apply_fill stamps the
     Position) beats the slack; the fill's own product beats a carried
     NRML / CNC row opened as MIS (the rollover flips only the doc); then the
-    nearer span, then the newer position. {row id: its fills, oldest first}."""
+    nearer span, then the newer position. {row id: its fills, oldest first}.
+    `live=False` hands out the fills a delete / reopen took back as well."""
     # ponytail: time spans, not ownership — a Trade carries no position id; a
     # link stamped by apply_fill would make this exact. Re-entries < 1 s
     # apart can swap a fill between two of the client's rows (never twice).
@@ -1137,7 +1075,7 @@ async def own_fills(rows: list[Position]) -> dict[Any, list[Trade]]:
     }
     opens = [r.opened_at for r in rows if r.opened_at]
     ends = [r.closed_at for r in rows if r.closed_at]
-    fill_q: dict[str, Any] = {**book, **LIVE_FILL}
+    fill_q: dict[str, Any] = {**book, **(LIVE_FILL if live else {})}
     pos_q = dict(book)
     if len(opens) == len(rows):  # else a row's start is unknown: the whole book
         fill_q["executed_at"] = {"$gte": min(opens) - _OWN_SLACK}
@@ -1316,12 +1254,10 @@ async def cycle_closes(p: Position, side: OrderAction) -> list[Trade]:
     fills (`position_fills_query`) against the `side` it holds, with a booked
     P&L. What a reopen undoes and a CLOSED edit re-books — one set for both."""
     q = await position_fills_query(p)
-    win = dict(q["executed_at"])
-    cycle = p.reopened_at or p.opened_at
-    if cycle:
-        win["$gte"] = max(win["$gte"], cycle - timedelta(seconds=1))
+    if cycle := p.reopened_at or p.opened_at:
+        q["executed_at"] = {"$gte": cycle - timedelta(seconds=1)}
     return await Trade.find(
-        {**q, "executed_at": win, "action": {"$ne": side.value}, "pnl_inr": {"$ne": None}, **LIVE_FILL}
+        {**q, "action": {"$ne": side.value}, "pnl_inr": {"$ne": None}, **LIVE_FILL}
     ).to_list()
 
 

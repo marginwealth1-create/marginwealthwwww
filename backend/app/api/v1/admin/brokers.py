@@ -477,32 +477,16 @@ async def broker_report(broker_id: str, actor: CurrentAdmin):
         # only moves on an admin manual BROKERAGE entry.
         wallet_sum["total_brokerage"] += to_decimal(w.total_brokerage) + to_decimal(w.total_charges)
 
-    from app.services import market_data_service
-    fallback_usd_inr = to_decimal(market_data_service.get_usd_inr_rate())
-
-    def _is_usd(p) -> bool:
-        return market_data_service.position_is_usd(p)
-
-    def _realised_inr(p) -> _D:
-        raw = to_decimal(p.realized_pnl)
-        if not _is_usd(p):
-            return raw
-        rate = to_decimal(p.open_usd_inr_rate) if p.open_usd_inr_rate is not None else fallback_usd_inr
-        return raw * rate
-
-    # Today / This week realised: the Billing statement Gross PnL
-    # (tradebook_builder.booked) of the broker's direct clients — demo and
-    # CLOSED clients out — every close in the window at what the wallet
-    # booked, settlements included, undone fills out; a partial close of a
-    # position still open counts.
+    # Today / This week / All-time realised: the Billing statement Gross PnL
+    # (tradebook_builder.booked; all-time = no window) of the broker's direct
+    # clients — demo and CLOSED clients out — every close in the window at
+    # what the wallet booked, settlements included, undone fills out; a
+    # partial close of a position still open counts.
     pnl_pool = await _broker_client_ids(b.id)
-    today_realised, week_realised = [
-        (await client_totals_for_users(pnl_pool, *windows[k]))["net_client_pnl"] for k in ("today", "week")
+    today_realised, week_realised, all_time_realised = [
+        (await client_totals_for_users(pnl_pool, *w))["net_client_pnl"]
+        for w in (windows["today"], windows["week"], (None, None))
     ]
-    all_closed = await Position.find(
-        {**user_q, "status": PositionStatus.CLOSED.value}
-    ).to_list()
-    all_time_realised = sum((_realised_inr(p) for p in all_closed), _D("0"))
 
     open_positions = await Position.find(
         {**user_q, "status": PositionStatus.OPEN.value}

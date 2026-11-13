@@ -2145,41 +2145,57 @@ async def positions_pnl_summary(
     def _is_usd(p: Position) -> bool:
         return market_data_service.position_is_usd(p)
 
-    # Scope user pool for sub-admins. None for SUPER_ADMIN = no filter.
-    # own_scope (super-admin Positions page): the super-admin's OWN direct
-    # users only — never any sub-admin's clients. A per-user drill-down
-    # (user_id) still takes precedence over own_scope below.
-    if own_scope and admin.role == UserRole.SUPER_ADMIN and not user_id:
-        scope = await super_admin_direct_user_ids()
-    else:
-        scope = await scoped_user_ids(admin)
-
     # Optional per-user narrowing — used by the admin Positions page when
     # a user filter is active so the dashboard cards match the table.
-    # We intersect with `scope` so a sub-admin can't query users outside
-    # their pool by guessing the user_id.
+    # We intersect with the caller's pool so a sub-admin can't query users
+    # outside it by guessing the user_id.
     user_filter_oid: PydanticObjectId | None = None
     if user_id:
         try:
             user_filter_oid = PydanticObjectId(user_id)
         except Exception:
             user_filter_oid = None
-        if user_filter_oid is not None:
-            if scope is not None and user_filter_oid not in scope:
-                # Out of scope → empty tile data (sub-admin probing
-                # a user_id outside their pool). Shape matches the
-                # normal return so the frontend never sees `undefined`.
-                return APIResponse(
-                    data={
-                        "today_pnl": 0.0,
-                        "today_realised": 0.0,
-                        "open_unrealised": 0.0,
-                        "week_pnl": 0.0,
-                        "week_realised": 0.0,
-                        "last_week_pnl": 0.0,
-                    }
-                )
-            scope = [user_filter_oid]
+        if user_filter_oid is not None and user_filter_oid not in await scoped_user_ids(admin):
+            # Out of scope → empty tile data (sub-admin probing
+            # a user_id outside their pool). Shape matches the
+            # normal return so the frontend never sees `undefined`.
+            return APIResponse(
+                data={
+                    "today_pnl": 0.0,
+                    "today_realised": 0.0,
+                    "open_unrealised": 0.0,
+                    "week_pnl": 0.0,
+                    "week_realised": 0.0,
+                    "last_week_pnl": 0.0,
+                }
+            )
+
+    # ── Accounts-dashboard parity ───────────────────────────────────────
+    # The two Net-P&L cards must show the SAME Net Client PNL / Brokerage /
+    # Total-of-Both as /accounts-dashboard for the identical Mon→Sun window.
+    # Reuse the dashboard's own aggregator over its own pool resolver so the
+    # numbers can't drift: whole-book uses `_entity_pool_ids(admin)` (exactly
+    # what the "All Users" KPI card queries via compute_broker_totals); a
+    # user-filtered view narrows to that single client. Both pools are
+    # demo-free + non-CLOSED, so no demo data leaks in. open_unrealised reads
+    # the same pool.
+    from app.services.accounts_dashboard_service import (  # noqa: PLC0415
+        client_totals_for_users as _client_totals,
+        _entity_pool_ids as _acct_pool,
+    )
+
+    if user_filter_oid is not None:
+        _acct_ids = [user_filter_oid]
+    elif (
+        own_scope or admin.role == UserRole.EMPLOYEE
+    ) and await is_effective_super_admin(admin):
+        # Super-admin Positions page: own direct users only (same pool as the
+        # table above), so the Total-of-Both cards match that filtered book.
+        # Its staff gets the same book (its table is the direct pool too; the
+        # page sends own_scope only for the SUPER_ADMIN role).
+        _acct_ids = await super_admin_direct_user_ids()
+    else:
+        _acct_ids = await _acct_pool(admin.id, admin.role.value)
 
     # Recompute unrealised LIVE per position rather than reading the stored
     # `p.unrealized_pnl` field — that field is only refreshed when the
@@ -2188,16 +2204,13 @@ async def positions_pnl_summary(
     # (often 0 on a freshly opened position), which is what made the
     # admin's "Open PNL" card stick at ₹0.00 while the per-row M2M column
     # showed the correct live number. Mirror the /positions list view's
-    # (ltp - avg) * qty math so both reads stay in lockstep.
-    open_q: dict[str, Any] = {"status": PositionStatus.OPEN.value}
-    if scope is not None:
-        if not scope:
-            open_positions: list[Position] = []
-        else:
-            open_q["user_id"] = {"$in": scope}
-            open_positions = await Position.find(open_q).to_list()
-    else:
-        open_positions = await Position.find(open_q).to_list()
+    # (ltp - avg) * qty math so both reads stay in lockstep. Over the same
+    # pool as the period figures, so the cards cover one set of clients.
+    open_positions = (
+        await Position.find({"status": PositionStatus.OPEN.value, "user_id": {"$in": _acct_ids}}).to_list()
+        if _acct_ids
+        else []
+    )
 
     # Parallel LTP fan-out (see /admin/positions for rationale). This
     # endpoint is hit by the Dashboard, Positions, and Orders pages every
@@ -2242,31 +2255,6 @@ async def positions_pnl_summary(
             raw *= current_usd_inr
         total_unrealised += raw
 
-    # ── Accounts-dashboard parity ───────────────────────────────────────
-    # The two Net-P&L cards must show the SAME Net Client PNL / Brokerage /
-    # Total-of-Both as /accounts-dashboard for the identical Mon→Sun window.
-    # Reuse the dashboard's own aggregator over its own pool resolver so the
-    # numbers can't drift: whole-book uses `_entity_pool_ids(admin)` (exactly
-    # what the "All Users" KPI card queries via compute_broker_totals); a
-    # user-filtered view narrows to that single client. Both pools are
-    # demo-free + non-CLOSED, so no demo data leaks in.
-    from app.services.accounts_dashboard_service import (  # noqa: PLC0415
-        client_totals_for_users as _client_totals,
-        _entity_pool_ids as _acct_pool,
-    )
-
-    if user_filter_oid is not None:
-        _acct_ids = [user_filter_oid]
-    elif (
-        own_scope or admin.role == UserRole.EMPLOYEE
-    ) and await is_effective_super_admin(admin):
-        # Super-admin Positions page: own direct users only (same pool as the
-        # table above), so the Total-of-Both cards match that filtered book.
-        # Its staff gets the same book (its table is the direct pool too; the
-        # page sends own_scope only for the SUPER_ADMIN role).
-        _acct_ids = await super_admin_direct_user_ids()
-    else:
-        _acct_ids = await _acct_pool(admin.id, admin.role.value)
     _td_tot, _wk_tot, _lw_tot = await asyncio.gather(
         *(_client_totals(_acct_ids, *windows[k]) for k in ("today", "week", "last_week"))
     )
@@ -2411,10 +2399,8 @@ async def position_netting_entries(
 
     Used by the admin Positions blotter row-click to show the same view
     the user reported as the "Netting Entries — BSE (426450)" mockup.
-    Works for both OPEN and CLOSED positions:
-      - OPEN  → returns every fill from `opened_at` onward whose
-                (user, token, product_type) matches the position
-      - CLOSED → bounded by `[opened_at, closed_at]`
+    Works for both OPEN and CLOSED positions: the fills the row bills
+    (position_service.own_fills), oldest first.
     """
     from decimal import Decimal as _D
 
@@ -2426,64 +2412,12 @@ async def position_netting_entries(
         raise HTTPException(status_code=404, detail="Position not found")
     await assert_user_in_scope(admin, p.user_id)
 
-    # Find every Trade that contributed to this position. `position_id` is
-    # not stored on Trade, so we match by user + token + product_type +
-    # time window. For a re-opened position (close then open again on the
-    # same instrument) the time bounds keep us inside the CURRENT
-    # incarnation's fills.
-    #
-    # Grace window: position.opened_at is stamped AFTER the opening
-    # Trade.insert() in position_service.apply_fill, so a millisecond of
-    # clock-skew between the two writes makes `executed_at >= opened_at`
-    # silently drop the opening Trade — exactly the user-reported "sirf
-    # ek entry dikh raha hai (Exit), Entry missing" bug. A small grace
-    # absorbs that sub-second skew.
-    #
-    # The grace MUST stay tight: when a user closes a position and reopens
-    # the SAME instrument seconds later, a wide grace makes the two cycles'
-    # windows overlap, so each closed-position card bleeds in the adjacent
-    # cycle's legs (CL33333046 GOLD26AUGFUT, 2026-06-24: close 11:42:59 →
-    # reopen 11:43:14, only 15 s apart — the old 60 s grace pulled cycle-2's
-    # opening BUY into cycle-1's card and cycle-1's closing SELL into
-    # cycle-2's card, so both netting popups showed phantom extra legs even
-    # though the books were correct). The real clock-skew is milliseconds,
-    # so 2 s is ~1000× the worst case while no longer overlapping any
-    # realistic same-instrument re-entry.
-    from datetime import timedelta as _td
-
-    # A carried-forward position flips MIS→NRML at the EOD rollover, but its
-    # OPENING trades keep product_type=MIS — only the position row + the
-    # closing fill become NRML. A strict `product_type == p.product_type`
-    # filter then dropped every entry leg, so the dialog showed ONLY the exit
-    # (operator: "sirf exit dikh raha, saare entry missing" on a carried NFO
-    # position). Accept the position's product type PLUS its MIS intraday
-    # origin so a carried position lists all of its legs. The time window
-    # already isolates this incarnation, so this can't pull in a later cycle.
-    _pt = p.product_type.value if hasattr(p.product_type, "value") else str(p.product_type)
-    query: dict = {
-        "user_id": p.user_id,
-        "instrument.token": p.instrument.token,
-        "product_type": {"$in": list({_pt, "MIS"})},
-        # A close a reopen undid (or a deleted neighbour's fill) is not a leg.
-        **LIVE_FILL,
-    }
-    time_q: dict = {}
-    if p.opened_at:
-        time_q["$gte"] = p.opened_at - _td(seconds=2)
-    if p.closed_at:
-        # Same grace on the upper bound so a closing trade whose
-        # executed_at lands a few milliseconds AFTER position.closed_at
-        # still shows up.
-        time_q["$lte"] = p.closed_at + _td(seconds=2)
-    if time_q:
-        query["executed_at"] = time_q
-    # Another position's legs, traded while this one sat closed.
-    if gaps := position_service.reopen_gap_clauses(p):
-        query["$nor"] = gaps
-
-    trades = (
-        await Trade.find(query).sort("+executed_at").to_list()
-    )
+    # The fills this row bills: each live fill belongs to exactly ONE
+    # position (position_service.own_fills) — a carried NRML row its
+    # MIS-stamped opening legs but no MIS round trip beside it, a re-entry
+    # seconds after a close or a reopened row none of a neighbour's legs, an
+    # undone close none at all.
+    trades = (await position_service.own_fills([p]))[p.id]
 
     # Build the per-row entries the dialog renders.
     open_side = (
@@ -2894,8 +2828,8 @@ async def delete_position(
     # blotter, ledger, admin cards). Unlike reopen (which only undoes the
     # closing leg), a delete removes the whole position, so its opening-leg
     # brokerage must drop too — operator: "delete karne par brokerage bhi har
-    # jagah se hat jaye". Window = the position's full life [opened_at,
-    # closed_at] less other positions' spans (`_delete_window`).
+    # jagah se hat jaye". The fills = the ones this row bills, each fill's
+    # one owner (`_delete_window`, position_service.own_fills).
     #
     # `fifo_deleted` also takes the fills out of the FIFO cost book: flagged
     # only, the bare opening legs stayed queued and priced every later close

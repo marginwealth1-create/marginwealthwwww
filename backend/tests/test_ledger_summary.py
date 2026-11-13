@@ -11,6 +11,8 @@ and the server sums the strip over every row.
 
 from __future__ import annotations
 
+import inspect
+from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -19,18 +21,21 @@ from beanie import init_beanie
 from bson import Decimal128
 from motor.motor_asyncio import AsyncIOMotorClient
 
+from app.api.v1.admin import accounts, money_transactions, trading, users
 from app.api.v1.admin import ledger as admin_ledger
-from app.api.v1.admin import money_transactions, trading, users
 from app.core.config import settings
 from app.core.database import _document_models
 from app.models.netting import NettingFieldsRequired, NettingSegment
 from app.models.position import Position, PositionStatus
+from app.models.trade import LIVE_FILL, Trade
 from app.models.transaction import TransactionType as T
 from app.models.transaction import WalletTransaction, ledger_bucket
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.schemas.admin.common import WalletAdjustRequest
 from app.services import accounts_dashboard_service, market_data_service, position_service, wallet_service
+from app.utils.decimal_utils import to_decimal
+from app.utils.time_utils import IST, now_utc
 from tests._real_fill import INSTRUMENT, market, set_commission_per_lot
 
 ROUND = INSTRUMENT.model_copy(update={"token": "TLS1", "symbol": "TLS26ROUND"})
@@ -181,3 +186,35 @@ async def test_the_sheet_asks_for_its_types_server_side(w):
     ).data["items"]
     buckets = {i["narration"].split(" ")[0]: i["bucket"] for i in adj}
     assert buckets == {"Add": "deposit", "Deduct": "withdrawal", "Carry-forward": "trading"}
+
+
+async def test_the_accounts_csv_counts_cash_and_trades_as_the_screens(w):
+    """/accounts/summary (the Accounts CSV): Deposits / Withdrawals go through
+    the KPI's cash classifier — Add / Deduct Fund and BONUS / PROMO / PENALTY
+    in, the system carry fee out, lifetime as well as windowed — so its grand
+    total is the KPI; trades and volume count live fills only."""
+    await scenario(w)
+    for amount, tt in ((500, "BONUS"), (100, "PROMO"), (-200, "PENALTY")):
+        req = WalletAdjustRequest(amount=amount, narration=f"{tt} entry", transaction_type=tt)
+        await users.wallet_adjust(str(w.u.id), req, w.sa)
+    # A fill the FIFO walk no longer takes is out of every LIVE_FILL screen.
+    carry_open = await Trade.find_one({"user_id": w.u.id, "instrument.token": CARRY.token})
+    await Trade.get_motor_collection().update_one(
+        {"_id": carry_open.id}, {"$set": {"superseded_at": now_utc()}}
+    )
+    live = await Trade.find({"user_id": w.u.id, **LIVE_FILL}).to_list()
+
+    today = datetime.now(IST).date().isoformat()
+    for f, t in ((None, None), (today, today)):
+        gt = (await accounts.accounts_summary(w.sa, "all_users", f, t, None, None)).data["grand_total"]
+        kpi = (await accounts.broker_totals(str(w.sa.id), w.sa, f, t, None, None)).data
+        cash = (Decimal(str(gt["deposits"])), Decimal(str(gt["withdrawals"])))
+        assert cash == (Decimal(kpi["total_deposits"]), Decimal(kpi["total_withdrawals"])), f
+        assert cash == (Decimal("11600"), Decimal("500")), f
+        assert gt["total_trades"] == sum(1 for x in live if x.pnl_inr is not None), f
+        assert Decimal(str(gt["volume"])) == sum((to_decimal(x.value) for x in live), Decimal(0)), f
+
+
+def test_payments_money_sums_the_ledger_as_decimals():
+    """Payments → Money adds Decimal128 amounts as decimals, never via doubles."""
+    assert "$toDouble" not in inspect.getsource(money_transactions)

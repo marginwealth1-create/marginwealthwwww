@@ -231,6 +231,37 @@ def _ist(dt: datetime) -> str:
     return to_ist(dt).date().isoformat()
 
 
+async def _mk(n: int, role: UserRole = UserRole.CLIENT, **kw) -> User:
+    u = User(user_code=f"TWP{n:03d}", email=f"twp{n}@example.com", mobile=f"93700{n:05d}",
+             full_name=f"TWP{n}", password_hash="x", role=role, status=UserStatus.ACTIVE, **kw)
+    await u.insert()
+    await Wallet(user_id=u.id, available_balance=Decimal128("10000")).insert()
+    return u
+
+
+async def _transferred_broker(w) -> SimpleNamespace:
+    """b1 came over to a1 from a0: its client c3 and its sub-broker sb's client
+    c5 still say a0. Under b1 also a demo client and a deleted (CLOSED) one.
+    Each client books one closed round trip today: c +10, c3 +20, c5 +30,
+    demo +50, gone +70."""
+    a1, b1 = w.a1, w.b1
+    a0 = await _mk(91, UserRole.ADMIN)
+    c3 = await _mk(92, assigned_admin_id=a0.id, assigned_broker_id=b1.id, broker_ancestry=[b1.id])
+    sb = await _mk(
+        93, UserRole.BROKER, assigned_admin_id=a0.id, assigned_broker_id=b1.id, broker_ancestry=[b1.id]
+    )
+    c5 = await _mk(94, assigned_admin_id=a0.id, assigned_broker_id=sb.id, broker_ancestry=[b1.id, sb.id])
+    under_b1 = {"assigned_admin_id": a1.id, "assigned_broker_id": b1.id, "broker_ancestry": [b1.id]}
+    demo = await _mk(95, is_demo=True, **under_b1)
+    gone = await _mk(96, **under_b1)
+    for u, gain in ((w.c, 10), (c3, 20), (c5, 30), (demo, 50), (gone, 70)):
+        inst = INSTRUMENT.model_copy(update={"token": f"TWPE{gain}", "symbol": f"TWPE{gain}"})
+        await market(u, "BUY", 1, "100", instrument=inst)
+        await market(u, "SELL", 1, str(100 + gain), instrument=inst)
+    await User.get_motor_collection().update_one({"_id": gone.id}, {"$set": {"status": "CLOSED"}})
+    return SimpleNamespace(a0=a0, c3=c3, sb=sb, c5=c5, demo=demo, gone=gone)
+
+
 async def test_an_entity_reads_one_pool_on_every_screen(w):
     """An admin's or a broker's figure covers the same clients on every screen:
     demo and deleted (CLOSED) clients nowhere, and the clients of a broker
@@ -239,30 +270,8 @@ async def test_an_entity_reads_one_pool_on_every_screen(w):
     them — not on the table and the Accounts rows but missing from the KPI and
     the Close PNL card."""
     a1, b1, c = w.a1, w.b1, w.c
-    n = 90
-
-    async def mk(role: UserRole = UserRole.CLIENT, **kw) -> User:
-        nonlocal n
-        n += 1
-        u = User(user_code=f"TWP{n:03d}", email=f"twp{n}@example.com", mobile=f"93700{n:05d}",
-                 full_name=f"TWP{n}", password_hash="x", role=role, status=UserStatus.ACTIVE, **kw)
-        await u.insert()
-        await Wallet(user_id=u.id, available_balance=Decimal128("10000")).insert()
-        return u
-
-    # b1 came over from a0: its client and its sub-broker's client still say a0.
-    a0 = await mk(UserRole.ADMIN)
-    c3 = await mk(assigned_admin_id=a0.id, assigned_broker_id=b1.id, broker_ancestry=[b1.id])
-    sb = await mk(UserRole.BROKER, assigned_admin_id=a0.id, assigned_broker_id=b1.id, broker_ancestry=[b1.id])
-    c5 = await mk(assigned_admin_id=a0.id, assigned_broker_id=sb.id, broker_ancestry=[b1.id, sb.id])
-    under_b1 = {"assigned_admin_id": a1.id, "assigned_broker_id": b1.id, "broker_ancestry": [b1.id]}
-    demo = await mk(is_demo=True, **under_b1)
-    gone = await mk(**under_b1)
-    for u, gain in ((c, 10), (c3, 20), (c5, 30), (demo, 50), (gone, 70)):
-        inst = INSTRUMENT.model_copy(update={"token": f"TWPE{gain}", "symbol": f"TWPE{gain}"})
-        await market(u, "BUY", 1, "100", instrument=inst)
-        await market(u, "SELL", 1, str(100 + gain), instrument=inst)
-    await User.get_motor_collection().update_one({"_id": gone.id}, {"$set": {"status": "CLOSED"}})
+    x = await _transferred_broker(w)
+    c3, c5 = x.c3, x.c5
 
     periods = tradebook_builder.periods()
     pool = await scoped_user_ids(a1)  # a1's Positions table and Users list
@@ -292,6 +301,81 @@ async def test_an_entity_reads_one_pool_on_every_screen(w):
     week = [_d(adm[f]) for f in ("week_net_client_pnl", "week_brokerage", "week_pnl")]
     assert week == await total(pool, "week")
     assert _d(adm["today_pnl"]) == (await total(pool, "today"))[2]
+
+
+async def test_the_accounts_csv_reads_each_cards_pool(w):
+    """/accounts/summary (the Accounts CSV): an admin's row (Admins scope) and a
+    broker's row (Brokers / Sub-Brokers scopes) cover the clients that entity's
+    on-screen card covers — a transferred broker's whole subtree, sub-broker
+    clients included, demo and deleted clients out — and the grand total is the
+    page's own KPI."""
+    a1, b1 = w.a1, w.b1
+    x = await _transferred_broker(w)
+    lo, hi = tradebook_builder.periods()["week"]
+    f, t = _ist(lo), _ist(hi)
+
+    async def card(entity: User, actor: User) -> tuple:
+        k = (await accounts_api.broker_totals(str(entity.id), actor, f, t, None, None)).data
+        return _d(k["net_client_pnl"]), _d(k["net_client_bkg"]), k["client_count"]
+
+    def row(e: dict) -> tuple:
+        return _d(e["realized_pnl"]), _d(e["brokerage"]), e["user_count"]
+
+    for actor, scopes in (
+        (w.sa, {"admins": (a1, x.a0), "brokers": (b1,), "sub_brokers": (x.sb,)}),
+        (a1, {"brokers": (b1,), "sub_brokers": (x.sb,)}),
+    ):
+        for scope, entities in scopes.items():
+            data = (await accounts_api.accounts_summary(actor, scope, f, t, None, None)).data
+            got = {e["id"]: e for e in data["entities"]}
+            for ent in entities:
+                assert row(got[str(ent.id)]) == await card(ent, actor), (scope, ent.user_code, actor.role)
+            assert row(data["grand_total"]) == await card(actor, actor), (scope, actor.role)
+    assert (await card(a1, w.sa))[0] == Decimal("60")  # c, c3, c5
+
+
+async def test_all_time_realised_is_the_lifetime_statement(w):
+    """The sub-admin and broker pages' All-time realised and the action menu's
+    closed_pnl_all_time: the statement's lifetime Gross over the pool their
+    Today / This week cards read — demo and deleted clients out, a partial
+    close of a position still open in."""
+    a1, b1, c = w.a1, w.b1, w.c
+    x = await _transferred_broker(w)
+    await market(c, "BUY", 10, "100", instrument=HELD)
+    await market(c, "SELL", 4, "110", instrument=HELD)  # +40, 6 units still open
+
+    async def life(*us: User) -> Decimal:
+        return sum([(await _statement(u, None, None))[0] for u in us], Decimal(0))
+
+    assert await life(c) == Decimal("50")
+    sub = (await management.sub_admin_report(str(a1.id), w.sa)).data["pnl"]
+    assert _d(sub["all_time_realised"]) == await life(c, x.c3, x.c5)
+    brk = (await brokers.broker_report(str(b1.id), a1)).data["pnl"]
+    assert _d(brk["all_time_realised"]) == await life(c, x.c3)  # its direct clients, as its other cards
+    stats = (await users_api.live_trade_stats(str(c.id), a1)).data
+    assert _d(stats["closed_pnl_all_time"]) == await life(c)
+
+
+async def test_the_super_admins_whole_book_cards_read_one_pool(w):
+    """pnl-summary for the super-admin without own_scope (the prefetch): the
+    floating M2M covers the same clients as the week / today figures — the
+    whole book, a sub-admin's clients and the super-admin's own direct ones."""
+    c = w.c
+    d0 = await _mk(97)  # the super-admin's own client
+    await market(c, "BUY", 10, "100", instrument=HELD)
+    await market(d0, "BUY", 5, "200", instrument=ROUND)
+    await market(d0, "SELL", 2, "210", instrument=ROUND)  # +20, 3 units still open
+
+    async def _ltp(_token):
+        return Decimal("105")
+
+    w.monkeypatch.setattr(market_data_service, "get_display_ltp", _ltp)
+    trading._ADMIN_PNL_CACHE.clear()
+    s = (await trading.positions_pnl_summary(w.sa, None, False, None)).data
+    assert _d(s["open_unrealised"]) == Decimal("-235")  # c (105 − 100) × 10, d0 (105 − 200) × 3
+    week = [await _statement(u, *tradebook_builder.periods()["week"]) for u in (c, d0)]
+    assert _d(s["week_net_client_pnl"]) == sum((g for g, _, _ in week), Decimal(0))
+    assert _d(s["week_pnl"]) == sum((n for _, _, n in week), Decimal(0))
 
 
 def test_the_week_runs_monday_to_sunday_ist():

@@ -33,8 +33,7 @@ from app.core.dependencies import (
 )
 from app.core.exceptions import NotFoundError, ValidationFailedError
 from app.models.position import Position, PositionStatus
-from app.models.trade import Trade
-from app.models.transaction import TransactionType, WalletTransaction
+from app.models.trade import LIVE_FILL, Trade
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.schemas.common import APIResponse
@@ -87,8 +86,6 @@ async def _aggregate_for_users(
     if not user_ids:
         return _empty()
 
-    is_lifetime = start_utc is None and end_utc is None
-
     wallets = await Wallet.find({"user_id": {"$in": user_ids}}).to_list()
 
     total_balance = sum(_d(w.available_balance) + _d(w.used_margin) for w in wallets)
@@ -108,59 +105,27 @@ async def _aggregate_for_users(
     realized_pnl = float(sum((g for g, _ in booked), Decimal(0)))
     brokerage = float(sum((b for _, b in booked), Decimal(0)))
 
-    if is_lifetime:
-        deposits = sum(_d(w.total_deposits) for w in wallets)
-        withdrawals = sum(_d(w.total_withdrawals) for w in wallets)
+    date_filter: dict[str, Any] = {}
+    if start_utc:
+        date_filter["$gte"] = start_utc
+    if end_utc:
+        date_filter["$lte"] = end_utc
 
-        all_trades = await Trade.find({
-            "user_id": {"$in": user_ids},
-            "superseded_by_reopen": {"$ne": True},
-        }).to_list()
-        volume = sum(_d(t.value) for t in all_trades)
+    # Deposits / Withdrawals: the KPI's own cash classifier, lifetime too.
+    dep, wd = await ads.cash_in_out(user_ids, date_filter or None)
+    deposits, withdrawals, net_deposit = float(dep), float(wd), float(dep - wd)
 
-        all_closing_trades = [t for t in all_trades if t.pnl_inr is not None]
-        total_trades = len(all_closing_trades)
-        profit_trades = sum(1 for t in all_closing_trades if _d(t.pnl_inr) > 0)
-        loss_trades = sum(1 for t in all_closing_trades if _d(t.pnl_inr) < 0)
-    else:
-        date_filter = {}
-        if start_utc:
-            date_filter["$gte"] = start_utc
-        if end_utc:
-            date_filter["$lte"] = end_utc
+    # Trades and volume: live fills only (LIVE_FILL), as every other screen.
+    trade_q: dict[str, Any] = {"user_id": {"$in": user_ids}, **LIVE_FILL}
+    if date_filter:
+        trade_q["executed_at"] = date_filter
+    fills = await Trade.find(trade_q).to_list()
+    volume = float(sum((to_decimal(t.value) for t in fills), Decimal(0)))
+    closes = [to_decimal(t.pnl_inr) for t in fills if t.pnl_inr is not None]
+    total_trades = len(closes)
+    profit_trades = sum(1 for p in closes if p > 0)
+    loss_trades = sum(1 for p in closes if p < 0)
 
-        dep_txns = await WalletTransaction.find({
-            "user_id": {"$in": user_ids},
-            "transaction_type": TransactionType.DEPOSIT.value,
-            "created_at": date_filter,
-        }).to_list()
-        deposits = sum(_d(t.amount) for t in dep_txns)
-
-        wd_txns = await WalletTransaction.find({
-            "user_id": {"$in": user_ids},
-            "transaction_type": TransactionType.WITHDRAWAL.value,
-            "created_at": date_filter,
-        }).to_list()
-        withdrawals = sum(abs(_d(t.amount)) for t in wd_txns)
-
-        closing_trades = await Trade.find({
-            "user_id": {"$in": user_ids},
-            "superseded_by_reopen": {"$ne": True},
-            "pnl_inr": {"$ne": None},
-            "executed_at": date_filter,
-        }).to_list()
-        total_trades = len(closing_trades)
-        profit_trades = sum(1 for t in closing_trades if _d(t.pnl_inr) > 0)
-        loss_trades = sum(1 for t in closing_trades if _d(t.pnl_inr) < 0)
-
-        all_trades = await Trade.find({
-            "user_id": {"$in": user_ids},
-            "superseded_by_reopen": {"$ne": True},
-            "executed_at": date_filter,
-        }).to_list()
-        volume = sum(_d(t.value) for t in all_trades)
-
-    net_deposit = deposits - withdrawals
     win_rate = round((profit_trades / total_trades) * 100, 1) if total_trades > 0 else 0.0
     net_pnl = realized_pnl + total_unrealized
 
@@ -198,12 +163,16 @@ def _empty() -> dict[str, Any]:
 
 async def _make_entity(
     entity_user: User,
-    pool_ids: list[PydanticObjectId],
     role_label: str,
+    clause: dict[str, Any],
     start_utc: datetime | None,
     end_utc: datetime | None,
     **extra: Any,
 ) -> dict[str, Any]:
+    """One admin / broker / sub-broker row over the pool its on-screen card
+    (compute_broker_totals) reads: an admin's clients incl. a transferred
+    broker's subtree, a broker's whole subtree; ANDed with the caller's clause."""
+    pool_ids = await ads._entity_pool_ids(entity_user.id, entity_user.role.value, clause)
     agg = await _aggregate_for_users(pool_ids, start_utc=start_utc, end_utc=end_utc)
     return {
         "id": str(entity_user.id),
@@ -295,9 +264,10 @@ async def accounts_summary(
         }).to_list()
 
         async def _do_admin(adm: User) -> dict[str, Any]:
-            pool = [u.id for u in all_users if u.assigned_admin_id == adm.id]
             broker_count = sum(1 for u in await User.find({"assigned_admin_id": adm.id, "role": UserRole.BROKER.value}).to_list())
-            return await _make_entity(adm, pool, "ADMIN", start_utc, end_utc, broker_count=broker_count)
+            return await _make_entity(
+                adm, "ADMIN", admin_scope, start_utc, end_utc, broker_count=broker_count
+            )
 
         results = await asyncio.gather(*[_do_admin(a) for a in admins], return_exceptions=True)
         entities.extend(r for r in results if isinstance(r, dict))
@@ -318,8 +288,7 @@ async def accounts_summary(
             entities.append({"id": "direct", "name": "Direct Users (No Broker)", "role": "DIRECT", **agg})
 
         async def _do_broker(b: User) -> dict[str, Any]:
-            pool = [u.id for u in all_users if u.assigned_broker_id == b.id]
-            return await _make_entity(b, pool, "BROKER", start_utc, end_utc)
+            return await _make_entity(b, "BROKER", admin_scope, start_utc, end_utc)
 
         results = await asyncio.gather(*[_do_broker(b) for b in brokers], return_exceptions=True)
         entities.extend(r for r in results if isinstance(r, dict))
@@ -335,8 +304,7 @@ async def accounts_summary(
         sub_brokers = await User.find(sub_query).to_list()
 
         async def _do_sub(sb: User) -> dict[str, Any]:
-            pool = [u.id for u in all_users if u.assigned_broker_id == sb.id]
-            return await _make_entity(sb, pool, "SUB_BROKER", start_utc, end_utc)
+            return await _make_entity(sb, "SUB_BROKER", admin_scope, start_utc, end_utc)
 
         results = await asyncio.gather(*[_do_sub(sb) for sb in sub_brokers], return_exceptions=True)
         entities.extend(r for r in results if isinstance(r, dict))

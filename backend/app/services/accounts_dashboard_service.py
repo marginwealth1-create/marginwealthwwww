@@ -204,6 +204,32 @@ async def _settlement_in_window(
     return booked - recovered
 
 
+async def cash_in_out(
+    user_ids: list[PydanticObjectId], date_filter: dict[str, Any] | None
+) -> tuple[Decimal, Decimal]:
+    """Deposits and withdrawals over `created_at` ∈ date_filter (lifetime when
+    None): the cash rows the ledger strip sums (models.transaction.ledger_bucket)
+    — DEPOSIT / WITHDRAWAL and every admin Add / Deduct Fund, whatever type it
+    was booked under; a system ADJUSTMENT (initial balance credit, bogus-fill
+    reversal, the EOD carry fee) is no cash in or out."""
+    deposits = withdrawals = Decimal("0")
+    if not user_ids:
+        return deposits, withdrawals
+    q: dict[str, Any] = {
+        "user_id": {"$in": user_ids},
+        "transaction_type": {"$in": [t.value for t in CASH_TYPES]},
+    }
+    if date_filter:
+        q["created_at"] = date_filter
+    for t in await WalletTransaction.find(q).to_list():
+        bucket = ledger_bucket(t.transaction_type, t.amount, t.narration)
+        if bucket == "deposit":
+            deposits += abs(to_decimal(t.amount))
+        elif bucket == "withdrawal":
+            withdrawals += abs(to_decimal(t.amount))
+    return deposits, withdrawals
+
+
 async def client_totals_for_users(
     user_ids: list[PydanticObjectId],
     start_utc: datetime | None,
@@ -267,8 +293,6 @@ async def compute_broker_totals(
 
     net_client_pnl = Decimal("0")
     net_client_bkg = Decimal("0")
-    total_deposits = Decimal("0")
-    total_withdrawals = Decimal("0")
 
     # Build the date filter at function scope so the post-block
     # settlement helper can see it even when user_ids is empty (the
@@ -288,24 +312,7 @@ async def compute_broker_totals(
     net_client_pnl = _ct["net_client_pnl"]
     net_client_bkg = _ct["net_client_bkg"]
 
-    if user_ids:
-        # Deposits / withdrawals in window: the cash rows the ledger strip sums
-        # (models.transaction.ledger_bucket) — DEPOSIT / WITHDRAWAL and every
-        # admin Add / Deduct Fund, whatever type it was booked under; a system
-        # ADJUSTMENT (initial balance credit, bogus-fill reversal, the EOD carry
-        # fee) is no cash in or out.
-        cash_query: dict[str, Any] = {
-            "user_id": {"$in": user_ids},
-            "transaction_type": {"$in": [t.value for t in CASH_TYPES]},
-        }
-        if date_filter:
-            cash_query["created_at"] = date_filter
-        for t in await WalletTransaction.find(cash_query).to_list():
-            bucket = ledger_bucket(t.transaction_type, t.amount, t.narration)
-            if bucket == "deposit":
-                total_deposits += abs(to_decimal(t.amount))
-            elif bucket == "withdrawal":
-                total_withdrawals += abs(to_decimal(t.amount))
+    total_deposits, total_withdrawals = await cash_in_out(user_ids, date_filter)
 
     # Settlement — windowed (BOOKED − RECOVERY WalletTransactions in
     # the selected period) when a date filter is set, full lifetime
