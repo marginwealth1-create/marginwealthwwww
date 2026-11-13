@@ -262,6 +262,25 @@ async def test_a_weekly_settlement_of_a_legacy_reopen_carries_its_open_leg(w, mo
     assert [r["brokerage"] for r in b.rows] == [10.0, 10.0], _show(b)
 
 
+async def test_a_legacy_reopen_added_to_bills_every_charge_of_the_close(w):
+    # The re-close of restored + added units found a lot for the add only;
+    # the close leg of the restored units fell off with them.
+    await market(w.c, "BUY", 10, "100")
+    await _later(w, minutes=1)
+    await market(w.c, "SELL", 10, "110")
+    await _later(w, minutes=10)
+    await _reopen(w)
+    await Trade.get_motor_collection().update_many({}, {"$unset": {"superseded_at": ""}})
+    await _later(w, minutes=10)
+    await market(w.c, "BUY", 10, "120")
+    await _later(w, minutes=1)
+    await market(w.c, "SELL", 20, "130")
+
+    b = await _books(w)
+    assert b.gross == b.realized, _show(b)
+    assert b.brokerage == b.charges == Decimal("40"), _show(b)  # was 20
+
+
 async def test_a_reopen_after_a_later_round_trip_keeps_the_legacy_flag(w):
     await market(w.c, "BUY", 10, "100")
     await _later(w, minutes=1)

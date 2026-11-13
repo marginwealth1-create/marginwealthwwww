@@ -1471,9 +1471,11 @@ async def list_closed_trade_events_fifo(
         ts = _naive(t.executed_at)
         return any(o <= ts <= c for o, c in _spans.get(t.instrument.token, ()))
 
-    def _reclaim(token: str, side: str, qty: float) -> list[tuple[Any, float]]:
-        """Take up to `qty` restored `side` units on `token`; their open legs."""
+    def _reclaim(token: str, side: str, qty: float) -> tuple[list[tuple[Any, float]], float]:
+        """Take up to `qty` restored `side` units on `token`: their open legs
+        and the units taken."""
         legs: list[tuple[Any, float]] = []
+        want = qty
         for k, held in _restored.items():
             if k[0] != token:
                 continue
@@ -1487,7 +1489,7 @@ async def list_closed_trade_events_fifo(
                 f["qty"] -= take
                 qty -= take
             _restored[k] = [f for f in held if f["qty"] > 1e-9]
-        return legs
+        return legs, want - qty
 
     # One boundary per settlement-style close (WEEKLY_SETTLEMENT or
     # EXPIRY_SETTLED), to be merged into the walk. Both close the position
@@ -1638,7 +1640,7 @@ async def list_closed_trade_events_fifo(
                     _remaining -= _take
                 open_queues[_bk] = deque(_f for _f in _bq if _f["qty"] > 1e-9)
             if _remaining > 1e-9:
-                _legs += _reclaim(_token, b["side"], _remaining)
+                _legs += _reclaim(_token, b["side"], _remaining)[0]
             # Native gross like every row here; fx_rate converts it to what
             # the wallet booked.
             events.append({
@@ -1782,7 +1784,7 @@ async def list_closed_trade_events_fifo(
                     entry_price = price + (gross / _closed)
                 _legs_ac = [(t.executed_at, close_brk)]
                 if not getattr(t, "superseded_by_reopen", False):
-                    _legs_ac = _reclaim(t.instrument.token, opened_side, _closed) + _legs_ac
+                    _legs_ac = _reclaim(t.instrument.token, opened_side, _closed)[0] + _legs_ac
                 events.append({
                     "_row_id": f"fifo_{t.id}_0",
                     "_closed_at": t.executed_at,
@@ -1913,7 +1915,11 @@ async def list_closed_trade_events_fifo(
                 del q[idx]
 
         if remaining > 1e-9 and sub_idx and not getattr(t, "superseded_by_reopen", False):
-            _more = _reclaim(t.instrument.token, events[-1]["opened_side"], remaining)
+            # The units it took past the book: their open legs and their share
+            # of this close's own charge.
+            _more, _took_r = _reclaim(t.instrument.token, events[-1]["opened_side"], remaining)
+            if _took_r > 1e-9:
+                _more.append((t.executed_at, close_brk * _took_r / qty))
             events[-1]["legs"] = events[-1]["legs"] + _more
             events[-1]["brokerage"] += sum(a for _, a in _more)
 
