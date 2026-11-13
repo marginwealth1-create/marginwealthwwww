@@ -32,7 +32,7 @@ from app.core.database import _document_models
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.services import accounts_dashboard_service as ads
-from app.services import report_pdf_service
+from app.services import report_pdf_service, report_xlsx_service
 
 _DB = f"{settings.MONGODB_DB_NAME}_test_report_render_off_loop"
 _NO_DATES = {"from_date": None, "to_date": None, "preset": None, "_": None}
@@ -41,6 +41,7 @@ _BUILDERS = {
         "build_pnl_pdf", "build_tradebook_pdf", "build_brokerage_pdf",
         "build_tax_pdf", "build_margin_pdf", "build_full_tradebook_pdf",
     ),
+    report_xlsx_service: ("render_billing_xlsx", "render_trade_book_xlsx"),
     ads: (
         "render_entity_users_excel", "render_entity_users_pdf",
         "render_broker_totals_excel", "render_broker_totals_pdf",
@@ -91,6 +92,8 @@ async def test_every_report_renders_in_a_worker_thread(w, renders):
     uid, eid = str(w.c.id), str(w.sa.id)
     await admin_reports.tradebook_pdf(user_id=uid, admin=w.sa, _=None)
     await admin_reports.trade_book_pdf(user_id=uid, admin=w.sa, _=None)
+    await admin_reports.tradebook_xlsx(user_id=uid, admin=w.sa, _=None)
+    await admin_reports.trade_book_xlsx(user_id=uid, admin=w.sa, _=None)
     await user_reports.pnl_report_pdf(user=w.c)
     await user_reports.tradebook_pdf(user=w.c, limit=None)
     await user_reports.brokerage_pdf(user=w.c)

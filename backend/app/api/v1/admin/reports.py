@@ -1,4 +1,4 @@
-"""Admin reports — users, financial, trades, tax, compliance, tradebook PDF."""
+"""Admin reports — users, financial, trades, tax, compliance, Billing / Trade Book PDF and Excel."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from app.models.transaction import (
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.schemas.common import APIResponse
-from app.services import report_pdf_service, tradebook_builder
+from app.services import report_pdf_service, report_xlsx_service, tradebook_builder
 from app.utils.decimal_utils import quantize_money, to_decimal
 from app.utils.time_utils import now_ist, now_utc
 
@@ -163,7 +163,9 @@ async def compliance_report(
     return APIResponse(data={"kyc_verified": kyc_done, "kyc_pending": kyc_pending})
 
 
-# ── Per-user Billing statement and Trade Book PDFs ─────────────────
+# ── Per-user Billing statement and Trade Book, PDF and Excel ───────
+
+_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 async def _tradebook_user(admin: User, user_id: str) -> User:
@@ -182,10 +184,10 @@ async def _tradebook_user(admin: User, user_id: str) -> User:
     return user
 
 
-def _pdf(data: bytes, filename: str) -> StreamingResponse:
+def _file(data: bytes, filename: str, media_type: str = "application/pdf") -> StreamingResponse:
     return StreamingResponse(
         iter([data]),
-        media_type="application/pdf",
+        media_type=media_type,
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "Content-Length": str(len(data)),
@@ -198,6 +200,32 @@ def _slug(v: str | None) -> str:
     return (v or "").strip().replace(" ", "_")
 
 
+def _filename(prefix: str, user: User, ext: str, *extra: str) -> str:
+    code = getattr(user, "user_code", "") or "user"
+    return "_".join([prefix, _slug(user.full_name), code, *extra, now_ist().strftime("%Y%m%d")]) + ext
+
+
+async def _statement(
+    admin: User, user_id: str, from_date: str | None, to_date: str | None
+) -> tuple[User, str, dict[str, Any]]:
+    """The client's Billing statement under the admin's brand. Dates are
+    whole IST days (YYYY-MM-DD); none → lifetime."""
+    user = await _tradebook_user(admin, user_id)
+    lo, hi = tradebook_builder.window(from_date, to_date)
+    brand = admin.brand_name or getattr(admin, "full_name", "") or ""
+    return user, brand, await tradebook_builder.statement_payload(user, lo, hi, brand=brand)
+
+
+async def _fills(
+    admin: User, user_id: str, from_date: str | None, to_date: str | None
+) -> tuple[User, list[dict[str, Any]]]:
+    """The client's Trade Book: one row per fill, newest first — what was
+    executed, not the FIFO-paired statement. Same gate and dates as Billing."""
+    user = await _tradebook_user(admin, user_id)
+    lo, hi = tradebook_builder.window(from_date, to_date)
+    return user, await tradebook_builder.trade_rows(user.id, lo, hi)
+
+
 @router.get("/tradebook/pdf")
 async def tradebook_pdf(
     user_id: str,
@@ -207,16 +235,24 @@ async def tradebook_pdf(
     to_date: str | None = None,
 ) -> StreamingResponse:
     """The client's Billing statement — the same statement the client
-    downloads, under the admin's brand. Dates are whole IST days
-    (YYYY-MM-DD); none → lifetime."""
-    user = await _tradebook_user(admin, user_id)
-    lo, hi = tradebook_builder.window(from_date, to_date)
-    brand = admin.brand_name or getattr(admin, "full_name", "") or ""
-    payload = await tradebook_builder.statement_payload(user, lo, hi, brand=brand)
+    downloads, under the admin's brand."""
+    user, brand, payload = await _statement(admin, user_id, from_date, to_date)
     pdf_bytes = await asyncio.to_thread(report_pdf_service.build_full_tradebook_pdf, user, payload)
-    stamp = now_ist().strftime("%Y%m%d")
-    code = getattr(user, "user_code", "") or "user"
-    return _pdf(pdf_bytes, f"billing_{_slug(user.full_name)}_{code}_{_slug(brand)}_{stamp}.pdf")
+    return _file(pdf_bytes, _filename("billing", user, ".pdf", _slug(brand)))
+
+
+@router.get("/tradebook/xlsx")
+async def tradebook_xlsx(
+    user_id: str,
+    admin: CurrentAdmin,
+    _: None = Depends(require_perm("reports", "read")),
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> StreamingResponse:
+    """The Billing statement as a workbook: the PDF's tables, cell for cell."""
+    user, _brand, payload = await _statement(admin, user_id, from_date, to_date)
+    data = await asyncio.to_thread(report_xlsx_service.render_billing_xlsx, user, payload)
+    return _file(data, _filename("billing", user, ".xlsx"), _XLSX)
 
 
 @router.get("/trade-book/pdf")
@@ -227,15 +263,23 @@ async def trade_book_pdf(
     from_date: str | None = None,
     to_date: str | None = None,
 ) -> StreamingResponse:
-    """The client's Trade Book: one row per fill, newest first — what was
-    executed, not the FIFO-paired statement. Same gate and dates as Billing."""
-    user = await _tradebook_user(admin, user_id)
-    lo, hi = tradebook_builder.window(from_date, to_date)
-    rows = await tradebook_builder.trade_rows(user.id, lo, hi)
+    user, rows = await _fills(admin, user_id, from_date, to_date)
     pdf_bytes = await asyncio.to_thread(report_pdf_service.build_tradebook_pdf, user, rows)
-    stamp = now_ist().strftime("%Y%m%d")
-    code = getattr(user, "user_code", "") or "user"
-    return _pdf(pdf_bytes, f"tradebook_fills_{_slug(user.full_name)}_{code}_{stamp}.pdf")
+    return _file(pdf_bytes, _filename("tradebook_fills", user, ".pdf"))
+
+
+@router.get("/trade-book/xlsx")
+async def trade_book_xlsx(
+    user_id: str,
+    admin: CurrentAdmin,
+    _: None = Depends(require_perm("reports", "read")),
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> StreamingResponse:
+    """The Trade Book as a workbook: the PDF's table, cell for cell."""
+    user, rows = await _fills(admin, user_id, from_date, to_date)
+    data = await asyncio.to_thread(report_xlsx_service.render_trade_book_xlsx, user, rows)
+    return _file(data, _filename("tradebook", user, ".xlsx"), _XLSX)
 
 
 @router.get("/top-movers")

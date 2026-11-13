@@ -750,13 +750,18 @@ export const ReportsAdminAPI = {
   // Billing statement: the client's trades FIFO-paired. Dates are plain
   // YYYY-MM-DD, read by the backend as whole IST days.
   tradebookPdf: (userId: string, fromDate?: string, toDate?: string): Promise<Blob> =>
-    userPdf("/admin/reports/tradebook/pdf", userId, fromDate, toDate),
+    userFile("/admin/reports/tradebook/pdf", userId, fromDate, toDate),
+  // The same statement as a workbook: the PDF's tables, cell for cell.
+  tradebookXlsx: (userId: string, fromDate?: string, toDate?: string): Promise<Blob> =>
+    userFile("/admin/reports/tradebook/xlsx", userId, fromDate, toDate),
   // Trade Book: one row per fill, newest first.
   tradeBookPdf: (userId: string, fromDate?: string, toDate?: string): Promise<Blob> =>
-    userPdf("/admin/reports/trade-book/pdf", userId, fromDate, toDate),
+    userFile("/admin/reports/trade-book/pdf", userId, fromDate, toDate),
+  tradeBookXlsx: (userId: string, fromDate?: string, toDate?: string): Promise<Blob> =>
+    userFile("/admin/reports/trade-book/xlsx", userId, fromDate, toDate),
 };
 
-async function userPdf(path: string, userId: string, fromDate?: string, toDate?: string): Promise<Blob> {
+async function userFile(path: string, userId: string, fromDate?: string, toDate?: string): Promise<Blob> {
   const params: Record<string, string> = { user_id: userId };
   if (fromDate) params.from_date = fromDate;
   if (toDate) params.to_date = toDate;

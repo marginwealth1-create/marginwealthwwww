@@ -9,7 +9,7 @@ import {
 } from "recharts";
 import {
   ArrowDownRight, ArrowUpRight, BookOpen, Briefcase,
-  ChevronRight, DollarSign, Download,
+  ChevronDown, ChevronRight, DollarSign, Download,
   FileSpreadsheet, FileText, Loader2, PieChartIcon,
   RefreshCw, Search, TrendingUp, Trophy, UserPlus, Users, X,
 } from "lucide-react";
@@ -23,6 +23,12 @@ import {
   type EntityUsersResponse,
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/common/PageHeader";
 import { useAdminAuthStore } from "@/stores/authStore";
@@ -968,6 +974,67 @@ function PaginationBar({
 }
 
 
+/** A row's Excel / PDF button: which document to download — the account
+ *  summary, the Billing statement or the Trade Book — for the dashboard's
+ *  selected dates. */
+function DownloadMenu({
+  format,
+  user: u,
+  entityId,
+  dateParams,
+  className,
+}: {
+  format: "xlsx" | "pdf";
+  user: EntityUserRow;
+  entityId: string;
+  dateParams: { from_date?: string; to_date?: string };
+  className: string;
+}) {
+  const { from_date, to_date } = dateParams;
+  const Icon = format === "xlsx" ? FileSpreadsheet : FileText;
+  const docs: Array<[label: string, prefix: string, fetchBlob: () => Promise<Blob>]> =
+    format === "xlsx"
+      ? [
+          [
+            "Account summary",
+            "pnl",
+            () => AccountsAPI.exportEntityUsersExcel(entityId, { ...dateParams, user_id: u.user_id }),
+          ],
+          ["Billing", "billing", () => ReportsAdminAPI.tradebookXlsx(u.user_id, from_date, to_date)],
+          ["Trade Book", "tradebook", () => ReportsAdminAPI.tradeBookXlsx(u.user_id, from_date, to_date)],
+        ]
+      : [
+          [
+            "Account summary",
+            "pnl",
+            () => AccountsAPI.exportEntityUsersPdf(entityId, { ...dateParams, user_id: u.user_id }),
+          ],
+          ["Billing", "billing", () => ReportsAdminAPI.tradebookPdf(u.user_id, from_date, to_date)],
+          ["Trade Book", "tradebook", () => ReportsAdminAPI.tradeBookPdf(u.user_id, from_date, to_date)],
+        ];
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="outline" size="sm" className={className}>
+          <Icon className="size-3 mr-0.5" /> {format === "xlsx" ? "Excel" : "PDF"}
+          <ChevronDown className="size-3 ml-0.5 opacity-60" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-[10rem]">
+        {docs.map(([label, prefix, fetchBlob]) => (
+          <DropdownMenuItem
+            key={label}
+            className="text-xs"
+            onSelect={() => saveOrToast(fetchBlob, `${prefix}_${u.user_code}.${format}`)}
+          >
+            {label === "Account summary" ? <Icon /> : <BookOpen />} {label}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 function UserPnlRow({
   user: u,
   entityId,
@@ -1017,32 +1084,21 @@ function UserPnlRow({
           >
             <FileText className="size-3 mr-0.5" /> Settle
           </Button>
-          <Button
-            variant="outline"
-            size="sm"
+          {/* Excel / PDF: account summary, Billing or Trade Book. */}
+          <DownloadMenu
+            format="xlsx"
+            user={u}
+            entityId={entityId}
+            dateParams={dateParams}
             className="h-7 text-[10px] px-2"
-            onClick={async () => {
-              await saveOrToast(
-                () => AccountsAPI.exportEntityUsersExcel(entityId, { ...dateParams, user_id: u.user_id }),
-                `pnl_${u.user_code}.xlsx`,
-              );
-            }}
-          >
-            <FileSpreadsheet className="size-3 mr-0.5" /> Excel
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
+          />
+          <DownloadMenu
+            format="pdf"
+            user={u}
+            entityId={entityId}
+            dateParams={dateParams}
             className="h-7 text-[10px] px-2"
-            onClick={async () => {
-              await saveOrToast(
-                () => AccountsAPI.exportEntityUsersPdf(entityId, { ...dateParams, user_id: u.user_id }),
-                `pnl_${u.user_code}.pdf`,
-              );
-            }}
-          >
-            <FileText className="size-3 mr-0.5" /> PDF
-          </Button>
+          />
           {/* Billing: the FIFO statement (incl. weekly settlement rows). */}
           <Button
             variant="outline"
@@ -1142,32 +1198,21 @@ function UserPnlCard({
         <Button variant="outline" size="sm" className="h-8 text-[10px]" disabled>
           <FileText className="size-3 mr-1" /> Settle
         </Button>
-        <Button
-          variant="outline"
-          size="sm"
+        {/* Excel / PDF: account summary, Billing or Trade Book. */}
+        <DownloadMenu
+          format="xlsx"
+          user={u}
+          entityId={entityId}
+          dateParams={dateParams}
           className="h-8 text-[10px]"
-          onClick={async () => {
-            await saveOrToast(
-              () => AccountsAPI.exportEntityUsersExcel(entityId, { ...dateParams, user_id: u.user_id }),
-              `pnl_${u.user_code}.xlsx`,
-            );
-          }}
-        >
-          <FileSpreadsheet className="size-3 mr-1" /> Excel
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
+        />
+        <DownloadMenu
+          format="pdf"
+          user={u}
+          entityId={entityId}
+          dateParams={dateParams}
           className="h-8 text-[10px]"
-          onClick={async () => {
-            await saveOrToast(
-              () => AccountsAPI.exportEntityUsersPdf(entityId, { ...dateParams, user_id: u.user_id }),
-              `pnl_${u.user_code}.pdf`,
-            );
-          }}
-        >
-          <FileText className="size-3 mr-1" /> PDF
-        </Button>
+        />
         {/* Billing: the FIFO statement (incl. weekly settlement rows). */}
         <Button
           variant="outline"
