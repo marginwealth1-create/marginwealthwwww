@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 
 from beanie import PydanticObjectId
@@ -369,52 +370,14 @@ async def open_positions(user: CurrentUser):
             pass
 
     # Refresh LTP and unrealized PnL for the response (best-effort)
-    # Also fetch total brokerage per position from associated trades.
-    from datetime import timedelta
+    # Also the brokerage on each position's own live fills — each fill on
+    # exactly one position (position_service.own_fills), as the admin sees it.
     tokens = [r.instrument.token for r in rows]
-
-    # Per-position maps: opened_at (for opening fill lower bound) and
-    # cycle start (reopened_at or opened_at, for closing fill filter).
-    position_opens: dict[tuple[str, str], Any] = {}
-    position_cycle_starts: dict[tuple[str, str], Any] = {}
-    positions_by_key: dict[tuple[str, str], Position] = {}
-    for r in rows:
-        k = (r.instrument.token, str(r.product_type.value))
-        position_opens[k] = r.opened_at
-        position_cycle_starts[k] = r.reopened_at or r.opened_at
-        positions_by_key[k] = r
-
-    oldest_open = min((r.opened_at for r in rows if r.opened_at), default=None)
-    trade_q: dict[str, Any] = {
-        "user_id": user.id,
-        "instrument.token": {"$in": tokens},
-        **LIVE_FILL,
+    fills_of = await position_service.own_fills(rows)
+    charges_map = {
+        r.id: sum((to_decimal(t.total_charges or t.brokerage or 0) for t in fills_of[r.id]), Decimal(0))
+        for r in rows
     }
-    if oldest_open is not None:
-        trade_q["executed_at"] = {"$gte": oldest_open - timedelta(seconds=5)}
-    trades = await Trade.find(trade_q).to_list()
-
-    # Sum brokerage per (token, product_type).
-    # Opening fills (pnl_inr=None): count from opened_at onwards (lower bound
-    #   prevents old cycles from bleeding in; no upper bound since position is
-    #   still OPEN and more lots can be added at any time).
-    # Closing fills (pnl_inr set): only count from the current reopen cycle
-    #   (>= reopened_at) so stale closing fills don't accumulate.
-    charges_map: dict[tuple[str, str], float] = {}
-    for t in trades:
-        k = (t.instrument.token, str(t.product_type.value))
-        if k in positions_by_key and position_service.in_reopen_gap(positions_by_key[k], t.executed_at):
-            continue  # another position's, traded while this one sat closed
-        is_closing = getattr(t, "pnl_inr", None) is not None
-        if is_closing:
-            cycle_start = position_cycle_starts.get(k)
-            if cycle_start is not None and t.executed_at < cycle_start - timedelta(seconds=5):
-                continue  # stale closing fill from a previous cycle — skip
-        else:
-            pos_open = position_opens.get(k)
-            if pos_open is not None and t.executed_at < pos_open - timedelta(seconds=5):
-                continue  # opening fill from before this position opened — skip
-        charges_map[k] = charges_map.get(k, 0.0) + float(str(t.brokerage))
 
     # Parallelise LTP fetch + unrealised P&L refresh across every open
     # position with asyncio.gather. Sequential awaits made this O(N) on
@@ -461,8 +424,7 @@ async def open_positions(user: CurrentUser):
     out = []
     for r, resolved in zip(rows, ovn_resolved):
         d = _pos(r, expiry=emap.get(r.instrument.token), carry_enabled=carry_enabled)
-        k = (r.instrument.token, str(r.product_type.value))
-        charges_amt = charges_map.get(k, 0.0)
+        charges_amt = charges_map[r.id]
         d["charges"] = f"{charges_amt:.2f}"
         # Net the displayed P&L with the commission the admin charges.
         # The user reported the broker brokerage being deducted from
@@ -474,9 +436,9 @@ async def open_positions(user: CurrentUser):
         # wallet.
         if charges_amt > 0:
             try:
-                d["unrealized_pnl"] = f"{float(d['unrealized_pnl']) - charges_amt:.2f}"
-                d["realized_pnl"] = f"{float(d['realized_pnl']) - charges_amt:.2f}"
-            except (TypeError, ValueError):
+                d["unrealized_pnl"] = f"{to_decimal(d['unrealized_pnl']) - charges_amt:.2f}"
+                d["realized_pnl"] = f"{to_decimal(d['realized_pnl']) - charges_amt:.2f}"
+            except (TypeError, ArithmeticError):
                 pass
 
         # ── Carry-forward margin (the "Holding Margin" tile) ──

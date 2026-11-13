@@ -1099,6 +1099,75 @@ def in_reopen_gap(p: Position, ts: datetime) -> bool:
     return any(lo < ts < hi for lo, hi in p.reopen_gaps or [])
 
 
+_OWN_SLACK = timedelta(seconds=5)
+
+
+def _own_rank(p: Position, t: Trade) -> tuple[bool, bool, timedelta, float] | None:
+    """How strongly `p` claims fill `t` (lower wins); None when it can't."""
+    carried = t.product_type == ProductType.MIS and p.product_type in (ProductType.NRML, ProductType.CNC)
+    if (p.product_type != t.product_type and not carried) or in_reopen_gap(p, t.executed_at):
+        return None
+    at, zero = t.executed_at, timedelta(0)
+    off = max(p.opened_at - at if p.opened_at else zero, at - p.closed_at if p.closed_at else zero, zero)
+    if off > _OWN_SLACK:
+        return None
+    newest = -p.opened_at.timestamp() if p.opened_at else float("inf")
+    return (off > timedelta(seconds=1), carried, off, newest)
+
+
+async def own_fills(rows: list[Position]) -> dict[Any, list[Trade]]:
+    """Each live fill on the rows' (user, token) books, given to exactly ONE
+    position — the one that held the book when it executed — so overlapping
+    same-token positions (a scalper's re-entry, a reopened row, a carried
+    NRML row beside MIS round trips) never bill a fill twice. Every position
+    of the book competes, the closed neighbours a page doesn't list included.
+    Of the spans (less reopen gaps) within 5 s of the fill: inside one (to
+    1 s — the engine stamps the Trade just before apply_fill stamps the
+    Position) beats the slack; the fill's own product beats a carried
+    NRML / CNC row opened as MIS (the rollover flips only the doc); then the
+    nearer span, then the newer position. {row id: its fills, oldest first}."""
+    # ponytail: time spans, not ownership — a Trade carries no position id; a
+    # link stamped by apply_fill would make this exact. Re-entries < 1 s
+    # apart can swap a fill between two of the client's rows (never twice).
+    if not rows:
+        return {}
+    book: dict[str, Any] = {
+        "user_id": {"$in": list({r.user_id for r in rows})},
+        "instrument.token": {"$in": list({r.instrument.token for r in rows})},
+    }
+    opens = [r.opened_at for r in rows if r.opened_at]
+    ends = [r.closed_at for r in rows if r.closed_at]
+    fill_q: dict[str, Any] = {**book, **LIVE_FILL}
+    pos_q = dict(book)
+    if len(opens) == len(rows):  # else a row's start is unknown: the whole book
+        fill_q["executed_at"] = {"$gte": min(opens) - _OWN_SLACK}
+        # a neighbour closed up to 5 s before the first fill still competes
+        pos_q["$or"] = [{"closed_at": None}, {"closed_at": {"$gte": min(opens) - 2 * _OWN_SLACK}}]
+    if len(ends) == len(rows):  # all closed: nothing after the last close counts
+        fill_q.setdefault("executed_at", {})["$lte"] = max(ends) + _OWN_SLACK
+        pos_q["opened_at"] = {"$lte": max(ends) + 2 * _OWN_SLACK}
+    held = {p.id: p for p in await Position.find(pos_q).to_list()} | {r.id: r for r in rows}
+    books: dict[tuple[Any, str], list[Position]] = {}
+    for p in sorted(held.values(), key=lambda p: (p.opened_at is not None, p.opened_at)):
+        books.setdefault((p.user_id, p.instrument.token), []).append(p)
+    fills: dict[tuple[Any, str], list[Trade]] = {}
+    for t in await Trade.find(fill_q).sort("+executed_at").to_list():
+        fills.setdefault((t.user_id, t.instrument.token), []).append(t)
+
+    owned: dict[Any, list[Trade]] = {}
+    for key, ts in fills.items():  # one sweep per book: positions join as they open
+        ps, i, near = books.get(key, []), 0, []
+        for t in ts:
+            while i < len(ps) and ((o := ps[i].opened_at) is None or o - _OWN_SLACK <= t.executed_at):
+                near.append(ps[i])
+                i += 1
+            near = [p for p in near if p.closed_at is None or p.closed_at + _OWN_SLACK >= t.executed_at]
+            ranked = [(r, n) for n, p in enumerate(near) if (r := _own_rank(p, t)) is not None]
+            if ranked:
+                owned.setdefault(near[min(ranked)[1]].id, []).append(t)
+    return {r.id: owned.get(r.id, []) for r in rows}
+
+
 _QTY = Decimal("1e-8")
 _OPEN_ORDER = [OrderStatus.OPEN.value, OrderStatus.PENDING.value, OrderStatus.PARTIAL.value]
 

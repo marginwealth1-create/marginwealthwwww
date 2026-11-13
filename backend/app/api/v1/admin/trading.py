@@ -958,120 +958,33 @@ async def list_positions(
             except Exception:
                 ltp_map[tok] = 0.0
 
-    # Bulk-fetch every trade that touches these positions so we can attach
-    # a per-position `charges` total without an N+1 query. Mirrors the
-    # bucketing user-facing /positions/closed uses (start − slack ≤
-    # executed_at ≤ end + slack) so charges land on the right position
-    # lifecycle even when two CLOSED rows share (user, token, product).
-    # Same key the user endpoint uses keeps the math aligned across views.
-    from datetime import timedelta as _td_charges
+    # Each live fill on these rows' books, given to exactly ONE position (the
+    # one holding the book when it executed; closed neighbours off this page
+    # claim theirs), so overlapping same-token rows never bill a fill twice
+    # and Σ Charges is what the client was charged. Undone fills are out.
+    from decimal import Decimal  # noqa: PLC0415
 
-    by_charges_key: dict[tuple[str, str, str], list[Trade]] = {}
+    from app.utils.decimal_utils import to_decimal  # noqa: PLC0415
+
+    fills_of = await position_service.own_fills(rows)
     # Map order_id → order_type (MARKET / LIMIT / SL_M) so each position row
     # can show HOW it was opened. The Position has no order_type (it's an
     # order property); we recover it from the opening fill's order below.
     order_type_by_id: dict[Any, str] = {}
-    if rows:
-        user_ids_for_trades = list({r.user_id for r in rows})
-        trade_q: dict[str, Any] = {
-            "user_id": {"$in": user_ids_for_trades},
-            "instrument.token": {"$in": unique_tokens},
-            **LIVE_FILL,
-        }
-        oldest_open = min((r.opened_at for r in rows if r.opened_at), default=None)
-        if oldest_open is not None:
-            trade_q["executed_at"] = {"$gte": oldest_open - _td_charges(seconds=5)}
-        trade_rows = await Trade.find(trade_q).sort("+executed_at").to_list()
-        for t in trade_rows:
-            key = (str(t.user_id), t.instrument.token, t.product_type.value)
-            by_charges_key.setdefault(key, []).append(t)
-        # One bulk lookup of the orders behind those trades → order_type.
-        _oid_list = list({t.order_id for t in trade_rows if getattr(t, "order_id", None)})
-        if _oid_list:
-            _orders = await Order.find({"_id": {"$in": _oid_list}}).to_list()
-            order_type_by_id = {o.id: o.order_type.value for o in _orders}
+    _oid_list = list({t.order_id for fills in fills_of.values() for t in fills})
+    if _oid_list:
+        _orders = await Order.find({"_id": {"$in": _oid_list}}).to_list()
+        order_type_by_id = {o.id: o.order_type.value for o in _orders}
 
-    def _bucket_for(p: Position) -> list[Trade]:
-        """Trades belonging to this position's lifecycle.
-
-        A position carried overnight is converted MIS→NRML (or MIS→CNC) by
-        `convert_intraday_to_carry`, which flips ONLY the Position doc — the
-        opening Trade rows keep their original MIS `product_type`. So a
-        carried NRML/CNC position's `(user, token, NRML)` bucket misses its
-        own opening fills, leaving the admin blotter's Order-Type column
-        blank and its Charges column under-counted. For carry product types
-        we therefore merge in the MIS bucket (re-sorted by executed_at so the
-        earliest opening fill still wins) to recover the opening order.
-        """
-        key = (str(p.user_id), p.instrument.token, p.product_type.value)
-        bucket = list(by_charges_key.get(key, []))
-        if p.product_type.value in ("NRML", "CNC"):
-            mis_key = (str(p.user_id), p.instrument.token, "MIS")
-            mis_bucket = by_charges_key.get(mis_key)
-            if mis_bucket:
-                bucket = sorted(bucket + list(mis_bucket), key=lambda t: t.executed_at)
-        # Another position's fills, traded while this one sat closed.
-        return [t for t in bucket if not position_service.in_reopen_gap(p, t.executed_at)]
-
-    def _charges_for(p: Position) -> float:
-        bucket = _bucket_for(p)
-        if not bucket:
-            return 0.0
-        if not p.opened_at:
-            return sum(
-                float(str(getattr(t, "total_charges", None) or t.brokerage or 0))
-                for t in bucket
-            )
-        # Opening fills (pnl_inr=None): count from opened_at onwards.
-        #   Upper bound = closed_at for CLOSED positions (so later same-token
-        #   positions don't bleed in). No upper bound for OPEN positions
-        #   (more lots can be added at any time).
-        # Closing fills (pnl_inr set): only count from the current reopen
-        #   cycle (>= reopened_at) so stale closing rows don't accumulate.
-        cycle_start = p.reopened_at or p.opened_at
-        pos_open = p.opened_at
-        pos_end = p.closed_at  # None when OPEN — means no upper bound
-        slack = _td_charges(seconds=5)
-        total = 0.0
-        for t in bucket:
-            charge = float(str(getattr(t, "total_charges", None) or t.brokerage or 0))
-            if getattr(t, "pnl_inr", None) is not None:
-                # closing fill — must be in current lifecycle window.
-                # Upper bound: pos_end (closed_at) prevents later same-token
-                # positions' closing fills from bleeding into this row.
-                if t.executed_at < cycle_start - slack:
-                    continue
-                if pos_end is not None and t.executed_at > pos_end + slack:
-                    continue
-                total += charge
-            else:
-                # opening fill — lower bound: opened_at; upper bound: closed_at or none
-                if t.executed_at < pos_open - slack:
-                    continue
-                if pos_end is not None and t.executed_at > pos_end + slack:
-                    continue
-                total += charge
-        return total
+    def _charges_for(p: Position) -> Decimal:
+        return sum((to_decimal(t.total_charges or t.brokerage or 0) for t in fills_of[p.id]), Decimal(0))
 
     def _order_type_for(p: Position) -> str | None:
         """Order type (MARKET / LIMIT / SL_M) of the order that OPENED this
-        position — recovered from the earliest opening fill's order. Returns
-        None if the linking order isn't found."""
-        bucket = _bucket_for(p)
-        if not bucket:
-            return None
-        slack = _td_charges(seconds=5)
-        pos_open = p.opened_at
-        pos_end = p.closed_at
-        for t in bucket:  # already sorted +executed_at → first opening fill wins
-            if getattr(t, "pnl_inr", None) is not None:
-                continue  # closing fill, skip
-            if pos_open is not None and t.executed_at < pos_open - slack:
-                continue
-            if pos_end is not None and t.executed_at > pos_end + slack:
-                continue
-            ot = order_type_by_id.get(getattr(t, "order_id", None))
-            if ot:
+        position — its earliest opening fill's order (a carried NRML row's is
+        MIS-stamped). None if the linking order isn't found."""
+        for t in fills_of[p.id]:  # oldest first
+            if t.pnl_inr is None and (ot := order_type_by_id.get(t.order_id)):
                 return ot
         return None
 
@@ -2123,9 +2036,8 @@ async def admin_reopen_position(
         # reopen itself. The next reconcile pass cleans up.
         p.margin_used = Decimal128("0")
 
-    # Stamp reopened_at so _charges_for uses this as the Trade window
-    # start instead of opened_at — prevents brokerage from accumulating
-    # across multiple close/reopen/close cycles.
+    # Stamp reopened_at — cycle_closes starts this cycle's closes there — and
+    # the gap, whose fills are another position's (position_service.own_fills).
     p.reopened_at = _now_utc()
     p.reopen_gaps = [*p.reopen_gaps, (gap_from, p.reopened_at)]
 

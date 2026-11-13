@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { AlertOctagon, CalendarDays, History, Info, Loader2, Pencil, RefreshCw, RotateCcw, Search, TrendingDown, TrendingUp, Trash2, X, X as XIcon } from "lucide-react";
+import { AlertOctagon, History, Info, Loader2, Pencil, RefreshCw, RotateCcw, Search, TrendingDown, TrendingUp, Trash2, X, X as XIcon } from "lucide-react";
 import { TradingAPI, UsersAPI } from "@/lib/api";
 import { useMarketStream } from "@/lib/useMarketStream";
 import { Button } from "@/components/ui/button";
@@ -703,6 +703,15 @@ function AdminPositionsInner() {
     (s: number, r: any) => s + Number(r.unrealized_pnl || 0),
     0
   );
+  // Net = M2M − Close PNL. Close PNL can't follow the in-page search, so the
+  // M2M here is the whole scoped book's — still the WS-overlaid rows, so Net
+  // moves with every tick, not with the REST poll.
+  const bookM2M = (openRowsLive ?? openRows ?? []).reduce(
+    (s: number, r: any) => s + Number(r.unrealized_pnl || 0),
+    0
+  );
+  const closePnl = pnl?.week_total_of_both ?? 0;
+  const netPnl = bookM2M - closePnl;
 
   // Pagination. CLOSED is paginated SERVER-side (rows already represent the
   // current page), so we use them as-is. OPEN is the full set loaded in one
@@ -1302,15 +1311,11 @@ function AdminPositionsInner() {
           icon={totalPnl >= 0 ? TrendingUp : TrendingDown}
         />
         <PnlCard
-          // Headline = Total of Both (broker take = −Net Client PNL + Brokerage),
+          // Close PNL = Total of Both (broker take = −Net Client PNL + Brokerage),
           // the SAME figure the Accounts dashboard shows for this Mon→Sun window.
           // Breakdown (Net P&L + Brokerage) sits in the hint so the two pages
           // reconcile line-for-line. Date range on top mirrors Accounts.
-          label={
-            pnl?.week_label
-              ? `This Week — Total of Both (${pnl.week_label})`
-              : "This Week — Total of Both"
-          }
+          label={pnl?.week_label ? `Close PNL (${pnl.week_label})` : "Close PNL"}
           // Broker take: PROFIT (positive) → red, LOSS (negative) → green.
           value={pnl?.week_total_of_both ?? 0}
           invertColor
@@ -1327,23 +1332,17 @@ function AdminPositionsInner() {
           loading={pnlLoading}
         />
         <PnlCard
-          label={
-            pnl?.last_week_label
-              ? `Last Week — Total of Both (${pnl.last_week_label})`
-              : "Last Week — Total of Both"
-          }
-          value={pnl?.last_week_total_of_both ?? 0}
-          invertColor
+          // Client view, like Open PNL: Close PNL is the broker's take, so
+          // Net = M2M − Close PNL is the client's floating + booked week.
+          label="Net = M2M − Close PNL"
+          value={netPnl}
           hint={
             <>
-              Net P&amp;L{" "}
-              <span className={pnlColor(pnl?.last_week_net_client_pnl ?? 0)}>
-                {formatINR(pnl?.last_week_net_client_pnl ?? 0)}
-              </span>{" "}
-              + Brokerage {formatINR(pnl?.last_week_brokerage ?? 0)}
+              M2M <span className={pnlColor(bookM2M)}>{formatINR(bookM2M)}</span> − Close PNL{" "}
+              {formatINR(closePnl)}
             </>
           }
-          icon={CalendarDays}
+          icon={netPnl >= 0 ? TrendingUp : TrendingDown}
           loading={pnlLoading}
         />
       </section>
