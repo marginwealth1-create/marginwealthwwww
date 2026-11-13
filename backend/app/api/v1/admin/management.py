@@ -37,7 +37,7 @@ from app.schemas.common import APIResponse
 from app.services import admin_management_service as mgmt
 from app.services import admin_settlement_service as stl
 from app.services import tradebook_builder, user_service
-from app.services.accounts_dashboard_service import client_totals_for_users
+from app.services.accounts_dashboard_service import _entity_pool_ids, client_totals_for_users
 from app.utils.time_utils import IST
 
 router = APIRouter(prefix="/management", tags=["admin-management"])
@@ -515,8 +515,9 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
 
     # Resolve the trading-client pool comprehensively (directly-assigned +
     # whole broker subtree), broker/sub-broker LOGIN rows excluded. All
-    # statuses are kept here so wallet / PNL / trade rollups still cover
-    # closed users' history; the counts below split active vs non-closed.
+    # statuses are kept here so wallet / all-time PNL / trade rollups still
+    # cover closed users' history (the Today / This week cards read the
+    # Accounts pool); the counts below split active vs non-closed.
     coll = User.get_motor_collection()
     clause = await _admin_pool_clause(sa.id)
     cursor = coll.find(
@@ -617,12 +618,14 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
         )
         return raw * rate
 
-    # Today / This week realised: the pool's Billing statement Gross PnL
-    # (tradebook_builder.booked) — every close in the window at what the
+    # Today / This week realised: the Billing statement Gross PnL
+    # (tradebook_builder.booked) of the admin's Accounts-dashboard pool —
+    # demo and CLOSED clients out — every close in the window at what the
     # wallet booked, settlements included, undone fills out; a partial close
     # of a position still open counts.
+    pnl_pool = await _entity_pool_ids(sa.id, _UR.ADMIN.value)
     today_realised, week_realised = [
-        (await client_totals_for_users(pool, *windows[k]))["net_client_pnl"] for k in ("today", "week")
+        (await client_totals_for_users(pnl_pool, *windows[k]))["net_client_pnl"] for k in ("today", "week")
     ]
     all_closed = await Position.find(
         {**user_q, "status": PositionStatus.CLOSED.value}

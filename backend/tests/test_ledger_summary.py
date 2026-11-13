@@ -30,7 +30,7 @@ from app.models.transaction import WalletTransaction, ledger_bucket
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.schemas.admin.common import WalletAdjustRequest
-from app.services import market_data_service, position_service, wallet_service
+from app.services import accounts_dashboard_service, market_data_service, position_service, wallet_service
 from tests._real_fill import INSTRUMENT, market, set_commission_per_lot
 
 ROUND = INSTRUMENT.model_copy(update={"token": "TLS1", "symbol": "TLS26ROUND"})
@@ -141,6 +141,29 @@ async def test_the_strip_sums_every_cash_row_and_no_trading_row(w):
     money = await money_transactions.money_by_user(w.sa, preset="all", from_date=None, to_date=None)
     [row] = money.data["users"]
     assert (row["deposit"], row["add_fund"], row["deduct"]) == (10000.0, 1000.0, 300.0)  # deduct was 305
+
+
+async def test_every_cash_reader_buckets_an_admin_entry_alike(w):
+    """An admin's manual entry is Add / Deduct Fund whatever type it was booked
+    under (the client's ledger already calls a BONUS 'Deposit by admin'): the
+    ledger strip, the Accounts dashboard and Payments → Money count the same rows."""
+    await scenario(w)
+    for amount, tt in ((500, "BONUS"), (100, "PROMO"), (-200, "PENALTY")):
+        req = WalletAdjustRequest(amount=amount, narration=f"{tt} entry", transaction_type=tt)
+        await users.wallet_adjust(str(w.u.id), req, w.sa)
+    strip = (
+        await admin_ledger.list_all(w.sa, user_id=str(w.u.id), transaction_type=None, page=1, page_size=1)
+    ).data["summary"]
+    dep, wd = Decimal(strip["deposits"]), Decimal(strip["withdrawals"])
+    assert (dep, wd) == (Decimal("11600"), Decimal("500"))
+
+    kpi = await accounts_dashboard_service.compute_broker_totals(w.sa.id, None, None)
+    assert (Decimal(kpi["total_deposits"]), Decimal(kpi["total_withdrawals"])) == (dep, wd)
+    money = await money_transactions.money_by_user(w.sa, preset="all", from_date=None, to_date=None)
+    [row] = money.data["users"]
+    assert (row["deposit"] + row["add_fund"], row["withdraw"] + row["deduct"]) == (float(dep), float(wd))
+    by_broker = await money_transactions.money_by_broker(w.sa, preset="all", from_date=None, to_date=None)
+    assert by_broker.data["totals"]["admin_add_fund"] == row["add_fund"] == 1600.0
 
 
 async def test_the_sheet_asks_for_its_types_server_side(w):

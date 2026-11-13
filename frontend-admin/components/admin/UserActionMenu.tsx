@@ -837,7 +837,7 @@ export function LiveTradeStatsDialog({
             </Section>
 
             {/* ── Realized P/L ───────────────────────────────────── */}
-            <Section title="Realized P/L" hint="closed positions">
+            <Section title="Realized P/L" hint="weekly net: billing statement, Mon → now IST">
               <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
                 <StatCard
                   label="Weekly Net P/L"

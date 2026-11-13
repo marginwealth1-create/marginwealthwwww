@@ -21,7 +21,7 @@ from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, Query
 
 from app.core.dependencies import CurrentAdmin, require_perm, scoped_user_ids
-from app.models.transaction import SYSTEM_ADJUSTMENT_PATTERNS, WalletTransaction
+from app.models.transaction import CASH_TYPES, SYSTEM_ADJUSTMENT_PATTERNS, TransactionType, WalletTransaction
 from app.models.user import User, UserRole
 from app.schemas.common import APIResponse
 
@@ -31,7 +31,10 @@ IST = ZoneInfo("Asia/Kolkata")
 
 # Only money-movement rows count — trade / brokerage / charges / pnl are NOT
 # money in/out of the wallet from the user's view and live on the ledger page.
-_MONEY_TYPES = ["DEPOSIT", "WITHDRAWAL", "ADJUSTMENT", "SETTLEMENT_OUTSTANDING_BOOKED"]
+_MONEY_TYPES = [t.value for t in CASH_TYPES] + ["SETTLEMENT_OUTSTANDING_BOOKED"]
+# An admin's manual entry — ADJUSTMENT, BONUS, PROMO, PENALTY — is Add / Deduct
+# Fund by its sign, as models.transaction.ledger_bucket buckets it.
+_ADMIN_ENTRY_TYPES = [t.value for t in CASH_TYPES - {TransactionType.DEPOSIT, TransactionType.WITHDRAWAL}]
 # The ADJUSTMENT narrations the backend writes itself (initial balance credit,
 # bogus-fill reversal, EOD carry fee): not an operator's Add / Deduct Fund.
 _SYSTEM_NARRATION_RX = "|".join(re.escape(p) for p in SYSTEM_ADJUSTMENT_PATTERNS)
@@ -151,7 +154,7 @@ async def money_by_user(
     }
     is_operator_adj = {
         "$and": [
-            {"$eq": ["$transaction_type", "ADJUSTMENT"]},
+            {"$in": ["$transaction_type", _ADMIN_ENTRY_TYPES]},
             {"$not": is_system_adj},
         ]
     }
@@ -270,7 +273,7 @@ async def money_by_broker(
     # Deposit (+ add-fund total) per client over the window.
     dmatch: dict[str, Any] = {
         "user_id": {"$in": scoped},
-        "transaction_type": {"$in": ["DEPOSIT", "ADJUSTMENT"]},
+        "transaction_type": {"$in": ["DEPOSIT", *_ADMIN_ENTRY_TYPES]},
         "status": "COMPLETED",
         **_date_match(from_utc, to_utc),
     }
@@ -288,7 +291,7 @@ async def money_by_broker(
     }
     _is_operator_adj_byb = {
         "$and": [
-            {"$eq": ["$transaction_type", "ADJUSTMENT"]},
+            {"$in": ["$transaction_type", _ADMIN_ENTRY_TYPES]},
             {"$not": _is_system_adj_byb},
         ]
     }

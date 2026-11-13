@@ -26,12 +26,14 @@ from beanie import init_beanie
 from bson import Decimal128
 from motor.motor_asyncio import AsyncIOMotorClient
 
+from app.api.v1.admin import accounts as accounts_api
 from app.api.v1.admin import brokers, management, reports, trading
 from app.api.v1.admin import users as users_api
 from app.api.v1.user import dashboard as dashboard_api
 from app.api.v1.user import positions as positions_api
 from app.core.config import settings
 from app.core.database import _document_models
+from app.core.dependencies import scoped_user_ids
 from app.models._base import Exchange, ProductType
 from app.models.order import InstrumentRef
 from app.models.position import Position
@@ -39,7 +41,7 @@ from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.services import accounts_dashboard_service as ads
 from app.services import market_data_service, tradebook_builder
-from app.utils.time_utils import IST, now_utc
+from app.utils.time_utils import IST, now_utc, to_ist
 from tests._real_fill import INSTRUMENT, later, market, set_commission_per_lot, settle_weekly
 
 _DB = f"{settings.MONGODB_DB_NAME}_test_weekly_pnl_one_definition"
@@ -213,6 +215,83 @@ async def test_every_card_reads_the_billing_statement(w):
     for k, (lo, hi) in periods.items():
         [acc] = (await ads.get_entity_users(None, "SUPER_ADMIN", lo, hi, user_id=c.id))["items"]
         assert (_d(acc["net_pnl"]), _d(acc["net_bkg"]), _d(acc["total_pnl"])) == st[k], k
+
+    # ── accounts dashboard CSV (/accounts/summary): Realized P&L and Brokerage
+    # are the statement's Gross and Brokerage — the partial close of a position
+    # still open, the USD crypto close in rupees, the settlement — lifetime too.
+    st["lifetime"] = await _statement(c, None, None)
+    dates = {k: (_ist(lo), _ist(hi)) for k, (lo, hi) in periods.items()} | {"lifetime": (None, None)}
+    for k, (f, t) in dates.items():
+        ents = (await accounts_api.accounts_summary(w.sa, "all_users", f, t, None, None)).data["entities"]
+        [e] = [e for e in ents if e["id"] == str(c.id)]
+        assert (_d(e["realized_pnl"]), _d(e["brokerage"])) == st[k][:2], k
+
+
+def _ist(dt: datetime) -> str:
+    return to_ist(dt).date().isoformat()
+
+
+async def test_an_entity_reads_one_pool_on_every_screen(w):
+    """An admin's or a broker's figure covers the same clients on every screen:
+    demo and deleted (CLOSED) clients nowhere, and the clients of a broker
+    transferred to this admin (their rows keep the old assigned_admin_id,
+    sub-broker clients included) everywhere the admin's Positions table shows
+    them — not on the table and the Accounts rows but missing from the KPI and
+    the Close PNL card."""
+    a1, b1, c = w.a1, w.b1, w.c
+    n = 90
+
+    async def mk(role: UserRole = UserRole.CLIENT, **kw) -> User:
+        nonlocal n
+        n += 1
+        u = User(user_code=f"TWP{n:03d}", email=f"twp{n}@example.com", mobile=f"93700{n:05d}",
+                 full_name=f"TWP{n}", password_hash="x", role=role, status=UserStatus.ACTIVE, **kw)
+        await u.insert()
+        await Wallet(user_id=u.id, available_balance=Decimal128("10000")).insert()
+        return u
+
+    # b1 came over from a0: its client and its sub-broker's client still say a0.
+    a0 = await mk(UserRole.ADMIN)
+    c3 = await mk(assigned_admin_id=a0.id, assigned_broker_id=b1.id, broker_ancestry=[b1.id])
+    sb = await mk(UserRole.BROKER, assigned_admin_id=a0.id, assigned_broker_id=b1.id, broker_ancestry=[b1.id])
+    c5 = await mk(assigned_admin_id=a0.id, assigned_broker_id=sb.id, broker_ancestry=[b1.id, sb.id])
+    under_b1 = {"assigned_admin_id": a1.id, "assigned_broker_id": b1.id, "broker_ancestry": [b1.id]}
+    demo = await mk(is_demo=True, **under_b1)
+    gone = await mk(**under_b1)
+    for u, gain in ((c, 10), (c3, 20), (c5, 30), (demo, 50), (gone, 70)):
+        inst = INSTRUMENT.model_copy(update={"token": f"TWPE{gain}", "symbol": f"TWPE{gain}"})
+        await market(u, "BUY", 1, "100", instrument=inst)
+        await market(u, "SELL", 1, str(100 + gain), instrument=inst)
+    await User.get_motor_collection().update_one({"_id": gone.id}, {"$set": {"status": "CLOSED"}})
+
+    periods = tradebook_builder.periods()
+    pool = await scoped_user_ids(a1)  # a1's Positions table and Users list
+    assert set(pool) == {c.id, c3.id, c5.id}
+    users = {u.id: u for u in (c, c3, c5)}
+
+    async def total(ids, k: str) -> list[Decimal]:
+        sts = [await _statement(users[i], *periods[k]) for i in ids]
+        return [sum((s[j] for s in sts), Decimal(0)) for j in range(3)]
+
+    for k in ("today", "week"):
+        g, b, _net = await total(pool, k)
+        assert g == Decimal("60")  # c +10, c3 +20, c5 +30
+        f, t = _ist(periods[k][0]), _ist(periods[k][1])
+        for actor in (w.sa, a1):  # the super-admin picking a1, and a1 on its own page
+            kpi = (await accounts_api.broker_totals(str(a1.id), actor, f, t, None, None)).data
+            assert (_d(kpi["net_client_pnl"]), _d(kpi["net_client_bkg"])) == (g, b), (k, actor.role)
+            rows = (await accounts_api.entity_users(str(a1.id), actor, f, t, None, 1, 100, None, None)).data
+            assert {r["user_id"] for r in rows["items"]} == {str(i) for i in pool}, (k, actor.role)
+        assert _d((await management.sub_admin_report(str(a1.id), w.sa)).data["pnl"][f"{k}_realised"]) == g, k
+        # b1's detail page counts its direct clients (c, c3); demo and deleted ones out.
+        bg = (await total([c.id, c3.id], k))[0]
+        assert _d((await brokers.broker_report(str(b1.id), a1)).data["pnl"][f"{k}_realised"]) == bg, k
+
+    trading._ADMIN_PNL_CACHE.clear()
+    adm = (await trading.positions_pnl_summary(a1, None, False, None)).data
+    week = [_d(adm[f]) for f in ("week_net_client_pnl", "week_brokerage", "week_pnl")]
+    assert week == await total(pool, "week")
+    assert _d(adm["today_pnl"]) == (await total(pool, "today"))[2]
 
 
 def test_the_week_runs_monday_to_sunday_ist():

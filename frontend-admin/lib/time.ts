@@ -42,3 +42,23 @@ export function istWeekSoFar(now: Date = new Date()): [string, string] {
   const sinceMonday = (ist.getUTCDay() + 6) % 7;
   return [ymd(new Date(ist.getTime() - sinceMonday * 86_400_000)), ymd(ist)];
 }
+
+/** The IST day, week (Mon → Sun) or month holding `now`, as UTC ISO bounds —
+ *  the P&L-sharing report's periods, whatever the device timezone. */
+export function istPeriodBounds(
+  cadence: "DAILY" | "WEEKLY" | "MONTHLY",
+  now: Date = new Date(),
+): { from: string; to: string } {
+  const [monday, today] = istWeekSoFar(now);
+  let [first, last] = [today, today];
+  if (cadence === "WEEKLY") {
+    first = monday;
+    last = ymd(new Date(Date.parse(`${monday}T00:00:00Z`) + 6 * 86_400_000));
+  } else if (cadence === "MONTHLY") {
+    const [y, m] = today.split("-").map(Number);
+    first = `${today.slice(0, 8)}01`;
+    last = ymd(new Date(Date.UTC(y, m, 0))); // day 0 of next month = this month's last
+  }
+  const at = (d: string, t: string) => new Date(`${d}T${t}+05:30`).toISOString();
+  return { from: at(first, "00:00:00.000"), to: at(last, "23:59:59.999") };
+}

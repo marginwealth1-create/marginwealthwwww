@@ -45,7 +45,7 @@ from app.schemas.common import APIResponse
 from app.services import broker_management_service as svc
 from app.services import broker_settlement_service as stl
 from app.services import tradebook_builder
-from app.services.accounts_dashboard_service import client_totals_for_users
+from app.services.accounts_dashboard_service import _broker_client_ids, client_totals_for_users
 from app.utils.time_utils import IST
 
 router = APIRouter(prefix="/management", tags=["admin-brokers"])
@@ -490,12 +490,14 @@ async def broker_report(broker_id: str, actor: CurrentAdmin):
         rate = to_decimal(p.open_usd_inr_rate) if p.open_usd_inr_rate is not None else fallback_usd_inr
         return raw * rate
 
-    # Today / This week realised: the pool's Billing statement Gross PnL
-    # (tradebook_builder.booked) — every close in the window at what the
-    # wallet booked, settlements included, undone fills out; a partial close
-    # of a position still open counts.
+    # Today / This week realised: the Billing statement Gross PnL
+    # (tradebook_builder.booked) of the broker's direct clients — demo and
+    # CLOSED clients out — every close in the window at what the wallet
+    # booked, settlements included, undone fills out; a partial close of a
+    # position still open counts.
+    pnl_pool = await _broker_client_ids(b.id)
     today_realised, week_realised = [
-        (await client_totals_for_users(pool, *windows[k]))["net_client_pnl"] for k in ("today", "week")
+        (await client_totals_for_users(pnl_pool, *windows[k]))["net_client_pnl"] for k in ("today", "week")
     ]
     all_closed = await Position.find(
         {**user_q, "status": PositionStatus.CLOSED.value}

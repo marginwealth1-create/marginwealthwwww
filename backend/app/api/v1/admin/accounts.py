@@ -102,19 +102,20 @@ async def _aggregate_for_users(
     total_equity = total_balance + total_unrealized
     total_settlement = sum(_d(w.settlement_outstanding) for w in wallets)
 
+    # Realized P&L / Brokerage: the users' Billing statement Gross and
+    # Brokerage over the window (lifetime when unbounded) — the rows on screen.
+    booked = (await tradebook_builder.booked(user_ids, start_utc, end_utc)).values()
+    realized_pnl = float(sum((g for g, _ in booked), Decimal(0)))
+    brokerage = float(sum((b for _, b in booked), Decimal(0)))
+
     if is_lifetime:
         deposits = sum(_d(w.total_deposits) for w in wallets)
         withdrawals = sum(_d(w.total_withdrawals) for w in wallets)
-        realized_pnl = sum(_d(w.realized_pnl) for w in wallets)
 
-        # Brokerage: wallet.total_brokerage is often 0 because brokerage
-        # is tracked per-trade (Trade.brokerage) not as a separate wallet
-        # transaction. Always sum from trades for accuracy.
         all_trades = await Trade.find({
             "user_id": {"$in": user_ids},
             "superseded_by_reopen": {"$ne": True},
         }).to_list()
-        brokerage = sum(_d(t.brokerage) for t in all_trades)
         volume = sum(_d(t.value) for t in all_trades)
 
         all_closing_trades = [t for t in all_trades if t.pnl_inr is not None]
@@ -142,13 +143,6 @@ async def _aggregate_for_users(
         }).to_list()
         withdrawals = sum(abs(_d(t.amount)) for t in wd_txns)
 
-        closed_positions = await Position.find({
-            "user_id": {"$in": user_ids},
-            "status": PositionStatus.CLOSED.value,
-            "closed_at": date_filter,
-        }).to_list()
-        realized_pnl = sum(_d(p.realized_pnl) for p in closed_positions)
-
         closing_trades = await Trade.find({
             "user_id": {"$in": user_ids},
             "superseded_by_reopen": {"$ne": True},
@@ -164,7 +158,6 @@ async def _aggregate_for_users(
             "superseded_by_reopen": {"$ne": True},
             "executed_at": date_filter,
         }).to_list()
-        brokerage = sum(_d(t.brokerage) for t in all_trades)
         volume = sum(_d(t.value) for t in all_trades)
 
     net_deposit = deposits - withdrawals

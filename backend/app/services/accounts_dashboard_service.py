@@ -30,10 +30,10 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-from app.core.dependencies import effective_scope_actor, scoped_user_filter
+from app.core.dependencies import _admin_pool_clause, effective_scope_actor, scoped_user_filter
 from app.core.exceptions import InsufficientPermissionsError
 from app.models.pnl_sharing import AgreementStatus, AgreementType, PnlSharingAgreement
-from app.models.transaction import TransactionType, WalletTransaction, is_system_adjustment
+from app.models.transaction import CASH_TYPES, TransactionType, WalletTransaction, ledger_bucket
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.services import tradebook_builder
@@ -143,7 +143,10 @@ async def _entity_pool_ids(
         # uske andar ke sub-broker ke users bhi dikhe").
         query["broker_ancestry"] = entity_id
     elif entity_role in (UserRole.ADMIN.value, "ADMIN"):
-        query["assigned_admin_id"] = entity_id
+        # The admin's whole pool, the one its Positions table shows: its own
+        # clients plus every client under its brokers (a transferred broker's
+        # subtree keeps the old assigned_admin_id).
+        query.update(await _admin_pool_clause(entity_id))
     elif entity_role in (UserRole.SUPER_ADMIN.value, "SUPER_ADMIN"):
         pass  # all users
     else:
@@ -286,54 +289,23 @@ async def compute_broker_totals(
     net_client_bkg = _ct["net_client_bkg"]
 
     if user_ids:
-        # Deposits in window =
-        #   • user-initiated DEPOSIT requests, AND
-        #   • admin manual "Add Fund" (ADJUSTMENT, amount > 0).
-        # The ONLY ADJUSTMENT+ we exclude is the automatic initial_balance
-        # credit written on user creation (narration "Initial balance credit
-        # by …") — that's an onboarding entry, not a real deposit, and folding
-        # it in once ballooned the tile to ~23 lakh for a week of signups.
-        # Withdrawals mirror this with ADJUSTMENT negatives ("Deduct Fund").
-        dep_query: dict[str, Any] = {
+        # Deposits / withdrawals in window: the cash rows the ledger strip sums
+        # (models.transaction.ledger_bucket) — DEPOSIT / WITHDRAWAL and every
+        # admin Add / Deduct Fund, whatever type it was booked under; a system
+        # ADJUSTMENT (initial balance credit, bogus-fill reversal, the EOD carry
+        # fee) is no cash in or out.
+        cash_query: dict[str, Any] = {
             "user_id": {"$in": user_ids},
-            "transaction_type": {"$in": [TransactionType.DEPOSIT.value, TransactionType.ADJUSTMENT.value]},
+            "transaction_type": {"$in": [t.value for t in CASH_TYPES]},
         }
         if date_filter:
-            dep_query["created_at"] = date_filter
-        dep_txns = await WalletTransaction.find(dep_query).to_list()
-        for t in dep_txns:
-            amt = to_decimal(t.amount)
-            if t.transaction_type == TransactionType.ADJUSTMENT:
-                if amt <= 0:
-                    continue  # admin Deduct Fund → counted under withdrawals
-                if is_system_adjustment(t.narration):
-                    # Onboarding initial balance, bogus-fill reversal, or
-                    # any other auto-generated correction — NOT a real
-                    # admin Add Fund. See SYSTEM_ADJUSTMENT_PATTERNS
-                    # (models/transaction.py) for the list and why.
-                    continue
-            total_deposits += abs(amt)
-
-        # Withdrawals in window =
-        #   • user-initiated WITHDRAWAL requests, AND
-        #   • admin manual "Deduct Fund" (ADJUSTMENT, amount < 0).
-        wd_query: dict[str, Any] = {
-            "user_id": {"$in": user_ids},
-            "transaction_type": {"$in": [TransactionType.WITHDRAWAL.value, TransactionType.ADJUSTMENT.value]},
-        }
-        if date_filter:
-            wd_query["created_at"] = date_filter
-        wd_txns = await WalletTransaction.find(wd_query).to_list()
-        for t in wd_txns:
-            amt = to_decimal(t.amount)
-            if t.transaction_type == TransactionType.ADJUSTMENT:
-                if amt >= 0:
-                    continue  # admin Add Fund → counted under deposits
-                if is_system_adjustment(t.narration):
-                    # Negative system corrections (e.g. reversal debits)
-                    # are NOT real Deduct Fund actions.
-                    continue
-            total_withdrawals += abs(amt)
+            cash_query["created_at"] = date_filter
+        for t in await WalletTransaction.find(cash_query).to_list():
+            bucket = ledger_bucket(t.transaction_type, t.amount, t.narration)
+            if bucket == "deposit":
+                total_deposits += abs(to_decimal(t.amount))
+            elif bucket == "withdrawal":
+                total_withdrawals += abs(to_decimal(t.amount))
 
     # Settlement — windowed (BOOKED − RECOVERY WalletTransactions in
     # the selected period) when a date filter is set, full lifetime
@@ -491,17 +463,9 @@ async def get_entity_users(
         # this broker's id for every descendant), not just direct clients.
         user_query["broker_ancestry"] = entity_id
     elif entity_role in (UserRole.ADMIN.value, "ADMIN"):
-        # Include direct users + users under admin's brokers
-        broker_ids = [
-            b["_id"] async for b in User.get_motor_collection().find(
-                {"assigned_admin_id": entity_id, "role": UserRole.BROKER.value},
-                {"_id": 1},
-            )
-        ]
-        scope_filter = [{"assigned_admin_id": entity_id}]
-        if broker_ids:
-            scope_filter.append({"assigned_broker_id": {"$in": broker_ids}})
-        user_query["$or"] = scope_filter
+        # Direct users + every user under the admin's brokers and sub-brokers:
+        # the pool _entity_pool_ids gives the KPI cards.
+        user_query.update(await _admin_pool_clause(entity_id))
     elif entity_role == DIRECT:
         user_query["assigned_broker_id"] = None
     elif entity_role not in (UserRole.SUPER_ADMIN.value, "SUPER_ADMIN"):
