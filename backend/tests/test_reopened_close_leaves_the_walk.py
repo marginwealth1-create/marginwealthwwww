@@ -40,17 +40,10 @@ from app.models.trade import Trade
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.services import market_data_service, position_service
-from tests._real_fill import INSTRUMENT, market, set_commission_per_lot
+from tests._real_fill import INSTRUMENT, later, market, set_commission_per_lot
 
 _DB = f"{settings.MONGODB_DB_NAME}_test_reopened_close_leaves_the_walk"
 CENT = Decimal("0.01")
-
-_CLOCKS = {
-    "trades": ("executed_at", "created_at"),
-    "positions": ("opened_at", "closed_at", "reopened_at", "created_at"),
-    "orders": ("created_at", "executed_at"),
-    "wallet_transactions": ("created_at",),
-}
 
 
 @pytest_asyncio.fixture
@@ -94,14 +87,7 @@ async def w(monkeypatch):
 
 
 async def _later(w, *, minutes: float) -> None:
-    """Time passes: every stored clock moves back."""
-    ms = int(minutes * 60_000)
-    for coll, fields in _CLOCKS.items():
-        shift = {
-            f: {"$cond": [{"$eq": [{"$type": f"${f}"}, "date"]}, {"$subtract": [f"${f}", ms]}, f"${f}"]}
-            for f in fields
-        }
-        await w.db[coll].update_many({}, [{"$set": shift}])
+    await later(w.db, minutes=minutes)
 
 
 async def _reopen(w) -> Position:

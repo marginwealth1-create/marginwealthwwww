@@ -113,6 +113,11 @@ class Position(TimestampMixin):
     # cycles since opened_at — prevents brokerage accumulation across
     # multiple close/reopen/close sequences.
     reopened_at: datetime | None = None
+    # (closed, reopened) spans an admin reopen left behind — opened_at stays
+    # the first open, so every opened_at-keyed window would otherwise take in
+    # another position's fills from while this one was closed. Fills strictly
+    # inside a gap are not this position's. Recorded by reopens from now on.
+    reopen_gaps: list[tuple[datetime, datetime]] = Field(default_factory=list)
 
     class Settings:
         name = "positions"

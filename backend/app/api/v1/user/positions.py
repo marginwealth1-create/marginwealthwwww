@@ -377,10 +377,12 @@ async def open_positions(user: CurrentUser):
     # cycle start (reopened_at or opened_at, for closing fill filter).
     position_opens: dict[tuple[str, str], Any] = {}
     position_cycle_starts: dict[tuple[str, str], Any] = {}
+    positions_by_key: dict[tuple[str, str], Position] = {}
     for r in rows:
         k = (r.instrument.token, str(r.product_type.value))
         position_opens[k] = r.opened_at
         position_cycle_starts[k] = r.reopened_at or r.opened_at
+        positions_by_key[k] = r
 
     oldest_open = min((r.opened_at for r in rows if r.opened_at), default=None)
     trade_q: dict[str, Any] = {
@@ -400,6 +402,8 @@ async def open_positions(user: CurrentUser):
     charges_map: dict[tuple[str, str], float] = {}
     for t in trades:
         k = (t.instrument.token, str(t.product_type.value))
+        if k in positions_by_key and position_service.in_reopen_gap(positions_by_key[k], t.executed_at):
+            continue  # another position's, traded while this one sat closed
         is_closing = getattr(t, "pnl_inr", None) is not None
         if is_closing:
             cycle_start = position_cycle_starts.get(k)

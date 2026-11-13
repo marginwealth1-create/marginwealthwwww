@@ -40,19 +40,11 @@ from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.services import market_data_service, position_service, weekly_settlement_service
 from app.utils.time_utils import now_utc
-from tests._real_fill import market, set_commission_per_lot
+from tests._real_fill import later, market, set_commission_per_lot
 
 _DB = f"{settings.MONGODB_DB_NAME}_test_deleted_fill_leaves_the_book"
 CENT = Decimal("0.01")
 START = Decimal("1000000")
-
-_CLOCKS = {
-    "trades": ("executed_at", "created_at"),
-    "positions": ("opened_at", "closed_at", "reopened_at", "created_at"),
-    "orders": ("created_at", "executed_at"),
-    "wallet_transactions": ("created_at",),
-    "position_settlements": ("settled_at", "created_at"),
-}
 
 
 @pytest_asyncio.fixture
@@ -96,15 +88,7 @@ async def w(monkeypatch):
 
 
 async def _later(w, *, minutes: float = 0, seconds: float = 0) -> None:
-    """Time passes: every stored clock moves back, so what comes next happens
-    that much after everything already written."""
-    ms = int((minutes * 60 + seconds) * 1000)
-    for coll, fields in _CLOCKS.items():
-        shift = {
-            f: {"$cond": [{"$eq": [{"$type": f"${f}"}, "date"]}, {"$subtract": [f"${f}", ms]}, f"${f}"]}
-            for f in fields
-        }
-        await w.db[coll].update_many({}, [{"$set": shift}])
+    await later(w.db, minutes=minutes, seconds=seconds)
 
 
 async def _only_position(w, status: PositionStatus | None = None) -> Position:

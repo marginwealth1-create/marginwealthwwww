@@ -1078,10 +1078,19 @@ async def position_fills_query(p: Position) -> dict[str, Any]:
         {"executed_at": {"$gte": o.opened_at - timedelta(seconds=2), "$lte": o.closed_at or hi}}
         for o in others
         if o.opened_at
-    ]
+    ] + reopen_gap_clauses(p)
     if spans:
         q["$nor"] = spans
     return q
+
+
+def reopen_gap_clauses(p: Position) -> list[dict[str, Any]]:
+    """`$nor` clauses for the fills inside `p`'s reopen gaps (not its own)."""
+    return [{"executed_at": {"$gt": lo, "$lt": hi}} for lo, hi in p.reopen_gaps or []]
+
+
+def in_reopen_gap(p: Position, ts: datetime) -> bool:
+    return any(lo < ts < hi for lo, hi in p.reopen_gaps or [])
 
 
 _LIVE_FILL = {"superseded_by_reopen": {"$ne": True}, "fifo_deleted": {"$ne": True}}
@@ -1220,6 +1229,23 @@ async def _resync_open_lots(old: Position, new: Position, side: OrderAction, d_a
     await _orders_follow_fills(added)
 
 
+SETTLE_REASONS = ("WEEKLY_SETTLEMENT", "EXPIRY_SETTLED")
+
+
+async def cycle_closes(p: Position, side: OrderAction) -> list[Trade]:
+    """The live closes of `p`'s current cycle (since its last reopen): its own
+    fills (`position_fills_query`) against the `side` it holds, with a booked
+    P&L. What a reopen undoes and a CLOSED edit re-books — one set for both."""
+    q = await position_fills_query(p)
+    win = dict(q["executed_at"])
+    cycle = p.reopened_at or p.opened_at
+    if cycle:
+        win["$gte"] = max(win["$gte"], cycle - timedelta(seconds=1))
+    return await Trade.find(
+        {**q, "executed_at": win, "action": {"$ne": side.value}, "pnl_inr": {"$ne": None}, **_LIVE_FILL}
+    ).to_list()
+
+
 async def _rebook_closed(old: Position, new: Position, side: OrderAction, d_avg: Decimal) -> Decimal:
     sign = Decimal(1) if side == OrderAction.BUY else Decimal(-1)
     new_close = to_decimal(new.ltp)
@@ -1227,14 +1253,8 @@ async def _rebook_closed(old: Position, new: Position, side: OrderAction, d_avg:
     if not d_avg and not set_close:
         return ZERO
     q = await position_fills_query(old)
-    win = dict(q["executed_at"])
-    cycle = old.reopened_at or old.opened_at
-    if cycle:
-        win["$gte"] = max(win["$gte"], cycle - timedelta(seconds=1))
-    closes = await Trade.find(
-        {**q, "executed_at": win, "action": {"$ne": side.value}, "pnl_inr": {"$ne": None}, **_LIVE_FILL}
-    ).to_list()
-    settled = old.close_reason in ("WEEKLY_SETTLEMENT", "EXPIRY_SETTLED")  # a close with no fill
+    closes = await cycle_closes(old, side)
+    settled = old.close_reason in SETTLE_REASONS  # a close with no fill
     legs = len(closes) + int(settled)
     if not legs:
         raise ConflictError(
