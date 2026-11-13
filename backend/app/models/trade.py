@@ -7,6 +7,7 @@ proportionally across fills.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from beanie import Indexed, PydanticObjectId
 from bson import Decimal128
@@ -21,6 +22,18 @@ from app.utils.time_utils import now_utc
 
 def _zero() -> Decimal128:
     return Decimal128("0")
+
+
+# A fill that still stands — not taken back by an admin delete or reopen. Every
+# such undo sets superseded_by_reopen (alone before fifo_deleted / superseded_at
+# existed); a delete adds fifo_deleted, a reopen superseded_at, which is all the
+# FIFO walk drops. Screens that rebuild a book from fills splice this in; the
+# walk and the statements do not (legacy-flagged fills are walked on purpose).
+LIVE_FILL: dict[str, Any] = {
+    "superseded_by_reopen": {"$ne": True},
+    "fifo_deleted": {"$ne": True},
+    "superseded_at": None,
+}
 
 
 class Trade(TimestampMixin):

@@ -400,7 +400,7 @@ async def broker_report(broker_id: str, actor: CurrentAdmin):
     from decimal import Decimal as _D
 
     from app.models.position import Position, PositionStatus
-    from app.models.trade import Trade
+    from app.models.trade import LIVE_FILL, Trade
     from app.models.transaction import (
         TransactionType,
         WalletTransaction,
@@ -452,6 +452,7 @@ async def broker_report(broker_id: str, actor: CurrentAdmin):
         )
 
     user_q = {"user_id": {"$in": pool}}
+    live_q = {**user_q, **LIVE_FILL}  # fills a delete / reopen took back are not trades
 
     now_utc_dt = now_utc()
     ist_now = now_utc_dt.astimezone(IST)
@@ -517,14 +518,14 @@ async def broker_report(broker_id: str, actor: CurrentAdmin):
         open_unrealised += to_decimal(p.unrealized_pnl)  # stored in rupees
 
     today_trades_count = await Trade.find(
-        {**user_q, "executed_at": {"$gte": today_start}}
+        {**live_q, "executed_at": {"$gte": today_start}}
     ).count()
     week_trades_count = await Trade.find(
-        {**user_q, "executed_at": {"$gte": week_start}}
+        {**live_q, "executed_at": {"$gte": week_start}}
     ).count()
-    all_time_trades_count = await Trade.find(user_q).count()
+    all_time_trades_count = await Trade.find(live_q).count()
     recent_trades_rows = (
-        await Trade.find(user_q).sort("-executed_at").limit(10).to_list()
+        await Trade.find(live_q).sort("-executed_at").limit(10).to_list()
     )
 
     trade_user_ids = list({t.user_id for t in recent_trades_rows})

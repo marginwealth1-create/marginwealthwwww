@@ -498,7 +498,7 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
     from decimal import Decimal as _D
 
     from app.models.position import Position, PositionStatus
-    from app.models.trade import Trade
+    from app.models.trade import LIVE_FILL, Trade
     from app.models.transaction import (
         TransactionType,
         WalletTransaction,
@@ -574,6 +574,7 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
         )
 
     user_q = {"user_id": {"$in": pool}}
+    live_q = {**user_q, **LIVE_FILL}  # fills a delete / reopen took back are not trades
 
     # IST week boundary (Mon 00:00 IST → now)
     now_utc_dt = now_utc()
@@ -648,14 +649,14 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
 
     # Trades
     today_trades_count = await Trade.find(
-        {**user_q, "executed_at": {"$gte": today_start}}
+        {**live_q, "executed_at": {"$gte": today_start}}
     ).count()
     week_trades_count = await Trade.find(
-        {**user_q, "executed_at": {"$gte": week_start}}
+        {**live_q, "executed_at": {"$gte": week_start}}
     ).count()
-    all_time_trades_count = await Trade.find(user_q).count()
+    all_time_trades_count = await Trade.find(live_q).count()
     recent_trades_rows = (
-        await Trade.find(user_q).sort("-executed_at").limit(10).to_list()
+        await Trade.find(live_q).sort("-executed_at").limit(10).to_list()
     )
 
     # Per-row user_code map for the recent trades table

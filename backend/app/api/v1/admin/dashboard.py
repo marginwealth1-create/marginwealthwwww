@@ -14,7 +14,7 @@ from app.core.redis_client import healthcheck as redis_health
 from app.models.holding import Holding
 from app.models.order import Order, OrderStatus
 from app.models.position import Position, PositionStatus
-from app.models.trade import Trade
+from app.models.trade import LIVE_FILL, Trade
 from app.models.transaction import (
     DepositRequest,
     DepositStatus,
@@ -164,7 +164,7 @@ async def stats(admin: CurrentAdmin):
         ).count(),
         0,
     )
-    trade_q: dict = {"executed_at": {"$gte": today_start}, **user_id_filter}
+    trade_q: dict = {"executed_at": {"$gte": today_start}, **user_id_filter, **LIVE_FILL}
     trades_today = await _safe(Trade.find(trade_q).to_list(), [])
     today_volume = sum(float(str(t.value)) for t in trades_today)
     today_revenue = sum(float(str(t.brokerage)) for t in trades_today)

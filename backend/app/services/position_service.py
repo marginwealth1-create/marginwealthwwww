@@ -22,7 +22,7 @@ from app.models.holding import Holding
 from app.models.order import InstrumentRef, Order, OrderStatus
 from app.models.position import Position, PositionStatus, UserPositionTracker
 from app.models.position_settlement import PositionSettlement
-from app.models.trade import Trade
+from app.models.trade import LIVE_FILL, Trade
 from app.utils.decimal_utils import (
     ZERO,
     add,
@@ -1093,7 +1093,6 @@ def in_reopen_gap(p: Position, ts: datetime) -> bool:
     return any(lo < ts < hi for lo, hi in p.reopen_gaps or [])
 
 
-_LIVE_FILL = {"superseded_by_reopen": {"$ne": True}, "fifo_deleted": {"$ne": True}}
 _QTY = Decimal("1e-8")
 _OPEN_ORDER = [OrderStatus.OPEN.value, OrderStatus.PENDING.value, OrderStatus.PARTIAL.value]
 
@@ -1190,7 +1189,7 @@ async def _resync_open_lots(old: Position, new: Position, side: OrderAction, d_a
     mine = {
         t.id: t
         for t in await Trade.find(
-            {**await position_fills_query(old), "action": side.value, "pnl_inr": None, **_LIVE_FILL}
+            {**await position_fills_query(old), "action": side.value, "pnl_inr": None, **LIVE_FILL}
         ).to_list()
     }
     lots: list[dict[str, Any]] = []
@@ -1242,7 +1241,7 @@ async def cycle_closes(p: Position, side: OrderAction) -> list[Trade]:
     if cycle:
         win["$gte"] = max(win["$gte"], cycle - timedelta(seconds=1))
     return await Trade.find(
-        {**q, "executed_at": win, "action": {"$ne": side.value}, "pnl_inr": {"$ne": None}, **_LIVE_FILL}
+        {**q, "executed_at": win, "action": {"$ne": side.value}, "pnl_inr": {"$ne": None}, **LIVE_FILL}
     ).to_list()
 
 
@@ -1289,7 +1288,7 @@ async def _rebook_closed(old: Position, new: Position, side: OrderAction, d_avg:
         native += d
         inr += quantize_money(d * position_fx_rate(old))
     if d_avg:
-        for t in await Trade.find({**q, "action": side.value, "pnl_inr": None, **_LIVE_FILL}).to_list():
+        for t in await Trade.find({**q, "action": side.value, "pnl_inr": None, **LIVE_FILL}).to_list():
             _restate(t, abs(to_decimal(t.quantity)), to_decimal(t.price) + d_avg)
             await t.save()
             touched[t.order_id] = ZERO

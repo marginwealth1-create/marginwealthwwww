@@ -13,7 +13,7 @@ from app.core.dependencies import CurrentUser
 from app.models._base import OrderAction, OrderType, ProductType
 from app.models.audit_log import AuditAction
 from app.models.position import Position, PositionStatus
-from app.models.trade import Trade
+from app.models.trade import LIVE_FILL, Trade
 from app.schemas.common import APIResponse
 from app.schemas.trading import HoldingOut, PositionOut
 from app.services import audit_service, market_data_service, netting_service, order_service, order_validator, position_service
@@ -388,6 +388,7 @@ async def open_positions(user: CurrentUser):
     trade_q: dict[str, Any] = {
         "user_id": user.id,
         "instrument.token": {"$in": tokens},
+        **LIVE_FILL,
     }
     if oldest_open is not None:
         trade_q["executed_at"] = {"$gte": oldest_open - timedelta(seconds=5)}
@@ -953,6 +954,7 @@ async def list_active_trades(user: CurrentUser):
     trade_q: dict[str, Any] = {
         "user_id": user.id,
         "instrument.token": {"$in": tokens},
+        **LIVE_FILL,  # an undone close must not eat the lots a reopen restored
     }
     trades = await Trade.find(trade_q).sort("-executed_at").to_list()
 
@@ -963,6 +965,7 @@ async def list_active_trades(user: CurrentUser):
         trade_q_fallback: dict[str, Any] = {
             "user_id": _OID(str(user.id)),
             "instrument.token": {"$in": tokens},
+            **LIVE_FILL,
         }
         trades = await Trade.find(trade_q_fallback).sort("-executed_at").to_list()
 
@@ -1646,6 +1649,7 @@ async def close_active_trade(trade_id: str, user: CurrentUser):
     all_trades = await Trade.find(
         Trade.user_id == user.id,
         Trade.instrument.token == t.instrument.token,
+        LIVE_FILL,
     ).to_list()
 
     # Attribute by TOKEN unless this token genuinely holds MULTIPLE open
@@ -1854,7 +1858,7 @@ async def _fill_open_qty(user_id, t) -> float:
     from datetime import datetime as _d, timezone as _tz
 
     trades = await Trade.find(
-        Trade.user_id == user_id, Trade.instrument.token == t.instrument.token
+        Trade.user_id == user_id, Trade.instrument.token == t.instrument.token, LIVE_FILL
     ).to_list()
     is_long = t.action == OrderAction.BUY
 

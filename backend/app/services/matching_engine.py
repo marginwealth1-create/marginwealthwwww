@@ -785,7 +785,7 @@ async def _exit_order_fill_open_qty(order) -> float:
         return -1.0
     from datetime import datetime as _d, timezone as _tz
 
-    from app.models.trade import Trade as _Trade
+    from app.models.trade import LIVE_FILL, Trade as _Trade
 
     src = await _Trade.get(tid)
     if src is None:
@@ -793,6 +793,7 @@ async def _exit_order_fill_open_qty(order) -> float:
     trades = await _Trade.find(
         _Trade.user_id == order.user_id,
         _Trade.instrument.token == order.instrument.token,
+        LIVE_FILL,
     ).to_list()
     is_long = str(getattr(src.action, "value", src.action)).upper() == "BUY"
 

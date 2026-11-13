@@ -30,7 +30,7 @@ from app.models.audit_log import AuditAction
 from app.models.holding import Holding
 from app.models.order import Order, order_reason_code
 from app.models.position import Position, PositionStatus
-from app.models.trade import Trade
+from app.models.trade import LIVE_FILL, Trade
 from app.models.user import User, UserRole
 from app.schemas.common import APIResponse
 from app.services import market_data_service, order_service, position_service
@@ -419,7 +419,9 @@ async def orders_stats(
     scope = await scoped_user_ids(admin)
     demo_ids = {u.id async for u in User.find(User.is_demo == True)}  # noqa: E712
 
-    trade_match: dict[str, Any] = {"executed_at": {"$gte": start, "$lt": end}}
+    # A deleted position's fills lost their orders, so they leave the count. A
+    # reopen-undone close keeps its order on the table, so it stays (not LIVE_FILL).
+    trade_match: dict[str, Any] = {"executed_at": {"$gte": start, "$lt": end}, "fifo_deleted": {"$ne": True}}
     pending_match: dict[str, Any] = {
         "status": {"$in": ["PENDING", "OPEN", "PARTIAL"]},
         "$or": [{"is_demo": {"$ne": True}}, {"is_demo": {"$exists": False}}],
@@ -974,6 +976,7 @@ async def list_positions(
         trade_q: dict[str, Any] = {
             "user_id": {"$in": user_ids_for_trades},
             "instrument.token": {"$in": unique_tokens},
+            **LIVE_FILL,
         }
         oldest_open = min((r.opened_at for r in rows if r.opened_at), default=None)
         if oldest_open is not None:
@@ -2695,7 +2698,7 @@ async def position_netting_entries(
         "instrument.token": p.instrument.token,
         "product_type": {"$in": list({_pt, "MIS"})},
         # A close a reopen undid (or a deleted neighbour's fill) is not a leg.
-        "superseded_by_reopen": {"$ne": True},
+        **LIVE_FILL,
     }
     time_q: dict = {}
     if p.opened_at:
@@ -3455,7 +3458,7 @@ async def list_trades(
     from_dt: str | None = Query(default=None, description="ISO datetime, inclusive"),
     to_dt: str | None = Query(default=None, description="ISO datetime, exclusive"),
 ):
-    q: dict[str, Any] = {}
+    q: dict[str, Any] = {**LIVE_FILL}
     if user_id:
         await assert_user_in_scope(admin, user_id)
         q["user_id"] = PydanticObjectId(user_id)
