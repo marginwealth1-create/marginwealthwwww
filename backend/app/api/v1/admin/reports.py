@@ -33,6 +33,7 @@ from app.models.wallet import Wallet
 from app.schemas.common import APIResponse
 from app.services import report_pdf_service, report_xlsx_service, tradebook_builder
 from app.utils.decimal_utils import quantize_money, to_decimal
+from app.utils.downloads import attachment
 from app.utils.time_utils import now_ist, now_utc
 
 logger = logging.getLogger(__name__)
@@ -189,7 +190,7 @@ def _file(data: bytes, filename: str, media_type: str = "application/pdf") -> St
         iter([data]),
         media_type=media_type,
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": attachment(filename),
             "Content-Length": str(len(data)),
             "Access-Control-Expose-Headers": "Content-Disposition",
         },

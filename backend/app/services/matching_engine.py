@@ -478,7 +478,10 @@ async def execute_market_order(
             fill_fx = to_decimal(round(market_data_service.get_usd_inr_rate(), 4))
             raw_realized = raw_realized * fill_fx
         raw_pnl_inr_dec = quantize_money(raw_realized)
-        pnl_inr_dec = quantize_money(raw_realized - to_decimal(charges.brokerage))
+        # The wallet's PNL row less its charge, so stamp + charge is what was
+        # booked: rounding the net instead read a paisa over on a half-paisa
+        # (24,262.125 booked 24,262.12; − 7.67 stamped 24,254.46).
+        pnl_inr_dec = raw_pnl_inr_dec - to_decimal(charges.brokerage)
 
     snapshot = execution_snapshot(
         quote=quote,

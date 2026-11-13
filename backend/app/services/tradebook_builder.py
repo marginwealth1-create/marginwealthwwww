@@ -26,7 +26,7 @@ from app.core.exceptions import ValidationFailedError
 from app.models.position import Position, PositionStatus
 from app.models.position_settlement import PositionSettlement, PositionSettlementStatus
 from app.models.trade import LIVE_FILL, Trade
-from app.models.transaction import TransactionStatus, TransactionType, WalletTransaction
+from app.models.transaction import CASH_TYPES, TransactionStatus, TransactionType, WalletTransaction
 from app.services import position_service
 from app.services.admin_settlement_service import ist_week_bounds
 from app.services.market_data_service import is_usd_quoted_segment
@@ -446,18 +446,13 @@ async def statement_payload(
     lots: list[dict[str, Any]] = []
     closed_rows, _, _ = await fifo_closed_rows(uid, from_date, to_date, lots=lots)
 
-    # ── Funds: settled money moves, opening on the ledger's own balance ──
-    money_types = [
-        TransactionType.DEPOSIT,
-        TransactionType.WITHDRAWAL,
-        TransactionType.ADJUSTMENT,
-        TransactionType.BONUS,
-    ]
+    # ── Funds: settled money moves, opening on the ledger's own balance.
+    # CASH_TYPES: an admin's PROMO / PENALTY is Add / Deduct Fund here too.
     tx_q: dict[str, Any] = {
         "user_id": uid,
         # A PENDING / FAILED request is not cash in or out.
         "status": TransactionStatus.COMPLETED.value,
-        "transaction_type": {"$in": [t.value for t in money_types]},
+        "transaction_type": {"$in": [t.value for t in CASH_TYPES]},
     }
     if span:
         tx_q["created_at"] = span

@@ -40,6 +40,7 @@ from app.schemas.common import APIResponse
 from app.services import accounts_dashboard_service as ads
 from app.services import tradebook_builder
 from app.utils.decimal_utils import to_decimal
+from app.utils.downloads import attachment
 
 router = APIRouter(prefix="/accounts", tags=["admin-accounts"])
 
@@ -440,7 +441,7 @@ async def export_entity_users_excel(
     return StreamingResponse(
         BytesIO(data),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": attachment(filename)},
     )
 
 
@@ -474,7 +475,7 @@ async def export_entity_users_pdf(
     return StreamingResponse(
         BytesIO(data),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": attachment(filename)},
     )
 
 
@@ -503,7 +504,7 @@ async def export_broker_totals_excel(
     return StreamingResponse(
         BytesIO(data),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": attachment(filename)},
     )
 
 
@@ -532,5 +533,5 @@ async def export_broker_totals_pdf(
     return StreamingResponse(
         BytesIO(data),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": attachment(filename)},
     )

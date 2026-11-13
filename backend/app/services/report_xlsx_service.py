@@ -46,6 +46,10 @@ def _render(title: str, meta: list[str], sections: list[Section], *, freeze: boo
                 cell.font = _BOLD
             if isinstance(c, Num):
                 cell.number_format = _number_format(c)
+            elif isinstance(c, str) and c:
+                # Text as the PDF prints it: openpyxl would make an admin's
+                # '=SUM(…)' Funds comment a formula.
+                cell.data_type = "s"
             if measure:
                 widths[i] = max(widths.get(i, 0), len(str(c)))
 

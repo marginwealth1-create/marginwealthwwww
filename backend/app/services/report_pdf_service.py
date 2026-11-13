@@ -204,7 +204,11 @@ class Num:
 
 
 def _dec(v: Any) -> Decimal:
-    return v if isinstance(v, Decimal) else Decimal(str(_num(v)))
+    """The float the PDF always formatted, exactly (Decimal(float), not its
+    repr): rounded at the printed precision it reads as the f-string read it,
+    so a re-downloaded statement prints what was sent. A half-paisa average
+    rounds as its float lies: 115.325 printed 115.33, 2.675 printed 2.67."""
+    return Decimal(_num(v))
 
 
 def _amt(v: Any, kind: str = "amt", usd: Any = False) -> Num:

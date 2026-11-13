@@ -19,6 +19,7 @@ import re
 from datetime import timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from urllib.parse import unquote
 
 import pytest
 import pytest_asyncio
@@ -28,16 +29,29 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from openpyxl import load_workbook
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Table
 
+from app.api.v1.admin import accounts
 from app.api.v1.admin import reports as admin_reports
+from app.api.v1.admin import users as admin_users
+from app.api.v1.user import reports as user_reports
 from app.core.config import settings
 from app.core.database import _document_models
 from app.core.exceptions import InsufficientPermissionsError
 from app.models._base import Exchange
 from app.models.order import InstrumentRef
-from app.models.transaction import TransactionType
+from app.models.trade import Trade
+from app.models.transaction import TransactionType, WalletTransaction
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
-from app.services import market_data_service, tradebook_builder, wallet_service
+from app.schemas.admin.common import WalletAdjustRequest
+from app.services import (
+    accounts_dashboard_service,
+    brokerage_calculator,
+    market_data_service,
+    tradebook_builder,
+    wallet_service,
+)
+from app.services.report_pdf_service import _amt, _qty, _rate, billing_sections
+from app.utils.decimal_utils import to_decimal
 from app.utils.time_utils import now_utc, to_ist
 from tests._real_fill import later, market, set_commission_per_lot, settle_weekly
 
@@ -297,3 +311,145 @@ async def test_both_workbooks_are_gated_like_the_pdfs(w):
     for endpoint in (admin_reports.tradebook_xlsx, admin_reports.trade_book_xlsx):
         with pytest.raises(InsufficientPermissionsError):
             await endpoint(user_id=uid, admin=w.other_admin, _=None)
+
+
+# ── P7 fixup ──────────────────────────────────────────────────────────
+
+
+def _adds_up(payload: dict) -> tuple[Decimal, Decimal]:
+    """(Opening + Net Funds + Net PnL, Balance): one figure when the
+    statement reconciles with itself."""
+    funds, fin = payload["funds"], payload["financial"]
+    net_funds = sum((Decimal(str(r["amount"])) for r in funds["rows"]), Decimal(0))
+    return Decimal(str(funds["opening_balance"])) + net_funds + Decimal(str(fin["net_pnl"])), Decimal(
+        str(fin["balance"])
+    )
+
+
+async def test_a_close_stamps_what_the_wallet_booked(w):
+    """pnl_inr is the close's P&L net of its own charge: stamp + charge is the
+    wallet's PNL row, on a half-paisa too. The BTCUSD close books (61,000.50 −
+    60,000) × 0.25 × 97 = 24,262.125 → 24,262.12; the stamp rounded the net
+    instead and read one paisa over, so Billing's Gross was 24,262.13 and the
+    statement no longer added up to its Balance."""
+    dates = await _week(w)
+
+    async def _odd_paise(**_kw):  # a close charged ₹7.67
+        return brokerage_calculator.ChargesBreakdown(Decimal("7.67"), Decimal("7.67"))
+
+    await market(w.c, "SELL", 0.25, "61000.50", instrument=BTCUSD)
+    await later(w.db, seconds=30)
+    w.mp.setattr(brokerage_calculator, "calculate", _odd_paise)
+    await market(w.c, "BUY", 0.25, "60000", instrument=BTCUSD)
+    for t in await Trade.find({"user_id": w.c.id, "pnl_inr": {"$ne": None}}).to_list():
+        [pnl_row] = await WalletTransaction.find(
+            {"reference_id": str(t.order_id), "transaction_type": TransactionType.PNL.value}
+        ).to_list()
+        assert to_decimal(t.pnl_inr) + to_decimal(t.total_charges) == to_decimal(pnl_row.amount), t.instrument
+    lo, hi = tradebook_builder.window(dates["from_date"], dates["to_date"])
+    computed, balance = _adds_up(await tradebook_builder.statement_payload(w.c, lo, hi))
+    assert computed == balance
+
+
+async def test_promo_and_penalty_are_funds_on_the_statement(w):
+    """An admin's PROMO / PENALTY is Add / Deduct Fund everywhere (P6), the
+    Billing statement's Funds Transactions too, so its Net Funds is the
+    Accounts KPI's cash and Opening + Net Funds + Net PnL is the Balance."""
+    dates = await _week(w)
+    for amount, tt in ((100, "PROMO"), (-200, "PENALTY")):
+        req = WalletAdjustRequest(amount=amount, narration=f"{tt} entry", transaction_type=tt)
+        await admin_users.wallet_adjust(str(w.c.id), req, w.sa)
+    lo, hi = tradebook_builder.window(dates["from_date"], dates["to_date"])
+    payload = await tradebook_builder.statement_payload(w.c, lo, hi)
+    rows = {r["type"]: Decimal(str(r["amount"])) for r in payload["funds"]["rows"]}
+    assert rows == {"Deposit": Decimal("50000"), "Promo": Decimal("100"), "Penalty": Decimal("-200")}
+    cash_in, cash_out = await accounts_dashboard_service.cash_in_out([w.c.id], {"$gte": lo, "$lte": hi})
+    assert sum(rows.values(), Decimal(0)) == cash_in - cash_out
+    computed, balance = _adds_up(payload)
+    assert computed == balance
+
+
+async def test_a_name_outside_latin_1_still_downloads(w):
+    """Headers go out as latin-1: a client named in Devanagari (or with a
+    quote in the name) made every download 500. The header carries an ASCII
+    name and the real one in filename* (RFC 5987)."""
+    name = 'राम "Ravi" कुमार'
+    w.c.full_name = w.sa.full_name = name
+    await w.c.save()
+    await w.sa.save()
+    uid = str(w.c.id)
+    responses = [
+        await admin_reports.tradebook_pdf(user_id=uid, admin=w.sa, _=None),
+        await admin_reports.tradebook_xlsx(user_id=uid, admin=w.sa, _=None),
+        await admin_reports.trade_book_pdf(user_id=uid, admin=w.sa, _=None),
+        await admin_reports.trade_book_xlsx(user_id=uid, admin=w.sa, _=None),
+        await user_reports.tradebook_full_pdf(user=w.c),
+        await accounts.export_entity_users_excel(
+            str(w.sa.id), w.sa, None, None, None, user_id=w.c.id, _=None
+        ),
+        await accounts.export_entity_users_pdf(str(w.sa.id), w.sa, None, None, None, user_id=w.c.id, _=None),
+    ]
+    for resp in responses:
+        disposition = resp.headers["content-disposition"]
+        fallback = re.search(r'filename="([^"]*)"', disposition)[1]
+        assert fallback.isascii() and '"' not in fallback, disposition
+        [encoded] = re.findall(r"filename\*=utf-8''(\S+)", disposition, re.I)
+        assert name in unquote(encoded).replace("_", " "), disposition
+
+
+async def test_text_cells_stay_text(w):
+    """A Funds comment is an admin's free text: '=SUM(1,2)' prints as written
+    in the PDF, so the workbook holds it as text, never as a formula."""
+    req = WalletAdjustRequest(amount=1, narration="=SUM(1,2)", transaction_type="ADJUSTMENT")
+    await admin_users.wallet_adjust(str(w.c.id), req, w.sa)
+    ws = await _sheet(await admin_reports.tradebook_xlsx(user_id=str(w.c.id), admin=w.sa, _=None), "billing")
+    [cell] = [c for row in ws.iter_rows() for c in row if c.value == "=SUM(1,2)"]
+    assert cell.data_type == "s"
+
+
+def _main(v: float, kind: str) -> str:
+    """How main's PDF printed a number (f-string formatting of the float)."""
+    if kind == "qty":
+        return f"{round(v, 8):,.8f}".rstrip("0").rstrip(".")
+    whole, frac = f"{v:,.{6 if kind == 'fine' else 2}f}".split(".")
+    return f"{whole}.{frac.rstrip('0').ljust(2, '0')}" if kind == "fine" else f"{whole}.{frac}"
+
+
+def test_a_statement_prints_what_was_sent():
+    """A re-downloaded statement prints every rate, average and value as the
+    copy already sent: main formatted the float, so 2.675 printed 2.67 and a
+    script-wise average of 17,298.75 / 150 printed 115.33. The workbook holds
+    the same value."""
+    for k in range(1, 100_000, 2):  # every half paisa 0.005 … 499.995
+        v = k / 200
+        assert str(_rate(v)) == str(_amt(v)) == _main(v, "rate"), v
+        assert str(_rate(Decimal(str(v)))) == _main(v, "rate"), v
+    for k in range(1, 20_000, 2):  # half a millionth: CDS / CRYPTO rates
+        v = 1 + k / 2_000_000
+        assert str(_rate(v, "CRYPTO")) == _main(v, "fine"), v
+    for k in range(1, 20_000, 2):
+        v = k / 200_000_000
+        assert str(_qty(v)) == _main(v, "qty"), v
+
+    sw = tradebook_builder.script_wise(
+        [
+            {
+                "exchange": "NSE",
+                "script": "NIFTY26NOV24000CE",
+                "qty": q,
+                "buy_rate": b,
+                "sell_rate": 120.0,
+                "brokerage": 1.0,
+                "gross_pnl": 0.0,
+                "buy_time": "",
+                "sell_time": "",
+            }
+            for q, b in ((75, 115.3), (75, 115.35))
+        ]
+    )
+    cf = [{"ticket_id": "T1", "time": "", "script": "X", "side": "BUY", "qty": 3.0, "price": 100.005,
+           "exchange": "BSE", "commission": 0.0, "value": 300.015}]  # fmt: skip
+    sections = {s.title: s for s in billing_sections({"script_wise": sw, "carry_forward": cf})}
+    assert str(sections["Script-wise P&L"].rows[0][3]) == "115.33"
+    [row] = sections["Carry Forward"].rows
+    assert (str(row[5]), str(row[7])) == ("100.00", "300.01")

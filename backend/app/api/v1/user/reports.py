@@ -20,6 +20,7 @@ from app.models.transaction import TransactionType, WalletTransaction
 from app.schemas.common import APIResponse
 from app.services import report_pdf_service, tradebook_builder
 from app.utils.decimal_utils import quantize_money, to_decimal
+from app.utils.downloads import attachment
 from app.utils.time_utils import now_ist, now_utc, to_ist
 
 
@@ -339,7 +340,7 @@ def _pdf_response(data: bytes, filename: str) -> StreamingResponse:
         iter([data]),
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": attachment(filename),
             "Content-Length": str(len(data)),
             # Expose Content-Disposition so the web JS download flow can
             # respect the server-suggested filename across CORS (browsers
