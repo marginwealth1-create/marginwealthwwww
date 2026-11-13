@@ -42,7 +42,7 @@ from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.services import market_data_service, position_service, tradebook_builder
 from app.utils.time_utils import now_utc, to_ist
-from tests._real_fill import INSTRUMENT, later, market, set_commission_per_lot
+from tests._real_fill import INSTRUMENT, later, market, set_commission_per_lot, settle_weekly
 
 _DB = f"{settings.MONGODB_DB_NAME}_test_reopened_close_leaves_the_walk"
 CENT = Decimal("0.01")
@@ -180,11 +180,14 @@ async def test_a_close_flagged_before_the_stamp_is_still_walked(w):
     await Trade.get_motor_collection().update_many({}, {"$unset": {"superseded_at": ""}})
 
     b = await _books(w)
-    # Exactly what the statements already sent show: the undone close took the
-    # lot, the re-close is recovered from its own stamp with its close leg only.
+    # The pairing the statements already sent: the undone close took the lot
+    # and the re-close is recovered from its own stamp. Its row now also
+    # carries the open leg the undone close took (was 10.0: the close leg only,
+    # so the column fell short of the ₹20 charged).
     [row] = b.rows
-    assert (row["qty"], row["gross_pnl"], row["brokerage"]) == (10.0, 300.0, 10.0), _show(b)
+    assert (row["qty"], row["gross_pnl"], row["brokerage"]) == (10.0, 300.0, 20.0), _show(b)
     assert not await _paired_with(row, f.opened), _show(b)
+    assert b.brokerage == b.charges == Decimal("20"), _show(b)
 
 
 async def test_a_legacy_reopen_carries_forward_the_units_it_held(w):
@@ -211,6 +214,52 @@ async def test_a_legacy_reopen_carries_forward_the_units_it_held(w):
     assert book(d2["carry_forward"]) == [("BUY", 10, 100)]  # was 0 units
     assert book(d1["brought_forward"]) == book(d1["carry_forward"]) == book(d2["carry_forward"])
     assert book(d0["brought_forward"]) == book(d1["carry_forward"])
+
+
+async def test_a_legacy_reopen_bills_its_open_leg_once(w):
+    # Opened and undone on one day, re-closed two days on: the open leg was
+    # on no row and no Carry Forward (no lot), though the client paid it.
+    await market(w.c, "BUY", 10, "100")
+    await _later(w, minutes=1)
+    await market(w.c, "SELL", 10, "110")
+    await _later(w, minutes=10)
+    await _reopen(w)
+    await Trade.get_motor_collection().update_many({}, {"$unset": {"superseded_at": ""}})
+    await _later(w, minutes=2 * 24 * 60)
+    await market(w.c, "SELL", 10, "130")
+
+    async def on(days_ago: int) -> dict:
+        day = to_ist(now_utc() - timedelta(days=days_ago)).date().isoformat()
+        return await tradebook_builder.statement_payload(w.c, *tradebook_builder.window(day, day))
+
+    def billed(s: dict) -> Decimal:
+        return sum(
+            (Decimal(str(r["brokerage"])) for r in s["closed_transactions"] if "brokerage" in r),
+            Decimal(0),
+        ) + sum((Decimal(str(d["commission"])) for d in s["carry_forward"]), Decimal(0))
+
+    d2, d0 = await on(2), await on(0)
+    assert [Decimal(str(d["commission"])) for d in d2["carry_forward"]] == [Decimal("10")]  # was 0
+    assert billed(d2) == Decimal(str(d2["financial"]["brokerage"])) == Decimal("10")
+    assert billed(d0) == Decimal(str(d0["financial"]["brokerage"])) == Decimal("10")  # the close leg
+
+
+async def test_a_weekly_settlement_of_a_legacy_reopen_carries_its_open_leg(w, monkeypatch):
+    await market(w.c, "BUY", 10, "100")
+    await _later(w, minutes=1)
+    await market(w.c, "SELL", 10, "110")
+    await _later(w, minutes=10)
+    await _reopen(w)
+    await Trade.get_motor_collection().update_many({}, {"$unset": {"superseded_at": ""}})
+    await _later(w, minutes=10)
+    await settle_weekly(w.c, monkeypatch, "120")  # +200, re-opens 10 @ 120
+    await _later(w, minutes=10)
+    await market(w.c, "SELL", 10, "125")  # +50
+
+    b = await _books(w)
+    assert b.gross == b.realized == Decimal("250"), _show(b)
+    assert b.brokerage == b.charges == Decimal("20"), _show(b)  # was 10: the open leg lost
+    assert [r["brokerage"] for r in b.rows] == [10.0, 10.0], _show(b)
 
 
 async def test_a_reopen_after_a_later_round_trip_keeps_the_legacy_flag(w):

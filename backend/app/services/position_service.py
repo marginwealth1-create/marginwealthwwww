@@ -1450,6 +1450,45 @@ async def list_closed_trade_events_fifo(
         """Does the book hold any lot a `side` fill can close?"""
         return any(f["side"] != side for f in lots)
 
+    # A close a reopen undid with the flag alone (before superseded_at, or
+    # held back since) still takes its lots: the statements already sent pair
+    # that way. The units the reopen gave back are held here instead, so
+    # their open legs reach the re-close, a settlement or Carry Forward
+    # rather than no row at all; pairing and gross are unchanged.
+    _restored: dict[tuple[str, str], list[dict]] = {}
+    _spans: dict[str, list] = {}
+    for _p in _all_pos:
+        if _p.opened_at:
+            _spans.setdefault(_p.instrument.token, []).append(
+                (_naive(_p.opened_at), _naive(_p.closed_at) if _p.closed_at else _datetime.max)
+            )
+
+    def _reopened(t: Any) -> bool:
+        """A flag-only close a reopen undid: a position still spans it (a
+        delete took its position's doc away)."""
+        if not getattr(t, "superseded_by_reopen", False):
+            return False
+        ts = _naive(t.executed_at)
+        return any(o <= ts <= c for o, c in _spans.get(t.instrument.token, ()))
+
+    def _reclaim(token: str, side: str, qty: float) -> list[tuple[Any, float]]:
+        """Take up to `qty` restored `side` units on `token`; their open legs."""
+        legs: list[tuple[Any, float]] = []
+        for k, held in _restored.items():
+            if k[0] != token:
+                continue
+            for f in held:
+                if qty <= 1e-9:
+                    break
+                if f["side"] != side:
+                    continue
+                take = min(f["qty"], qty)
+                legs.append((f["opened_at"], f["open_brk"] * take / f["original_qty"]))
+                f["qty"] -= take
+                qty -= take
+            _restored[k] = [f for f in held if f["qty"] > 1e-9]
+        return legs
+
     # One boundary per settlement-style close (WEEKLY_SETTLEMENT or
     # EXPIRY_SETTLED), to be merged into the walk. Both close the position
     # WITHOUT writing a Trade row — weekly re-opens at the settlement price,
@@ -1598,6 +1637,8 @@ async def list_closed_trade_events_fifo(
                     _f["qty"] = float(_f["qty"]) - _take
                     _remaining -= _take
                 open_queues[_bk] = deque(_f for _f in _bq if _f["qty"] > 1e-9)
+            if _remaining > 1e-9:
+                _legs += _reclaim(_token, b["side"], _remaining)
             # Native gross like every row here; fx_rate converts it to what
             # the wallet booked.
             events.append({
@@ -1686,6 +1727,7 @@ async def list_closed_trade_events_fifo(
                 "side": side_str,
                 "open_brk": _charge(t),  # stored for pro-rata allocation on close
                 "original_qty": qty,     # original fill qty for correct pro-rata on partial closes
+                "live": not getattr(t, "superseded_by_reopen", False),
                 "tid": t.id,
             })
             continue
@@ -1707,6 +1749,7 @@ async def list_closed_trade_events_fifo(
                     "side": side_str,
                     "open_brk": _charge(t) * _excess / qty,
                     "original_qty": _excess,
+                    "live": not getattr(t, "superseded_by_reopen", False),
                 })
 
         if not _against(q, side_str):
@@ -1737,6 +1780,9 @@ async def list_closed_trade_events_fifo(
                     entry_price = price - (gross / _closed)
                 else:
                     entry_price = price + (gross / _closed)
+                _legs_ac = [(t.executed_at, close_brk)]
+                if not getattr(t, "superseded_by_reopen", False):
+                    _legs_ac = _reclaim(t.instrument.token, opened_side, _closed) + _legs_ac
                 events.append({
                     "_row_id": f"fifo_{t.id}_0",
                     "_closed_at": t.executed_at,
@@ -1750,8 +1796,8 @@ async def list_closed_trade_events_fifo(
                     "_order_id": t.order_id,
                     "gross_pnl": gross,
                     "fx_rate": float(str(t.fx_rate)) if getattr(t, "fx_rate", None) is not None else None,
-                    "brokerage": close_brk,
-                    "legs": [(t.executed_at, close_brk)],
+                    "brokerage": sum(a for _, a in _legs_ac),
+                    "legs": _legs_ac,
                     # No surviving opening fill — the position's own
                     # opened_at is filled in below; close time is the last resort.
                     "opened_at": t.executed_at,
@@ -1788,6 +1834,7 @@ async def list_closed_trade_events_fifo(
         except Exception:
             _basis = None
         _before = to_decimal(sum(f["qty"] for f in q if f["side"] != side_str))
+        _undone = _reopened(t)
 
         while remaining > 1e-9:
             # A close takes only lots of the OTHER side: a book holding both
@@ -1849,12 +1896,26 @@ async def list_closed_trade_events_fifo(
                 "instrument_token": t.instrument.token,
             })
 
+            if _undone and front.get("live", True):
+                _restored.setdefault(qkey, []).append({
+                    "price": front["price"],
+                    "qty": consume,
+                    "opened_at": front["opened_at"],
+                    "side": front["side"],
+                    "open_brk": open_brk_alloc,
+                    "original_qty": consume,
+                })
             front["qty"] -= consume
             remaining -= consume
             sub_idx += 1
 
             if front["qty"] < 1e-9:
                 del q[idx]
+
+        if remaining > 1e-9 and sub_idx and not getattr(t, "superseded_by_reopen", False):
+            _more = _reclaim(t.instrument.token, events[-1]["opened_side"], remaining)
+            events[-1]["legs"] = events[-1]["legs"] + _more
+            events[-1]["brokerage"] += sum(a for _, a in _more)
 
         # A specific-lot close of part of the book re-derives the survivors'
         # average as the engine does (basis_override); any other close keeps it.
@@ -1866,6 +1927,11 @@ async def list_closed_trade_events_fifo(
 
     if lots is not None:
         lots.extend({**f, "key": _k, "avg": _avg.get(_k)} for _k, _q in open_queues.items() for f in _q)
+        lots.extend(
+            {**f, "key": _k, "avg": _avg.get(_k), "restored": True}
+            for _k, _held in _restored.items()
+            for f in _held
+        )
 
     # Drop closing fills an admin REOPEN/DELETE later undid. They stay in the
     # collection (audit) and were processed above so the FIFO pairing of the
