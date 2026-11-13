@@ -1311,21 +1311,21 @@ function AdminPositionsInner() {
           icon={totalPnl >= 0 ? TrendingUp : TrendingDown}
         />
         <PnlCard
-          // Close PNL = Total of Both (broker take = −Net Client PNL + Brokerage),
+          // Close PNL = Total of Both (broker take = −Client Gross PNL + Brokerage),
           // the SAME figure the Accounts dashboard shows for this Mon→Sun window.
-          // Breakdown (Net P&L + Brokerage) sits in the hint so the two pages
-          // reconcile line-for-line. Date range on top mirrors Accounts.
+          // Breakdown (Client Gross P&L, Brokerage) sits in the hint so the two
+          // pages reconcile line-for-line. Date range on top mirrors Accounts.
           label={pnl?.week_label ? `Close PNL (${pnl.week_label})` : "Close PNL"}
           // Broker take: PROFIT (positive) → red, LOSS (negative) → green.
           value={pnl?.week_total_of_both ?? 0}
           invertColor
           hint={
             <>
-              Net P&amp;L{" "}
+              Client Gross P&amp;L{" "}
               <span className={pnlColor(pnl?.week_net_client_pnl ?? 0)}>
                 {formatINR(pnl?.week_net_client_pnl ?? 0)}
               </span>{" "}
-              + Brokerage {formatINR(pnl?.week_brokerage ?? 0)}
+              · Brokerage {formatINR(pnl?.week_brokerage ?? 0)}
             </>
           }
           icon={(pnl?.week_total_of_both ?? 0) >= 0 ? TrendingUp : TrendingDown}

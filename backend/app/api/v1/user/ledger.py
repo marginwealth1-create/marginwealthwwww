@@ -36,7 +36,7 @@ from typing import Any
 from fastapi import APIRouter, Query
 
 from app.core.dependencies import CurrentUser
-from app.models.transaction import TransactionType, WalletTransaction
+from app.models.transaction import SETTLEMENT_TYPES, TransactionType, WalletTransaction, is_system_adjustment
 from app.schemas.common import APIResponse
 
 router = APIRouter(prefix="/ledger", tags=["user-ledger"])
@@ -97,6 +97,9 @@ _LEAK_PATTERNS = re.compile(
 # digits, optionally ending in CE/PE/FUT. Used to preserve the
 # user-visible identifier when we strip the rest of the line.
 _SYMBOL_RE = re.compile(r"\b([A-Z]+\d[A-Z0-9]*(?:CE|PE|FUT)?)\b")
+# "deleted by ADM001", "Admin ADM001 corrected …": the actor's code is cut
+# before the symbol is looked for, or it reads as the symbol.
+_ACTOR_RE = re.compile(r"\b(?:by|admin)\s+\S+", re.IGNORECASE)
 
 
 def _sanitize_narration(t: WalletTransaction) -> str:
@@ -127,13 +130,14 @@ def _sanitize_narration(t: WalletTransaction) -> str:
     ):
         return raw
 
-    if not _LEAK_PATTERNS.search(raw):
-        # No admin-action terminology in the narration; safe to keep.
+    if ttype != TransactionType.REVERSAL and not _LEAK_PATTERNS.search(raw):
+        # No admin-action terminology in the narration; safe to keep. A
+        # REVERSAL is always an admin delete / reopen / edit: never kept.
         return raw
 
     # Pull the symbol so the user can still identify which instrument
     # the adjustment relates to (otherwise the row looks orphan).
-    sym_match = _SYMBOL_RE.search(raw)
+    sym_match = _SYMBOL_RE.search(_ACTOR_RE.sub("", raw))
     sym = sym_match.group(1) if sym_match else None
 
     if ttype == TransactionType.REVERSAL:
@@ -169,10 +173,7 @@ async def ledger(
     # Backward-compatible: no `types` param → every transaction type as before.
     # Settlement (outstanding) rows — shortfall booked / recovered — are never
     # shown to users, on any client (operator). Still recorded; admin-side only.
-    hidden = [
-        TransactionType.SETTLEMENT_OUTSTANDING_BOOKED.value,
-        TransactionType.SETTLEMENT_OUTSTANDING_RECOVERY.value,
-    ]
+    hidden = [t.value for t in SETTLEMENT_TYPES]
     q["transaction_type"] = {"$nin": hidden}
     if types:
         wanted = [x.strip() for x in types.split(",") if x.strip() and x.strip() not in hidden]
@@ -200,8 +201,11 @@ async def ledger(
 
         label = _LABELS.get(t.transaction_type, t.transaction_type.value)
         # Admin manual wallet changes → show as a plain admin-initiated
-        # deposit / withdrawal, chosen by the sign of the amount.
-        if t.transaction_type in _ADMIN_MANUAL_TYPES:
+        # deposit / withdrawal, chosen by the sign of the amount. A system
+        # ADJUSTMENT (the EOD carry fee) is no admin's: it stays "Adjustment".
+        if t.transaction_type in _ADMIN_MANUAL_TYPES and not (
+            t.transaction_type == TransactionType.ADJUSTMENT and is_system_adjustment(t.narration)
+        ):
             label = "Deposit by admin" if d > 0 else "Withdrawal by admin"
         particulars = _sanitize_narration(t)
 

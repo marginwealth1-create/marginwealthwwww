@@ -295,11 +295,21 @@ async def tax_pnl(user: CurrentUser):
     return APIResponse(data=await _tax_payload(user))
 
 
+async def _margin_payload(user: Any) -> dict[str, Any]:
+    """The wallet summary plus `brokerage`: what the client was charged as
+    their statement bills it — every charge on a fill no delete / reopen
+    undid (Wallet.total_charges keeps a refunded one), plus any admin manual
+    BROKERAGE entry. The summary's own keys stay as they were."""
+    from app.services import wallet_service
+
+    s = await wallet_service.summary(user.id)
+    _, fills = (await tradebook_builder.booked([user.id], None, None)).get(user.id, (0, Decimal(0)))
+    return {**s, "brokerage": str(quantize_money(fills + to_decimal(s["total_brokerage"])))}
+
+
 @router.get("/margin", response_model=APIResponse[dict])
 async def margin_report(user: CurrentUser):
-    from app.services import wallet_service
-    s = await wallet_service.summary(user.id)
-    return APIResponse(data=s)
+    return APIResponse(data=await _margin_payload(user))
 
 
 def _client_window(from_date: str | None, to_date: str | None) -> tuple[datetime | None, datetime | None]:
@@ -390,10 +400,7 @@ async def tax_pdf(user: CurrentUser):
 
 @router.get("/margin/pdf")
 async def margin_pdf(user: CurrentUser):
-    from app.services import wallet_service
-    s = await wallet_service.summary(user.id)
-    if hasattr(s, "model_dump"):
-        s = s.model_dump(mode="json")
+    s = await _margin_payload(user)
     pdf = await asyncio.to_thread(report_pdf_service.build_margin_pdf, user, s)
     stamp = datetime.now().strftime("%Y%m%d")
     return _pdf_response(pdf, f"{_brand_slug()}_margin_{stamp}.pdf")

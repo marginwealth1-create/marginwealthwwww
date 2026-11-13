@@ -706,7 +706,11 @@ export const SupportAPI = {
 };
 
 export const LedgerAdminAPI = {
-  list: (params?: any) => unwrap<{ items: any[]; meta: any }>(api.get("/admin/ledger", { params })),
+  // `summary` (with a user_id): the user's whole-ledger cash in / out.
+  list: (params?: any) =>
+    unwrap<{ items: any[]; meta: any; summary?: { deposits: string; withdrawals: string; net: string } }>(
+      api.get("/admin/ledger", { params }),
+    ),
   manualEntry: (body: any) => unwrap<any>(api.post("/admin/ledger/manual-entry", body)),
 };
 

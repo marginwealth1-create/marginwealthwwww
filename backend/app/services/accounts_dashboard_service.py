@@ -33,7 +33,7 @@ from reportlab.platypus import (
 from app.core.dependencies import effective_scope_actor, scoped_user_filter
 from app.core.exceptions import InsufficientPermissionsError
 from app.models.pnl_sharing import AgreementStatus, AgreementType, PnlSharingAgreement
-from app.models.transaction import TransactionType, WalletTransaction
+from app.models.transaction import TransactionType, WalletTransaction, is_system_adjustment
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.services import tradebook_builder
@@ -152,46 +152,6 @@ async def _entity_pool_ids(
         query = {"$and": [query, pool_clause]}
     cursor = coll.find(query, {"_id": 1})
     return [doc["_id"] async for doc in cursor]
-
-
-# ── System-generated ADJUSTMENT filter ──────────────────────────────
-#
-# ADJUSTMENT is overloaded: operator-driven Add/Deduct Fund AND a
-# handful of automated corrections that should NOT count as cash
-# inflow or outflow on the dashboard. Each pattern below maps to a
-# concrete narration the platform writes at a known site:
-#
-#   "Initial balance credit by …"
-#       Written by user-creation flow (admin/users.py) when a new user
-#       is opened with a non-zero starting balance. Onboarding entry,
-#       not a real deposit.
-#   "Bogus 0-price fill reversal …"
-#       Written when the operator runs the fix_bogus_proceeds_credits
-#       recovery script (or its inline variant) to undo a trade booked
-#       at ₹0 due to a Zerodha feed flatline. The credit is a
-#       correction restoring the pre-bug wallet state, not new money.
-#       Operator hit this on CL62329114 — two ₹8,63,120 reversal rows
-#       inflated the per-week Add Fund total to ~₹17 lakh.
-#   "Reversal …" (generic)
-#       Catch-all for any future correction script that prefixes its
-#       narration with the word. Cheap to include; missing it would
-#       just re-create the same bug for the next operator-written fix.
-#   "Carry-forward charge …"
-#       The EOD carry fee (position_service.convert_intraday_to_carry). A
-#       house charge, not an admin Deduct Fund.
-_SYSTEM_ADJUSTMENT_PATTERNS = (
-    "initial balance credit",
-    "bogus 0-price fill reversal",
-    "reversal trade=",  # the bogus-fill narration always contains this fragment
-    "carry-forward charge",
-)
-
-
-def _is_system_adjustment(narration: str) -> bool:
-    """True when an ADJUSTMENT row is a backend-written correction
-    that should not be displayed as a real Add/Deduct Fund move."""
-    n = (narration or "").lower()
-    return any(p in n for p in _SYSTEM_ADJUSTMENT_PATTERNS)
 
 
 # ── Broker totals (PNL sharing snapshot) ─────────────────────────────
@@ -346,11 +306,11 @@ async def compute_broker_totals(
             if t.transaction_type == TransactionType.ADJUSTMENT:
                 if amt <= 0:
                     continue  # admin Deduct Fund → counted under withdrawals
-                if _is_system_adjustment(t.narration or ""):
+                if is_system_adjustment(t.narration):
                     # Onboarding initial balance, bogus-fill reversal, or
                     # any other auto-generated correction — NOT a real
-                    # admin Add Fund. See _is_system_adjustment for the
-                    # full pattern list and why it matters.
+                    # admin Add Fund. See SYSTEM_ADJUSTMENT_PATTERNS
+                    # (models/transaction.py) for the list and why.
                     continue
             total_deposits += abs(amt)
 
@@ -369,7 +329,7 @@ async def compute_broker_totals(
             if t.transaction_type == TransactionType.ADJUSTMENT:
                 if amt >= 0:
                     continue  # admin Add Fund → counted under deposits
-                if _is_system_adjustment(t.narration or ""):
+                if is_system_adjustment(t.narration):
                     # Negative system corrections (e.g. reversal debits)
                     # are NOT real Deduct Fund actions.
                     continue
@@ -741,7 +701,10 @@ def render_entity_users_excel(
     ws.append([f"Period: {period_label}"])
     ws.append([])
 
-    headers = ["User ID", "Username", "Total PNL", "Net PNL", "Net BKG", "Settlement", "PNL - Settlement"]
+    # The statement's words (§7.3): net_pnl is the Gross, total_pnl the Net.
+    headers = [
+        "User ID", "Username", "Net PNL", "Gross PNL", "Brokerage", "Settlement", "Net PNL - Settlement",
+    ]
     ws.append(headers)
     row_num = 4
     for col_idx in range(1, len(headers) + 1):
@@ -792,8 +755,8 @@ def render_broker_totals_excel(
     ws.append([])
 
     rows = [
-        ("NET CLIENT PNL", totals["net_client_pnl"]),
-        ("NET CLIENT BKG", totals["net_client_bkg"]),
+        ("CLIENT GROSS PNL", totals["net_client_pnl"]),
+        ("CLIENT BROKERAGE", totals["net_client_bkg"]),
         ("TOTAL OF BOTH", totals["total_of_both"]),
         ("SETTLEMENT", totals["settlement"]),
         ("ACTUAL PNL", totals["actual_pnl"]),
@@ -832,11 +795,11 @@ def render_single_user_excel(user_data: dict[str, Any], period_label: str) -> by
     ws.append([])
 
     rows = [
-        ("Net PNL", user_data["net_pnl"]),
-        ("Net BKG", user_data["net_bkg"]),
-        ("Total PNL", user_data["total_pnl"]),
+        ("Gross PNL", user_data["net_pnl"]),
+        ("Brokerage", user_data["net_bkg"]),
+        ("Net PNL", user_data["total_pnl"]),
         ("Settlement", user_data["settlement"]),
-        ("PNL - Settlement", user_data["pnl_minus_settlement"]),
+        ("Net PNL - Settlement", user_data["pnl_minus_settlement"]),
     ]
     for label, val in rows:
         ws.append([label, float(val)])
@@ -889,7 +852,7 @@ def render_entity_users_pdf(
     elements.append(Paragraph(escape(f"Period: {period_label}"), meta_style))
     elements.append(Spacer(1, 8))
 
-    headers = ["User ID", "Username", "Total PNL", "Net PNL", "Net BKG", "Settlement", "PNL-Sett."]
+    headers = ["User ID", "Username", "Net PNL", "Gross PNL", "Brokerage", "Settlement", "Net-Sett."]
     data = [headers]
     for u in users_data:
         data.append([
@@ -943,8 +906,8 @@ def render_broker_totals_pdf(
     elements.append(Spacer(1, 10))
 
     rows = [
-        ["NET CLIENT PNL", _money_fmt(totals["net_client_pnl"])],
-        ["NET CLIENT BKG", _money_fmt(totals["net_client_bkg"])],
+        ["CLIENT GROSS PNL", _money_fmt(totals["net_client_pnl"])],
+        ["CLIENT BROKERAGE", _money_fmt(totals["net_client_bkg"])],
         ["TOTAL OF BOTH", _money_fmt(totals["total_of_both"])],
         ["ACTUAL PNL", _money_fmt(totals["actual_pnl"])],
         ["SETTLEMENT (loss to broker)", _money_fmt(totals["settlement"])],

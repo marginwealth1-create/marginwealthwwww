@@ -63,7 +63,7 @@ function downloadCSV(entities: AccountEntity[], grandTotal?: AccountEntity) {
   if (!rows.length) return;
   const headers = [
     "Name", "Role", "Users", "Deposits", "Withdrawals", "Net Deposit",
-    "Realized P&L", "Unrealized P&L", "Net P&L", "Brokerage",
+    "Realized P&L", "Unrealized P&L", "Realized + Unrealized P&L", "Brokerage",
     "Total Trades", "Profit Trades", "Loss Trades", "Win Rate %",
     "Volume", "Balance", "Equity", "Open Positions", "Settlement",
   ];
@@ -605,7 +605,7 @@ function BrokerTotalsCard({
             {fmt(data.actual_pnl)}
           </div>
           <div className="mt-0.5 text-[10px] text-muted-foreground">
-            = (−Net Client PNL) + Net Client BKG
+            = (−Client Gross PNL) + Client Brokerage
           </div>
           <div className="mt-1 font-mono text-[10px] tabular-nums text-muted-foreground/80">
             {/* Use the broker-view PNL (= −net_client_pnl) so the math on this
@@ -631,12 +631,14 @@ function BrokerTotalsCard({
 
       {/* ── Composition tiles ────────────────────────────────── */}
       <div className="relative mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <KpiTile label="Net Client PNL" value={fmt(data.net_client_pnl)} valueClass={color(data.net_client_pnl)} />
-        <KpiTile label="Net Client BKG" value={fmt(data.net_client_bkg)} valueClass={color(data.net_client_bkg)} />
+        {/* One vocabulary with the Billing statement (§7.3): Gross before
+            brokerage, Net = Gross − Brokerage. */}
+        <KpiTile label="Client Gross PNL" value={fmt(data.net_client_pnl)} valueClass={color(data.net_client_pnl)} />
+        <KpiTile label="Client Brokerage" value={fmt(data.net_client_bkg)} valueClass={color(data.net_client_bkg)} />
         {/* Broker take, INVERTED tint (operator): PROFIT (positive) → red,
             LOSS (negative) → green. Negate before `color` to flip it. Matches
             the Positions page Total-of-Both cards. */}
-        <KpiTile label="Total of Both" value={fmt(data.total_of_both)} valueClass={color(String(-Number(data.total_of_both)))} hint="PNL + BKG" />
+        <KpiTile label="Total of Both" value={fmt(data.total_of_both)} valueClass={color(String(-Number(data.total_of_both)))} hint="−Client Gross PNL + Client Brokerage" />
         {/* Settlement is an outflow the broker settles to clients — a LOSS to
             the broker. Operator request: show it in red when it's a loss
             (positive settlement = broker pays out). Inverted tint like
@@ -717,28 +719,6 @@ function KpiTile({
     </div>
   );
 }
-
-function TotalsRow({
-  label, value, fmt, color, info,
-}: {
-  label: string;
-  value: string;
-  fmt: (v: string) => string;
-  color: (v: string) => string;
-  info?: boolean;
-}) {
-  return (
-    <div className="flex justify-between items-center px-3 py-1">
-      <span className="text-xs font-mono font-semibold text-muted-foreground tracking-wide">
-        {label} {info && <span className="text-muted-foreground/50 cursor-help" title="Net Client PNL (inverted) + Net Client BKG">ⓘ</span>}
-      </span>
-      <span className={`font-semibold tabular-nums ${color(value)}`}>
-        {fmt(value)}
-      </span>
-    </div>
-  );
-}
-
 
 /* ═══════════════════════════════════════════════════════════════════ */
 /* User PNL Table (lazy loaded inside broker card)                     */
@@ -824,11 +804,11 @@ function UserPnlTable({
                   <th className="px-3 py-2.5 text-left text-xs font-semibold text-muted-foreground">User ID</th>
                   <th className="px-3 py-2.5 text-left text-xs font-semibold text-muted-foreground">Username</th>
                   <th className="px-3 py-2.5 text-left text-xs font-semibold text-muted-foreground">Owner</th>
-                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Total PNL</th>
-                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Net PNL <InfoTip text="Sum of realized P&L from closed positions" /></th>
-                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Net BKG <InfoTip text="Total brokerage charged" /></th>
+                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Net PNL <InfoTip text="Gross PNL − Brokerage: the Billing statement's Net PnL for the window" /></th>
+                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Gross PNL <InfoTip text="Before brokerage: each close in the window at what the wallet booked, weekly / expiry settlements at their settle price (the statement's Gross PnL)" /></th>
+                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Brokerage <InfoTip text="Every charge on a fill executed in the window (the statement's Brokerage)" /></th>
                   <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Settlement <InfoTip text="Net settlement booked − recovered in the selected period. Without a date filter, falls back to the user's current outstanding wallet balance (lifetime)." /></th>
-                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Total − Settle <InfoTip text="Total PNL minus Settlement — the row's real take after settlement is netted off" /></th>
+                  <th className="px-3 py-2.5 text-right text-xs font-semibold text-muted-foreground">Net − Settle <InfoTip text="Net PNL minus Settlement — the row's real take after settlement is netted off" /></th>
                   <th className="px-3 py-2.5 text-center text-xs font-semibold text-muted-foreground">Actions</th>
                 </tr>
               </thead>
@@ -1135,17 +1115,17 @@ function UserPnlCard({
         </div>
         <div className={`shrink-0 text-right text-sm font-semibold tabular-nums ${pnlColor(u.total_pnl)}`}>
           ₹{fmtMoney(u.total_pnl)}
-          <div className="text-[9px] font-normal uppercase tracking-wider text-muted-foreground">Total PNL</div>
+          <div className="text-[9px] font-normal uppercase tracking-wider text-muted-foreground">Net PNL</div>
         </div>
       </div>
 
       <div className="mt-3 grid grid-cols-2 gap-2 rounded-md bg-muted/20 p-2 text-[11px]">
         <div>
-          <div className="text-[9px] uppercase tracking-wider text-muted-foreground">Net PNL</div>
+          <div className="text-[9px] uppercase tracking-wider text-muted-foreground">Gross PNL</div>
           <div className={`mt-0.5 font-semibold tabular-nums ${pnlColor(u.net_pnl)}`}>₹{fmtMoney(u.net_pnl)}</div>
         </div>
         <div>
-          <div className="text-[9px] uppercase tracking-wider text-muted-foreground">Net BKG</div>
+          <div className="text-[9px] uppercase tracking-wider text-muted-foreground">Brokerage</div>
           <div className="mt-0.5 font-semibold tabular-nums">₹{fmtMoney(u.net_bkg)}</div>
         </div>
         <div>
@@ -1153,7 +1133,7 @@ function UserPnlCard({
           <div className="mt-0.5 font-semibold tabular-nums">₹{fmtMoney(u.settlement)}</div>
         </div>
         <div>
-          <div className="text-[9px] uppercase tracking-wider text-muted-foreground">Total − Settle</div>
+          <div className="text-[9px] uppercase tracking-wider text-muted-foreground">Net − Settle</div>
           <div className={`mt-0.5 font-semibold tabular-nums ${pnlColor(u.pnl_minus_settlement ?? "0")}`}>
             ₹{fmtMoney(u.pnl_minus_settlement ?? "0")}
           </div>

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from beanie import PydanticObjectId
@@ -14,13 +15,30 @@ from app.core.dependencies import (
     scoped_user_ids,
 )
 from app.models.audit_log import AuditAction
-from app.models.transaction import TransactionType, WalletTransaction
+from app.models.transaction import CASH_TYPES, TransactionType, WalletTransaction, ledger_bucket
 from app.models.user import User
 from app.schemas.common import APIResponse
 from app.services import wallet_service
 from app.services.audit_service import log_event
+from app.utils.decimal_utils import to_decimal
 
 router = APIRouter(prefix="/ledger", tags=["admin-ledger"])
+
+
+async def _summary(user_id: PydanticObjectId) -> dict[str, str]:
+    """The ledger strip over every one of the user's rows, not a page of them:
+    cash in / out by ledger_bucket, so a REVERSAL or a system adjustment (the
+    carry fee) is never a deposit or a withdrawal."""
+    sums = {"deposit": Decimal(0), "withdrawal": Decimal(0)}
+    rows = await WalletTransaction.find(
+        {"user_id": user_id, "transaction_type": {"$in": [t.value for t in CASH_TYPES]}}
+    ).to_list()
+    for r in rows:
+        b = ledger_bucket(r.transaction_type, r.amount, r.narration)
+        if b in sums:
+            sums[b] += abs(to_decimal(r.amount))
+    dep, wd = sums["deposit"], sums["withdrawal"]
+    return {"deposits": str(dep), "withdrawals": str(wd), "net": str(dep - wd)}
 
 
 @router.get("", response_model=APIResponse[dict])
@@ -54,8 +72,8 @@ async def list_all(
                     }
                 )
             q["user_id"] = {"$in": scope}
-    if transaction_type:
-        q["transaction_type"] = transaction_type
+    if transaction_type:  # one type, or a comma list (the ledger sheet's)
+        q["transaction_type"] = {"$in": [t.strip() for t in transaction_type.split(",") if t.strip()]}
     total = await WalletTransaction.find(q).count()
     rows = (
         await WalletTransaction.find(q)
@@ -77,6 +95,7 @@ async def list_all(
                     "user_id": str(r.user_id),
                     "user_code": umap.get(str(r.user_id)),
                     "transaction_type": r.transaction_type.value,
+                    "bucket": ledger_bucket(r.transaction_type, r.amount, r.narration),
                     "amount": str(r.amount),
                     "balance_before": str(r.balance_before),
                     "balance_after": str(r.balance_after),
@@ -94,6 +113,7 @@ async def list_all(
                 "total": total,
                 "total_pages": (total + page_size - 1) // page_size,
             },
+            **({"summary": await _summary(q["user_id"])} if user_id else {}),
         }
     )
 

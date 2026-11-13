@@ -12,6 +12,7 @@ boundary (these are read-only report numbers, never wallet mutations).
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -20,7 +21,7 @@ from beanie import PydanticObjectId
 from fastapi import APIRouter, Depends, Query
 
 from app.core.dependencies import CurrentAdmin, require_perm, scoped_user_ids
-from app.models.transaction import WalletTransaction
+from app.models.transaction import SYSTEM_ADJUSTMENT_PATTERNS, WalletTransaction
 from app.models.user import User, UserRole
 from app.schemas.common import APIResponse
 
@@ -31,6 +32,9 @@ IST = ZoneInfo("Asia/Kolkata")
 # Only money-movement rows count — trade / brokerage / charges / pnl are NOT
 # money in/out of the wallet from the user's view and live on the ledger page.
 _MONEY_TYPES = ["DEPOSIT", "WITHDRAWAL", "ADJUSTMENT", "SETTLEMENT_OUTSTANDING_BOOKED"]
+# The ADJUSTMENT narrations the backend writes itself (initial balance credit,
+# bogus-fill reversal, EOD carry fee): not an operator's Add / Deduct Fund.
+_SYSTEM_NARRATION_RX = "|".join(re.escape(p) for p in SYSTEM_ADJUSTMENT_PATTERNS)
 
 
 def _parse_date(s: str | None):
@@ -138,7 +142,6 @@ async def money_by_user(
     # the tile aggregations brings the per-week number back to operator
     # expectation. Operator hit this on CL62329114 — two ₹8,63,120
     # reversal rows inflated the week's Add Fund by ~₹17 lakh.
-    _SYSTEM_NARRATION_RX = "Initial balance credit|Bogus 0-price fill reversal|Reversal trade="
     is_system_adj = {
         "$regexMatch": {
             "input": {"$ifNull": ["$narration", ""]},
@@ -279,7 +282,7 @@ async def money_by_broker(
     _is_system_adj_byb = {
         "$regexMatch": {
             "input": {"$ifNull": ["$narration", ""]},
-            "regex": "Initial balance credit|Bogus 0-price fill reversal|Reversal trade=",
+            "regex": _SYSTEM_NARRATION_RX,
             "options": "i",
         }
     }

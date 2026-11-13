@@ -20,6 +20,7 @@ from bson import Decimal128
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from app.api.v1.admin import accounts, brokers, management, reports, trading
+from app.api.v1.user import reports as user_reports
 from app.core.config import settings
 from app.core.database import _document_models
 from app.models._base import OrderAction, OrderType, ProductType
@@ -128,7 +129,8 @@ async def test_wallet_brokerage_readers_include_fill_charges(w, monkeypatch):
         "_summary_grid",
         lambda items, styles: grids.append(dict(items)) or real_grid(items, styles),
     )
-    assert report_pdf_service.build_margin_pdf(w.c, summary)[:4] == b"%PDF"
+    margin = await user_reports._margin_payload(w.c)
+    assert report_pdf_service.build_margin_pdf(w.c, margin)[:4] == b"%PDF"
     assert grids[0]["Total brokerage"] == report_pdf_service._fmt_money(charged)
 
     # Broker detail and sub-admin detail pool cards.
@@ -178,3 +180,27 @@ async def test_carry_forward_fee_is_not_an_admin_withdrawal(w):
 
     totals = await accounts_dashboard_service.compute_broker_totals(w.a1.id, None, None)
     assert Decimal(str(totals["total_withdrawals"])) == 0
+
+
+async def test_margin_report_brokerage_leaves_out_a_refunded_fill(w, monkeypatch):
+    kept = await _fill(w.c, _GOLD, 2)
+    await _fill(w.c, _SILV, 1)
+    silv = await Position.find_one(
+        {"user_id": w.c.id, "instrument.token": _SILV.token, "status": PositionStatus.OPEN.value}
+    )
+    await trading.delete_position(str(silv.id), w.a1, None)  # refunds SILV's ₹40
+    kept_bkg = Decimal(str(kept.brokerage))
+
+    grids: list = []
+    real_grid = report_pdf_service._summary_grid
+    monkeypatch.setattr(
+        report_pdf_service,
+        "_summary_grid",
+        lambda items, styles: grids.append(dict(items)) or real_grid(items, styles),
+    )
+    await user_reports.margin_pdf(user=w.c)
+    # was ₹120: total_charges keeps a charge the delete refunded
+    assert grids[0]["Total brokerage"] == report_pdf_service._fmt_money(kept_bkg)
+    margin = (await user_reports.margin_report(w.c)).data
+    assert Decimal(margin["brokerage"]) == kept_bkg
+    assert Decimal(margin["total_brokerage"]) == 0  # the wallet keys stay as they were

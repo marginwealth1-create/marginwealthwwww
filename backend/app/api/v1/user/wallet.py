@@ -11,6 +11,7 @@ from beanie import PydanticObjectId
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from app.api.v1.user.ledger import _sanitize_narration
 from app.core.dependencies import CurrentUser
 from app.models.bank_account import CompanyBankAccount, UserBankAccount
 from app.models.transaction import (
@@ -20,6 +21,7 @@ from app.models.transaction import (
     WithdrawalRequest,
     WithdrawalStatus,
     BankSnapshot,
+    ledger_bucket,
 )
 from app.schemas.common import APIResponse
 from app.schemas.trading import DepositCreate, WalletSummary, WithdrawalCreate
@@ -90,7 +92,11 @@ async def transactions(user: CurrentUser, limit: int = 100, skip: int = 0):
                 "amount": str(t.amount),
                 "balance_before": str(t.balance_before),
                 "balance_after": str(t.balance_after),
-                "narration": t.narration,
+                # Worded as the client's ledger words it (no admin action).
+                "narration": _sanitize_narration(t),
+                # deposit / withdrawal / trading / settlement / other: a carry
+                # fee or a REVERSAL is trading, never an admin's money move.
+                "bucket": ledger_bucket(t.transaction_type, t.amount, t.narration),
                 "status": t.status.value,
                 "reference_type": t.reference_type,
                 "reference_id": t.reference_id,

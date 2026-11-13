@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from typing import Any
 
 from beanie import Indexed, PydanticObjectId
 from bson import Decimal128
@@ -17,6 +18,7 @@ from pymongo import ASCENDING, DESCENDING, IndexModel
 
 from app.models._base import StrEnum, TimestampMixin
 from app.models._types import Money
+from app.utils.decimal_utils import to_decimal
 
 
 def _zero() -> Decimal128:
@@ -42,6 +44,66 @@ class TransactionType(StrEnum):
     PNL_SHARING_RECEIPT = "PNL_SHARING_RECEIPT"
     SETTLEMENT_OUTSTANDING_BOOKED = "SETTLEMENT_OUTSTANDING_BOOKED"
     SETTLEMENT_OUTSTANDING_RECOVERY = "SETTLEMENT_OUTSTANDING_RECOVERY"
+
+
+# ── Ledger buckets: the one type set every ledger summary reads ──────
+# Cash the client or an operator moved in or out — what the client's ledger
+# lists and the admin's ledger strip sums as deposits / withdrawals.
+CASH_TYPES: frozenset[TransactionType] = frozenset({
+    TransactionType.DEPOSIT,
+    TransactionType.WITHDRAWAL,
+    TransactionType.ADJUSTMENT,
+    TransactionType.BONUS,
+    TransactionType.PENALTY,
+    TransactionType.PROMO,
+})
+# A shortfall booked / recovered: admins see it, clients never do (operator).
+SETTLEMENT_TYPES: frozenset[TransactionType] = frozenset({
+    TransactionType.SETTLEMENT_OUTSTANDING_BOOKED,
+    TransactionType.SETTLEMENT_OUTSTANDING_RECOVERY,
+})
+# The trading side: a fill, its charge, its P&L, an admin delete / reopen /
+# edit undoing them. Never cash in or out, whatever its sign.
+TRADING_TYPES: frozenset[TransactionType] = frozenset({
+    TransactionType.TRADE,
+    TransactionType.BROKERAGE,
+    TransactionType.CHARGES,
+    TransactionType.PNL,
+    TransactionType.REVERSAL,
+})
+# ADJUSTMENT rows the backend writes itself (matched case-insensitively in the
+# narration). They move the wallet but are not an operator's Add / Deduct Fund:
+#   "Initial balance credit …"      onboarding credit on user creation
+#   "Bogus 0-price fill reversal …" / "… Reversal trade=…"  undoing a fill
+#       booked at ₹0 on a feed flatline (CL62329114: two ₹8,63,120 rows once
+#       read as ~₹17 lakh of Add Fund)
+#   "Carry-forward charge …"         the EOD carry fee
+#       (position_service.convert_intraday_to_carry), a house charge
+SYSTEM_ADJUSTMENT_PATTERNS: tuple[str, ...] = (
+    "initial balance credit",
+    "bogus 0-price fill reversal",
+    "reversal trade=",
+    "carry-forward charge",
+)
+
+
+def is_system_adjustment(narration: str | None) -> bool:
+    n = (narration or "").lower()
+    return any(p in n for p in SYSTEM_ADJUSTMENT_PATTERNS)
+
+
+def ledger_bucket(transaction_type: TransactionType | str, amount: Any, narration: str | None) -> str:
+    """'deposit' / 'withdrawal' (cash, by sign), 'trading' (TRADING_TYPES and
+    system adjustments), 'settlement', or 'other' (sharing payouts, bonus
+    conversion, transfers)."""
+    tt = TransactionType(transaction_type)
+    if tt in SETTLEMENT_TYPES:
+        return "settlement"
+    if tt in TRADING_TYPES or (tt == TransactionType.ADJUSTMENT and is_system_adjustment(narration)):
+        return "trading"
+    if tt in CASH_TYPES:
+        return "withdrawal" if to_decimal(amount) < 0 else "deposit"
+    return "other"
 
 
 class TransactionStatus(StrEnum):

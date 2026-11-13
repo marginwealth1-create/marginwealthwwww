@@ -39,6 +39,21 @@ function formatINR(v: unknown): string {
 
 const PAGE_SIZE = 25;
 
+// The rows this sheet lists: backend models/transaction.py CASH_TYPES |
+// SETTLEMENT_TYPES (tests/test_both_ledgers_agree.py holds the two together).
+// Asked for server-side so a busy trader's P&L / charge rows can't push a
+// deposit out of the page.
+const LEDGER_TYPES = [
+  "DEPOSIT",
+  "WITHDRAWAL",
+  "ADJUSTMENT",
+  "BONUS",
+  "PENALTY",
+  "PROMO",
+  "SETTLEMENT_OUTSTANDING_BOOKED",
+  "SETTLEMENT_OUTSTANDING_RECOVERY",
+];
+
 // A SETTLEMENT_OUTSTANDING_BOOKED row is really an UNPAID BROKERAGE charge
 // (not a stop-out/close shortfall) when its narration is a "Charges for …"
 // line — the ₹/trade brokerage that couldn't be debited because the wallet
@@ -52,13 +67,17 @@ function isBrokerageShortfall(tt: string, narration?: string): boolean {
   );
 }
 
-// Human-readable label for transaction type
-function txLabel(tt: string, amt: number, narration?: string): string {
+// Human-readable label for transaction type. `bucket` is the server's
+// ledger_bucket: a system ADJUSTMENT (EOD carry fee, bogus-fill reversal) is
+// "trading", not an admin's Add / Deduct Fund.
+function txLabel(tt: string, amt: number, narration?: string, bucket?: string): string {
   if (isBrokerageShortfall(tt, narration)) return "Brokerage charge (unpaid)";
   switch (tt) {
     case "DEPOSIT": return "Deposit";
     case "WITHDRAWAL": return "Withdrawal";
-    case "ADJUSTMENT": return amt >= 0 ? "Deposit (Admin)" : "Withdrawal (Admin)";
+    case "ADJUSTMENT":
+      if (bucket === "trading") return "System adjustment";
+      return amt >= 0 ? "Deposit (Admin)" : "Withdrawal (Admin)";
     case "BONUS": return "Bonus (Admin)";
     case "PENALTY": return "Penalty (Admin)";
     case "PROMO": return "Promo Credit (Admin)";
@@ -86,7 +105,12 @@ export function LedgerSheet({ open, onClose, user }: Props) {
   const { data, isLoading } = useQuery({
     queryKey: ["admin", "ledger", "user", user?.id],
     queryFn: () =>
-      LedgerAdminAPI.list({ user_id: user!.id, page: 1, page_size: 500 }),
+      LedgerAdminAPI.list({
+        user_id: user!.id,
+        page: 1,
+        page_size: 500,
+        transaction_type: LEDGER_TYPES.join(","),
+      }),
     enabled: !!user && open,
   });
 
@@ -101,38 +125,21 @@ export function LedgerSheet({ open, onClose, user }: Props) {
   const liveUsedMargin = liveUser?.wallet?.used_margin ?? user?.wallet?.used_margin;
 
   const txns: any[] = (data?.items ?? []).filter((t: any) => {
-    const tt = String(t?.transaction_type ?? "").toUpperCase();
-    // Hide weekly-settlement churn + admin reopen/delete reversals — these
+    // Hide weekly-settlement churn + admin reopen/delete unwinds — these
     // are bookkeeping rollovers, not real money movement. Genuine daily
     // SL/TP/stop-out shortfall bookings ("Realized loss … close — shortfall")
     // stay visible.
     const narration = String(t?.narration ?? "").toLowerCase();
-    if (narration.includes("weekly settlement") || narration.includes("settlement unbooked")) {
-      return false;
-    }
-    return (
-      tt === "DEPOSIT" ||
-      tt === "WITHDRAWAL" ||
-      tt === "SETTLEMENT_OUTSTANDING_BOOKED" ||
-      tt === "SETTLEMENT_OUTSTANDING_RECOVERY" ||
-      tt === "ADJUSTMENT" ||
-      tt === "BONUS" ||
-      tt === "PENALTY" ||
-      tt === "PROMO"
-    );
+    return !(narration.includes("weekly settlement") || narration.includes("settlement unbooked"));
   });
 
-  // Totals — ADJUSTMENT positive = deposit, negative = withdrawal; settlement tracked separately
-  let totalDeposits = 0;
-  let totalWithdrawals = 0;
-  for (const t of txns) {
-    const tt = String(t?.transaction_type ?? "").toUpperCase();
-    const amt = Number(t?.amount ?? 0);
-    if (tt === "SETTLEMENT_OUTSTANDING_BOOKED" || tt === "SETTLEMENT_OUTSTANDING_RECOVERY") continue;
-    if (amt >= 0) totalDeposits += amt;
-    else totalWithdrawals += Math.abs(amt);
-  }
-  const net = totalDeposits - totalWithdrawals;
+  // Totals over the user's WHOLE ledger, bucketed server-side (admin/ledger.py
+  // _summary): cash in / out only — a system adjustment or a settlement row
+  // is neither.
+  const summary = data?.summary;
+  const totalDeposits = Number(summary?.deposits ?? 0);
+  const totalWithdrawals = Number(summary?.withdrawals ?? 0);
+  const net = Number(summary?.net ?? 0);
 
   const adjustMut = useMutation({
     mutationFn: ({ signedAmount, narration }: { signedAmount: number; narration: string }) =>
@@ -255,7 +262,7 @@ export function LedgerSheet({ open, onClose, user }: Props) {
                     <div key={t.id} className="flex items-center justify-between rounded-md border border-border p-2.5 text-sm bg-card hover:bg-muted/30 transition-colors">
                       <div className="flex flex-col leading-tight min-w-0 gap-0.5">
                         <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border w-fit ${txColor(tt, amt, t.narration)}`}>
-                          {txLabel(tt, amt, t.narration)}
+                          {txLabel(tt, amt, t.narration, t.bucket)}
                         </span>
                         <span className="text-xs text-muted-foreground truncate max-w-[200px] sm:max-w-[300px]">{t.narration || "—"}</span>
                         <span className="text-[10px] text-muted-foreground">{t.created_at ? new Date(t.created_at).toLocaleString() : "—"}</span>
