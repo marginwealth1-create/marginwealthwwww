@@ -19,6 +19,7 @@ when flat), and the wallet's P&L ledger == what the statement bills.
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -339,6 +340,23 @@ async def test_an_edit_after_a_legacy_reopen_leaves_the_fills_alone(w):
     assert b.units == 20, _show(b)
 
 
+@pytest.mark.parametrize(
+    ("edit", "close", "pnl"),
+    [({"quantity": 10}, 10, "165"), ({"avg_price": "104"}, 5, "95")],
+    ids=["quantity", "price"],
+)
+async def test_an_edit_after_an_average_priced_partial_close_keeps_the_book(w, edit, close, pnl):
+    await market(w.c, "BUY", 3, "100")
+    await market(w.c, "BUY", 3, "110")  # avg 105
+    await market(w.c, "SELL", 1, "120")  # +15 off the average; FIFO took a 100 unit
+    # The 5 still held cost 530 in lots, 525 on the doc: that 5 is what the
+    # first close booked over its lot, and an edit must carry it, not scale it.
+    await _edit(w, edit)
+    await market(w.c, "SELL", close, "120")
+
+    _one_book(await _books(w), pnl)  # was 160 / 100 in the fills
+
+
 # ── §6 extra: price edits on a CLOSED position ────────────────────────────
 
 
@@ -400,6 +418,21 @@ async def test_a_realized_override_is_wallet_only_and_says_so(w):
     assert "fills" in rev.narration.lower()
     [log] = await AuditLog.find(AuditLog.entity_id == str(p.id)).to_list()
     assert "wallet-only" in log.metadata["narration"].lower()
+
+
+async def test_a_double_submitted_edit_moves_the_book_once(w):
+    await market(w.c, "BUY", 10, "100")
+    await market(w.c, "SELL", 10, "110")  # +100
+    p = await _pos(w)
+
+    out = await asyncio.gather(
+        *(trading.admin_edit_position(str(p.id), {"avg_price": "101"}, w.sa, None) for _ in range(2)),
+        return_exceptions=True,
+    )
+
+    failed = [o for o in out if isinstance(o, Exception)]
+    assert len(failed) == 1 and getattr(failed[0], "status_code", None) == 409, out
+    _one_book(await _books(w), "90")  # the wallet moved -10 twice
 
 
 async def test_a_closed_avg_edit_keeps_a_specific_lot_exit_on_its_lot(w):

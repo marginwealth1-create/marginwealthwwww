@@ -208,16 +208,16 @@ async def test_a_reopen_after_a_later_round_trip_keeps_the_legacy_flag(w):
     assert await _paired_with(p2_row, p2_open), _show(b)
 
 
-async def test_a_cycle_re_added_after_a_partial_close_keeps_the_legacy_flag(w):
+async def test_a_cycle_re_added_after_a_partial_close_undoes_only_the_last_close(w):
     await market(w.c, "BUY", 10, "100")
     await _later(w, minutes=1)
-    first = await market(w.c, "SELL", 5, "110")
+    first = await market(w.c, "SELL", 5, "110")  # +50, the client's own partial close
     await _later(w, minutes=1)
-    await market(w.c, "BUY", 5, "120")  # 15 units bought, the reopen restores 10
+    await market(w.c, "BUY", 5, "120")  # back to 10 @ 110; 15 units bought
     await _later(w, minutes=1)
     last = await market(w.c, "SELL", 10, "130")
     await _later(w, minutes=10)
-    await _reopen(w)
+    await _reopen(w)  # the 10 coming back are what the last close took
     await _later(w, minutes=10)
     await market(w.c, "SELL", 10, "140")  # +300 against the restored avg 110
     await _later(w, minutes=5)
@@ -225,9 +225,11 @@ async def test_a_cycle_re_added_after_a_partial_close_keeps_the_legacy_flag(w):
     await _later(w, minutes=1)
     await market(w.c, "SELL", 5, "160")  # +50
 
-    assert not await _stamped(first) and not await _stamped(last)
+    # The partial close stands; the undone one leaves the walk. Was: both
+    # undone (15 units for 10 restored), flag only, oracle -150 vs 350.
+    assert not (await Trade.get(first.id)).superseded_by_reopen and await _stamped(last)
     b = await _books(w)
-    assert b.realized == Decimal("350")
+    assert b.oracle == b.realized == Decimal("400")
     assert b.gross == b.realized, _show(b)
     # No lot the reopen did not restore is left to pair the next round trip.
     assert await _paired_with(b.rows[-1], rt_open), _show(b)

@@ -40,7 +40,7 @@ from app.models.audit_log import AuditAction
 from app.models.user import UserRole, UserStatus
 from app.models.watchlist import Watchlist, WatchlistItem
 from app.schemas.common import APIResponse
-from app.services import instrument_service, market_data_service, order_service
+from app.services import instrument_service, market_data_service, order_service, position_service
 from app.services.audit_service import log_event
 from app.utils.time_utils import now_utc
 
@@ -294,6 +294,15 @@ async def _stamp_history(order: Any, when: datetime) -> None:
         if abs((opened - booked).total_seconds()) <= 60:
             pos.opened_at = when
             await pos.save()
+    if pos is not None and position_service.in_reopen_gap(pos, when):
+        # The fill is this position's own, though it lands in a span the
+        # position sat closed (a reopen's gap): cut its instant out of it.
+        pos.reopen_gaps = [
+            g
+            for lo, hi in pos.reopen_gaps
+            for g in ([(lo, when), (when, hi)] if lo < when < hi else [(lo, hi)])
+        ]
+        await pos.save()
 
 
 @router.post("/place-orders", response_model=APIResponse[dict])

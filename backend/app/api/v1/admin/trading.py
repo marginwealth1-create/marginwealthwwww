@@ -1628,10 +1628,34 @@ async def admin_edit_position(
                 )
         p.margin_used = Decimal128(str(new_margin))
 
+    # Claim: the edit takes the doc from the state it was worked out against,
+    # so a double submit (or a fill landing meanwhile) gets 409 instead of
+    # moving the fills, margin and wallet twice. Undone if the resync refuses.
+    # An OPEN row's ltp moves with every tick, so it is not part of the claim.
+    _claim = ("quantity", "avg_price", "realized_pnl")
+    if p.status == PositionStatus.CLOSED:
+        _claim += ("ltp",)
+    _was = {f: getattr(before, f) for f in _claim}
+    _now = {f: getattr(p, f) for f in _claim}
+    _pos_coll = Position.get_motor_collection()
+    if _now != _was:
+        claimed = await _pos_coll.update_one(
+            {"_id": p.id, "status": before.status.value, **_was}, {"$set": _now}
+        )
+        if claimed.modified_count != 1:
+            raise HTTPException(
+                status_code=409, detail="This position has changed since it was loaded — refresh and retry."
+            )
+
     # Everything that reports the position is rebuilt from its fills: carry
     # the quantity / price edit onto them before the doc changes.
     if recalc_pnl or p.status == PositionStatus.OPEN:
-        _fills_delta = await position_service.resync_position_fills(before, p)
+        try:
+            _fills_delta = await position_service.resync_position_fills(before, p)
+        except Exception:
+            if _now != _was:
+                await _pos_coll.update_one({"_id": p.id}, {"$set": _was})
+            raise
         if recalc_pnl:
             realized_delta = _fills_delta
 
@@ -1847,7 +1871,22 @@ async def admin_reopen_position(
     # set: each close comes back at the rate it was booked at, every undone
     # close's charge is refunded (not one found near closed_at), and a flip's
     # first leg — same side as the units coming back — stands, P&L and all.
-    closes = await _ps.cycle_closes(p, side)
+    def _units(t: Any) -> float:
+        return abs(t.quantity) if t.closed_quantity is None else min(abs(t.quantity), t.closed_quantity)
+
+    # Only the closes that took the units coming back are undone, newest
+    # first (a settlement's own leg is the newest): a partial close the
+    # position was topped up after stands, P&L and all. When the next close
+    # would overshoot, what comes back is what the undone closes took.
+    settled = p.close_reason in _ps.SETTLE_REASONS
+    leg_units = float(abs(p.quantity or 0) or opening_qty) if settled else 0.0
+    took, closes = leg_units, []
+    for t in sorted(await _ps.cycle_closes(p, side), key=lambda t: t.executed_at, reverse=True):
+        if took and took + _units(t) > opening_qty + 1e-9:
+            opening_qty = took
+            break
+        closes.append(t)
+        took += _units(t)
 
     def _charge(t: Any) -> _Decimal:
         return _td(t.total_charges or t.brokerage or 0)
@@ -1855,9 +1894,9 @@ async def admin_reopen_position(
     brokerage = sum((_charge(t) for t in closes), _Decimal(0))
     undone = sum((_td(t.pnl_inr) + _charge(t) for t in closes), _Decimal(0))  # rupees, gross
     native = sum((quantize_money(_ps._booked_gross(t) or _Decimal(0)) for t in closes), _Decimal(0))
-    if p.close_reason in _ps.SETTLE_REASONS:
+    if settled:
         # A settlement close wrote no fill; it is billed off the doc.
-        leg = sign * (_td(p.ltp) - _td(p.avg_price)) * _td(abs(p.quantity or 0) or opening_qty)
+        leg = sign * (_td(p.ltp) - _td(p.avg_price)) * _td(leg_units)
         native += quantize_money(leg)
         undone += quantize_money(leg * _ps.position_fx_rate(p))
 
@@ -1869,10 +1908,7 @@ async def admin_reopen_position(
     # they keep the flag alone (walked, rows hidden), as before.
     _set: dict[str, Any] = {"superseded_by_reopen": True}
     restore_avg: Decimal128 | None = None
-    _undone = [
-        (t, abs(t.quantity) if t.closed_quantity is None else min(abs(t.quantity), t.closed_quantity))
-        for t in closes
-    ]
+    _undone = [(t, _units(t)) for t in closes]
     if abs(sum(q for _, q in _undone) - opening_qty) < 1e-9:
         _cost = sum(
             (_td(t.price) * _td(q) - sign * _ps._booked_gross(t) for t, q in _undone),
@@ -2012,6 +2048,7 @@ async def admin_reopen_position(
     # realized override) — never zeroed.
     p.status = PositionStatus.OPEN
     p.quantity = opening_qty * sign
+    p.opening_quantity = opening_qty  # the next reopen restores this cycle's size
     p.closed_at = None
     p.close_reason = None
     p.realized_pnl = Decimal128(str(quantize_money(_td(p.realized_pnl) - native)))
@@ -2102,7 +2139,13 @@ async def admin_reopen_position(
     try:
         await _ws.block_margin(p.user_id, _td(p.margin_used or 0))
     except Exception:
-        pass
+        # Short of free cash (an undo drawn from margin leaves none): lock it
+        # anyway, so used_margin stays Σ open margin_used and the shortfall
+        # shows as negative cash — not as another position's margin freed.
+        try:
+            await _ws.recompute_used_margin(p.user_id)
+        except Exception:
+            logger.exception("reopen_margin_recompute_failed", extra={"pos_id": str(p.id)})
 
     # Tracker recompute (intraday / holding lots).
     try:
@@ -2845,6 +2888,13 @@ async def delete_position(
         raise HTTPException(status_code=404, detail="Position not found")
     await assert_user_in_scope(admin, p.user_id)
     user_id = p.user_id
+    if p.status == PositionStatus.CLOSED and p.closed_at is None:
+        # A reopen holds it (its claim takes the close time off); a legacy
+        # row with no close time has no window to delete either.
+        raise HTTPException(
+            status_code=409,
+            detail="This position is being reopened or has no close time — refresh and retry.",
+        )
 
     # ── OPEN-position delete (admin-only escape hatch) ────────────────
     # Previously this endpoint refused to delete OPEN rows ("Square it
@@ -2877,7 +2927,7 @@ async def delete_position(
 
     from app.models.transaction import TransactionType
     from app.services import wallet_service
-    from app.utils.decimal_utils import to_decimal
+    from app.utils.decimal_utils import quantize_money, to_decimal
 
     is_open = p.status == PositionStatus.OPEN and abs(float(p.quantity or 0)) > 1e-9
     from app.services.position_service import realized_pnl_inr as _realized_inr_del
@@ -2896,6 +2946,14 @@ async def delete_position(
 
     def _charges(fills: list) -> _Decimal:
         return sum((to_decimal(t.total_charges or t.brokerage or 0) for t in fills), _Decimal("0"))
+
+    # Each close comes back at the rate it was booked at; the rest of
+    # realized_pnl (a settlement leg, an override) at the position's rate.
+    _fx_del = position_service.position_fx_rate(p)
+    for t in _live:
+        if t.pnl_inr is not None:
+            at_fx = quantize_money(position_service._booked_gross(t) * _fx_del)
+            realized += to_decimal(t.pnl_inr) + _charges([t]) - at_fx
 
     # Claim: the delete takes the doc first, so a second submit (admins retry
     # on "Network Error") finds nothing and gets 409 instead of a second

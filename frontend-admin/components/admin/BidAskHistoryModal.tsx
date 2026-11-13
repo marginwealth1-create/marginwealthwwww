@@ -5,6 +5,7 @@ import { useInfiniteQuery } from "@tanstack/react-query";
 import { TradingAPI } from "@/lib/api";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { isoToLocalInput, localInputToIso } from "@/lib/time";
 
 interface RatePosition {
   id: string;
@@ -45,35 +46,9 @@ interface RatePayload {
 // PAGE_SIZE on demand (see useInfiniteQuery below). Keeps a wide window cheap.
 const PAGE_SIZE = 20;
 
-function pad(n: number): string {
-  return String(n).padStart(2, "0");
-}
-
-// Snapshots are stored in UTC and this is an India-markets app, so the whole
-// modal works in IST explicitly — NEVER the viewer's device timezone. Relying
-// on device time made a phone/emulator set to UTC send a window shifted +5:30,
-// so the query looked 5.5 h ahead of the real ticks → "No recorded rates"
-// even though the data existed (the reported bug).
-const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-
-// UTC ISO → "YYYY-MM-DDThh:mm" wall-clock in IST for <input type="datetime-local">.
-function isoToLocalInput(iso?: string | null): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "";
-  const ist = new Date(d.getTime() + IST_OFFSET_MS); // read UTC parts = IST wall-clock
-  return `${ist.getUTCFullYear()}-${pad(ist.getUTCMonth() + 1)}-${pad(ist.getUTCDate())}T${pad(
-    ist.getUTCHours(),
-  )}:${pad(ist.getUTCMinutes())}`;
-}
-
-// IST wall-clock from <input type="datetime-local"> → UTC ISO for the API.
-function localInputToIso(v: string): string | undefined {
-  if (!v) return undefined;
-  const withSecs = v.length === 16 ? `${v}:00` : v; // datetime-local omits seconds
-  const d = new Date(`${withSecs}+05:30`); // interpret AS IST, not device-local
-  return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
-}
+// The whole modal works in IST explicitly, NEVER the viewer's device timezone:
+// a phone set to UTC sent a window shifted +5:30 → "No recorded rates".
+// Helpers live in lib/time.
 
 function fmtRowTime(iso: string): string {
   const d = new Date(iso);

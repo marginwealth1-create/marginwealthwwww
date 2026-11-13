@@ -1073,9 +1073,13 @@ async def position_fills_query(p: Position) -> dict[str, Any]:
     }
     # ponytail: time spans, not ownership — a fill of `p` within 2s before
     # another position opened is ceded to it. A Trade→Position link (§7.1)
-    # makes this exact.
+    # makes this exact. Another position's span leaves out the gaps it sat
+    # closed in (`p` may have traded in one).
     spans = [
-        {"executed_at": {"$gte": o.opened_at - timedelta(seconds=2), "$lte": o.closed_at or hi}}
+        {
+            "executed_at": {"$gte": o.opened_at - timedelta(seconds=2), "$lte": o.closed_at or hi},
+            **({"$nor": reopen_gap_clauses(o)} if o.reopen_gaps else {}),
+        }
         for o in others
         if o.opened_at
     ] + reopen_gap_clauses(p)
@@ -1159,7 +1163,8 @@ async def resync_position_fills(old: Position, new: Position) -> Decimal:
 
     OPEN — a quantity and/or entry-price edit reaches the lots the FIFO walk
     still holds for the position: each is scaled by new/old units (a pyramid
-    keeps its ratio) and shifted by (new avg − their average) (spacing kept).
+    keeps its ratio) and shifted by one amount (spacing kept) so they cost
+    what they did + new avg × new qty − old avg × old qty.
     Units closes already took are cut off first and keep their price, so a
     statement already sent does not move; closing fills are never touched.
     opening_quantity moves with the units. When the walk holds none of the
@@ -1203,9 +1208,13 @@ async def _resync_open_lots(old: Position, new: Position, side: OrderAction, d_a
         )
         return
     k = to_decimal(abs(new.quantity)) / units
-    shift = ZERO
-    if d_avg:
-        shift = to_decimal(new.avg_price) - sum((to_decimal(t.price) * u for t, u in held), ZERO) / units
+    # The held lots can cost more or less than avg × qty: an average-priced
+    # partial close booked against the average while FIFO took a front lot.
+    # That difference carries over unscaled, so the lots end up costing
+    # held + new_avg·new_qty − old_avg·old_qty and the fills still net to
+    # what the wallet booked.
+    held_avg = sum((to_decimal(t.price) * u for t, u in held), ZERO) / units
+    shift = d_avg - (held_avg - to_decimal(old.avg_price)) * to_decimal(dq) / to_decimal(abs(new.quantity))
     left = to_decimal(abs(new.quantity))
     added: dict[Any, Decimal] = {}  # order id → units added to its fills
     for i, (t, u) in enumerate(held):

@@ -20,6 +20,7 @@ import { PageHeader } from "@/components/common/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
+import { localInputToIso } from "@/lib/time";
 import { SymbolAvatar } from "@/components/common/SymbolAvatar";
 
 /**
@@ -549,7 +550,7 @@ function PlaceOrderModal({
         product_type: productType,
         lots: lotsNum,
         price: priceNum,
-        executed_at: historicalAt ? new Date(historicalAt).toISOString() : undefined,
+        executed_at: historicalAt ? localInputToIso(historicalAt) : undefined,
         reason: historicalAt ? historyReason.trim() : undefined,
       });
       const ok = res.placed.length;
@@ -832,7 +833,7 @@ function PlaceOrderModal({
             <div className="mt-2 space-y-2">
               <div>
                 <label className="mb-1.5 block text-xs font-semibold">
-                  Trade date &amp; time
+                  Trade date &amp; time (IST)
                 </label>
                 <Input
                   type="datetime-local"

@@ -27,6 +27,7 @@ import { NettingEntriesDialog } from "@/components/admin/NettingEntriesDialog";
 import { BidAskHistoryModal } from "@/components/admin/BidAskHistoryModal";
 import { StatusPill } from "@/components/common/StatusPill";
 import { cn, formatINR, pnlColor } from "@/lib/utils";
+import { isoToLocalInput, localInputToIso, parseDate } from "@/lib/time";
 import { OwnerBadge } from "@/components/admin/OwnerBadge";
 import { useAdminAuthStore } from "@/stores/authStore";
 import { SymbolAvatar } from "@/components/common/SymbolAvatar";
@@ -38,15 +39,6 @@ function fmtFeedPrice(value: string | number | null | undefined, _quote?: string
   const n = typeof value === "string" ? Number(value) : (value ?? 0);
   if (!Number.isFinite(n)) return "—";
   return n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
-}
-
-/** Backend serialises naive UTC; add `Z` if missing before parsing. */
-function parseDate(v: string | Date | null | undefined): Date | null {
-  if (!v) return null;
-  if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
-  const hasTz = /[zZ]|[+-]\d{2}:?\d{2}$/.test(v);
-  const d = new Date(hasTz ? v : v + "Z");
-  return isNaN(d.getTime()) ? null : d;
 }
 
 // Color + label for the close_reason chip. Legal tags come from
@@ -577,9 +569,7 @@ function AdminPositionsInner() {
     setForm({
       avg_price: String(editing.avg_price ?? ""),
       quantity: String(editing.quantity ?? ""),
-      opened_at: editing.opened_at
-        ? new Date(parseDate(editing.opened_at) ?? editing.opened_at).toISOString().slice(0, 16)
-        : "",
+      opened_at: isoToLocalInput(editing.opened_at),
       stop_loss: editing.stop_loss != null ? String(editing.stop_loss) : "",
       target: editing.target != null ? String(editing.target) : "",
       realized_pnl: editing.realized_pnl != null ? String(editing.realized_pnl) : "",
@@ -602,8 +592,11 @@ function AdminPositionsInner() {
       if (form.quantity !== "" && Number(form.quantity) !== Number(editing.quantity))
         patch.quantity = Number(form.quantity);
       if (form.opened_at) {
-        const iso = new Date(form.opened_at).toISOString();
-        if (iso !== editing.opened_at) patch.opened_at = iso;
+        // Compare instants at the input's minute resolution: an untouched
+        // field equals its own prefill and is never re-sent.
+        const iso = localInputToIso(form.opened_at);
+        if (iso && iso !== localInputToIso(isoToLocalInput(editing.opened_at)))
+          patch.opened_at = iso;
       }
       if (form.stop_loss === "") patch.stop_loss = null;
       else if (Number(form.stop_loss) !== Number(editing.stop_loss ?? 0))
@@ -1824,7 +1817,7 @@ function AdminPositionsInner() {
                 />
               </div>
               <div className="space-y-1.5 sm:col-span-2">
-                <Label>Opened at</Label>
+                <Label>Opened at (IST)</Label>
                 <Input
                   type="datetime-local"
                   value={form.opened_at}
