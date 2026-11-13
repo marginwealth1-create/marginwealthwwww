@@ -58,6 +58,7 @@ async def market(
     placed_at: datetime | None = None,
     instrument: InstrumentRef = INSTRUMENT,
     margin: str | None = None,
+    squareoff: bool = False,
 ) -> Trade:
     """Fill a MARKET order for `user`. `at` moves only the Trade's clock into a
     test's window; the brokerage on it is whatever the engine charged.
@@ -65,7 +66,8 @@ async def market(
     an open carried position makes a later order adopt it). `basis` is the
     tapped fill's price on an Active-tab specific-lot Exit. `placed_at` backdates
     the order, as for a parked exit that fires now. `margin` is blocked on the
-    wallet and carried on the order, as order_service does at placement."""
+    wallet and carried on the order, as order_service does at placement.
+    `squareoff` marks a forced close (risk enforcer stop-out)."""
     order = Order(
         order_number=f"TB{secrets.token_hex(6)}",
         user_id=user.id,
@@ -79,6 +81,7 @@ async def market(
         is_demo=user.is_demo,
         placed_by=user.id,
         cost_basis_override=Decimal(basis) if basis is not None else None,
+        is_squareoff=squareoff,
     )
     if placed_at is not None:
         order.created_at = placed_at

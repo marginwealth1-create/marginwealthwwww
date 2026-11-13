@@ -26,6 +26,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/common/PageHeader";
 import { useAdminAuthStore } from "@/stores/authStore";
+import { istWeekSoFar } from "@/lib/time";
 import { cn, saveBlob } from "@/lib/utils";
 
 const CHART_GREEN = "#10b981";
@@ -95,16 +96,13 @@ export default function AccountsDashboardPage() {
     : ADMIN_TABS;
 
   const [scope, setScope] = useState("all_users");
-  // Default range = current ISO week (Mon → Sun) so the page lands
+  // Default range = the current IST week (Mon → Sun) so the page lands
   // with real filtered data instead of a lifetime aggregate.  Admin
-  // can override either bound for ad-hoc periods.
-  const _today = new Date();
-  const _dow = _today.getDay(); // 0 = Sun
-  const _monOffset = _dow === 0 ? -6 : 1 - _dow;
-  const _monday = new Date(_today);
-  _monday.setDate(_today.getDate() + _monOffset);
-  const _sunday = new Date(_monday);
-  _sunday.setDate(_monday.getDate() + 6);
+  // can override either bound for ad-hoc periods. Dates are held as UTC
+  // midnights of IST days: a browser-local Monday was Sunday's week before
+  // 05:30 IST.
+  const _monday = new Date(`${istWeekSoFar()[0]}T00:00:00Z`);
+  const _sunday = new Date(_monday.getTime() + 6 * 86_400_000);
   const _iso = (d: Date) => d.toISOString().slice(0, 10);
   const [fromDate, setFromDate] = useState(_iso(_monday));
   const [toDate, setToDate] = useState(_iso(_sunday));
@@ -117,7 +115,7 @@ export default function AccountsDashboardPage() {
   // (Monday → Sunday) to match the default fromDate / toDate above.
   const weekPresets = useMemo(() => {
     const fmtIst = (d: Date) =>
-      d.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+      d.toLocaleDateString("en-IN", { day: "numeric", month: "short", timeZone: "UTC" });
     const out: { key: string; label: string; from: string; to: string }[] = [];
     // Current week = the one already populated on first render
     const curMon = new Date(_monday);
@@ -129,8 +127,8 @@ export default function AccountsDashboardPage() {
       to: _iso(curSun),
     });
     // Last week
-    const lastMon = new Date(curMon); lastMon.setDate(curMon.getDate() - 7);
-    const lastSun = new Date(curSun); lastSun.setDate(curSun.getDate() - 7);
+    const lastMon = new Date(curMon); lastMon.setUTCDate(curMon.getUTCDate() - 7);
+    const lastSun = new Date(curSun); lastSun.setUTCDate(curSun.getUTCDate() - 7);
     out.push({
       key: "last",
       label: `Last week (${fmtIst(lastMon)} – ${fmtIst(lastSun)})`,
@@ -139,8 +137,8 @@ export default function AccountsDashboardPage() {
     });
     // 4 prior weeks covering the rest of the last ~month
     for (let i = 2; i <= 5; i++) {
-      const m = new Date(curMon); m.setDate(curMon.getDate() - 7 * i);
-      const s = new Date(curSun); s.setDate(curSun.getDate() - 7 * i);
+      const m = new Date(curMon); m.setUTCDate(curMon.getUTCDate() - 7 * i);
+      const s = new Date(curSun); s.setUTCDate(curSun.getUTCDate() - 7 * i);
       out.push({
         key: `w-${i}`,
         label: `${fmtIst(m)} – ${fmtIst(s)}`,

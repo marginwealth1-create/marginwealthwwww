@@ -217,6 +217,7 @@ export default function DashboardPage() {
         <StatTile
           label="Today's P&L"
           value={hideBalance ? "•••" : formatINR(todayPnl)}
+          hint="booked, net of brokerage"
           tone={pnlColor(todayPnl)}
         />
       </section>

@@ -36,7 +36,8 @@ from app.schemas.admin.management import (
 from app.schemas.common import APIResponse
 from app.services import admin_management_service as mgmt
 from app.services import admin_settlement_service as stl
-from app.services import user_service
+from app.services import tradebook_builder, user_service
+from app.services.accounts_dashboard_service import client_totals_for_users
 from app.utils.time_utils import IST
 
 router = APIRouter(prefix="/management", tags=["admin-management"])
@@ -494,7 +495,6 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
     week trade count, current open positions count + unrealised PNL, and
     the most recent 10 trades. Drives the super-admin's detail page.
     """
-    from datetime import timedelta as _td
     from decimal import Decimal as _D
 
     from app.models.position import Position, PositionStatus
@@ -507,7 +507,6 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
     from app.models.wallet import Wallet
     from app.services import market_data_service
     from app.utils.decimal_utils import to_decimal
-    from app.utils.time_utils import now_utc
 
     sa = await mgmt._get_sub_admin_or_404(sub_admin_id)
 
@@ -576,13 +575,9 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
     user_q = {"user_id": {"$in": pool}}
     live_q = {**user_q, **LIVE_FILL}  # fills a delete / reopen took back are not trades
 
-    # IST week boundary (Mon 00:00 IST → now)
-    now_utc_dt = now_utc()
-    ist_now = now_utc_dt.astimezone(IST)
-    today_ist_start = ist_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    week_ist_start = today_ist_start - _td(days=ist_now.weekday())
-    today_start = today_ist_start.astimezone(now_utc_dt.tzinfo)
-    week_start = week_ist_start.astimezone(now_utc_dt.tzinfo)
+    # The IST day and the IST week (Mon 00:00 → now): the P&L cards' windows.
+    windows = tradebook_builder.periods()
+    today_start, week_start = windows["today"][0], windows["week"][0]
 
     # Wallet rollup across the pool
     wallets = await Wallet.find(user_q).to_list()
@@ -604,8 +599,8 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
         # only moves on an admin manual BROKERAGE entry.
         wallet_sum["total_brokerage"] += to_decimal(w.total_brokerage) + to_decimal(w.total_charges)
 
-    # Realised PNL by window (positions closed in window). Reuses the
-    # USD-quoted FX-conversion pattern from /admin/users/{id}/live-trade-stats.
+    # All-time realised (positions closed). Reuses the USD-quoted
+    # FX-conversion pattern from /admin/users/{id}/live-trade-stats.
     fallback_usd_inr = to_decimal(market_data_service.get_usd_inr_rate())
 
     def _is_usd(p) -> bool:
@@ -622,18 +617,13 @@ async def sub_admin_report(sub_admin_id: str, admin: SuperAdmin):
         )
         return raw * rate
 
-    async def _realised_in(window_start):
-        rows = await Position.find(
-            {
-                **user_q,
-                "status": PositionStatus.CLOSED.value,
-                "closed_at": {"$gte": window_start},
-            }
-        ).to_list()
-        return sum((_realised_inr(p) for p in rows), _D("0"))
-
-    today_realised = await _realised_in(today_start)
-    week_realised = await _realised_in(week_start)
+    # Today / This week realised: the pool's Billing statement Gross PnL
+    # (tradebook_builder.booked) — every close in the window at what the
+    # wallet booked, settlements included, undone fills out; a partial close
+    # of a position still open counts.
+    today_realised, week_realised = [
+        (await client_totals_for_users(pool, *windows[k]))["net_client_pnl"] for k in ("today", "week")
+    ]
     all_closed = await Position.find(
         {**user_q, "status": PositionStatus.CLOSED.value}
     ).to_list()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from decimal import Decimal
 from typing import Any
 
 from beanie import PydanticObjectId
@@ -28,7 +29,7 @@ from app.schemas.admin.common import (
     WalletAdjustRequest,
 )
 from app.schemas.common import APIResponse
-from app.services import user_service, wallet_service
+from app.services import tradebook_builder, user_service, wallet_service
 from app.services.audit_service import log_event
 from app.utils.decimal_utils import to_decimal128
 
@@ -250,63 +251,18 @@ async def list_users(
     wallets = await Wallet.find({"user_id": {"$in": user_ids}}).to_list()
     wallet_map = {str(w.user_id): w for w in wallets}
 
-    # Weekly closed P&L (#6) — net realised P&L booked in the current ISO week
-    # (Monday 00:00 IST → now). Surfaced on the all-users page in place of the
-    # old settlement column. One grouped aggregate over just this page's users.
-    from datetime import timedelta as _td
-
-    from app.models.transaction import TransactionType, WalletTransaction
-    from app.utils.time_utils import now_ist, to_utc
-
-    _now_i = now_ist()
-    _wk_start = to_utc(
-        (_now_i - _td(days=_now_i.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-    )
-    wk_pnl_map: dict[str, float] = {}
-    # NET realized P&L for the week = booked P&L − brokerage ± any admin
-    # reversals. Summing ONLY PNL rows made the column (a) gross (brokerage
-    # never subtracted) and (b) sticky after a delete — deleting a closed
-    # trade posts a REVERSAL row (not a PNL row), so the deleted trade's P&L
-    # lingered here forever. Include CHARGES (brokerage), REVERSAL
-    # (delete/reopen/edit undo) so a delete of any close nets its whole
-    # footprint back to zero. Operator: "trade delete karne par pnl and
-    # brokerage dono weekly se hat jaye."
-    #
-    # Only rows that MOVE the wallet count, so Balance = funds ± Weekly P&L.
-    # SETTLEMENT_OUTSTANDING_BOOKED never moves it (balance 0 → 0; the
-    # shortfall is owed, shown as "Settlement due"); it's counted when it is
-    # actually paid — the RECOVERY row debits the wallet. Counting both also
-    # double-charged a shortfall recovered the same week (29-Oct HPY86W:
-    # card −3,925.17 vs wallet −3,593.00).
-    _WK_TYPES = [
-        TransactionType.PNL.value,
-        TransactionType.CHARGES.value,
-        TransactionType.REVERSAL.value,
-        TransactionType.SETTLEMENT_OUTSTANDING_RECOVERY.value,
-    ]
-    try:
-        _cur = WalletTransaction.get_motor_collection().aggregate(
-            [
-                {
-                    "$match": {
-                        "user_id": {"$in": user_ids},
-                        "transaction_type": {"$in": _WK_TYPES},
-                        "created_at": {"$gte": _wk_start},
-                    }
-                },
-                {"$group": {"_id": "$user_id", "pnl": {"$sum": {"$toDouble": "$amount"}}}},
-            ]
-        )
-        async for _row in _cur:
-            wk_pnl_map[str(_row["_id"])] = float(_row.get("pnl") or 0.0)
-    except Exception:  # noqa: BLE001
-        wk_pnl_map = {}
+    # Weekly PnL (#6): each row's Billing statement Net P&L (Gross −
+    # Brokerage, tradebook_builder.booked) for this IST week, Mon 00:00 → now
+    # — the figure the client's own cards, the row's action menu and the
+    # Accounts dashboard read. A deleted / reopened trade drops out with its
+    # brokerage (its fills are undone); a stop-out shows its whole loss (the
+    # shortfall is "Settlement due"). One batched read for the page.
+    wk_pnl_map = await tradebook_builder.booked(user_ids, *tradebook_builder.periods()["week"])
 
     for item in items:
         w = wallet_map.get(item["id"])
-        _wk = round(wk_pnl_map.get(item["id"], 0.0), 2)
+        _g, _b = wk_pnl_map.get(PydanticObjectId(item["id"]), (Decimal(0), Decimal(0)))
+        _wk = _g - _b
         item["wallet"] = (
             {
                 "available_balance": str(w.available_balance),
@@ -1357,15 +1313,16 @@ async def live_trade_stats(
       • cf_total_eod     — sum of overnight margin needed for every
                            currently-open MIS/NRML position at EOD rates
       • cf_extra_needed  — max(0, cf_total_eod − wallet free balance)
-      • weekly_net_pnl   — realised P&L this IST week
-      • weekly_trades    — closed-position count this IST week
+      • weekly_net_pnl   — this IST week's (Mon 00:00 → now) Billing
+                           statement Net P&L (tradebook_builder.booked), the
+                           Users list's Weekly PnL
+      • weekly_trades    — positions closed this IST week
                            (also split into wins / losses)
       • closed_pnl_all   — realised P&L lifetime
       • all_time_trades  — closed-position count lifetime
       • open_positions   — list of currently-open positions (symbol,
                            qty, avg, ltp, floating P&L per row)
     """
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     from decimal import Decimal
 
     from app.models.position import Position, PositionStatus
@@ -1383,12 +1340,7 @@ async def live_trade_stats(
     used_margin = float(str(wallet.used_margin))
     credit_limit = float(str(wallet.credit_limit))
 
-    IST = _tz(_td(hours=5, minutes=30))
-    now_ist_dt = _dt.now(IST)
-    today_start = now_ist_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    days_back = (now_ist_dt.weekday() + 1) % 7  # Sun = 0
-    week_start_ist = today_start - _td(days=days_back)
-    week_start = week_start_ist.astimezone(_tz.utc)
+    week_start, week_end = tradebook_builder.periods()["week"]
 
     usd_inr = market_data_service.get_usd_inr_rate()
 
@@ -1429,7 +1381,7 @@ async def live_trade_stats(
         }
     ).to_list()
 
-    weekly_realised = sum(_realised_inr(p) for p in weekly_closed)
+    weekly_net = await tradebook_builder.net([target.id], week_start, week_end)
     weekly_wins = sum(1 for p in weekly_closed if _realised_inr(p) > 0)
     weekly_losses = sum(1 for p in weekly_closed if _realised_inr(p) < 0)
     all_realised = sum(_realised_inr(p) for p in all_closed)
@@ -1563,7 +1515,7 @@ async def live_trade_stats(
             "equity": round(equity, 2),
             "cf_total_eod": round(cf_total_eod, 2),
             "cf_extra_needed": round(cf_extra_needed, 2),
-            "weekly_net_pnl": round(weekly_realised, 2),
+            "weekly_net_pnl": float(weekly_net),
             "weekly_trades": len(weekly_closed),
             "weekly_wins": weekly_wins,
             "weekly_losses": weekly_losses,

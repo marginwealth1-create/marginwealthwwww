@@ -28,6 +28,7 @@ from app.models.position_settlement import PositionSettlement, PositionSettlemen
 from app.models.trade import LIVE_FILL, Trade
 from app.models.transaction import TransactionStatus, TransactionType, WalletTransaction
 from app.services import position_service
+from app.services.admin_settlement_service import ist_week_bounds
 from app.services.market_data_service import is_usd_quoted_segment
 from app.utils.decimal_utils import quantize_money, to_decimal
 from app.utils.time_utils import UTC, end_of_day_ist, now_utc, start_of_day_ist, to_ist
@@ -115,6 +116,20 @@ def window(from_date: str | None, to_date: str | None) -> tuple[datetime | None,
     lo = start_of_day_ist(_ist_day(from_date)).astimezone(UTC) if from_date else None
     hi = end_of_day_ist(_ist_day(to_date)).replace(microsecond=999000).astimezone(UTC) if to_date else None
     return lo, hi
+
+
+def periods(now: datetime | None = None) -> dict[str, tuple[datetime, datetime]]:
+    """The windows every Today / This week / Last week P&L reads `booked`
+    over: the IST day, and the IST week Monday 00:00 -> Sunday 23:59:59.999
+    (the settlements' own ist_week_bounds)."""
+    now = now or now_utc()
+    day = to_ist(now).date().isoformat()
+    lo, hi = window(day, day)
+    return {
+        "today": (lo, hi),  # type: ignore[dict-item]  # both dates given
+        "week": ist_week_bounds(now),
+        "last_week": ist_week_bounds(now - timedelta(days=7)),
+    }
 
 
 def _fmt_dt(dt: datetime | None) -> str:
@@ -373,7 +388,8 @@ async def booked(
     user_ids: list[Any], from_date: datetime | None, to_date: datetime | None
 ) -> dict[Any, tuple[Decimal, Decimal]]:
     """Each user's Billing statement Gross PnL and Brokerage over the window,
-    for many users in two queries (the accounts dashboard's rows and cards):
+    for many users in two queries (the accounts dashboard and every Today /
+    This week / Last week P&L card, over `periods`):
     every close in the window at what the wallet booked on it, weekly and
     expiry settlements at their settle price, undone fills out; brokerage is
     every charge on a fill executed in the window. The walk prices a close
@@ -403,6 +419,11 @@ async def booked(
         move = (to_decimal(p.ltp) - to_decimal(p.avg_price)) * units * sign
         out.setdefault(p.user_id, [Decimal(0), Decimal(0)])[0] += move * position_service.position_fx_rate(p)
     return {uid: (quantize_money(g), quantize_money(b)) for uid, (g, b) in out.items()}
+
+
+async def net(user_ids: list[Any], from_date: datetime | None, to_date: datetime | None) -> Decimal:
+    """Σ the users' Billing statement Net P&L (Gross − Brokerage) over the window."""
+    return sum((g - b for g, b in (await booked(user_ids, from_date, to_date)).values()), Decimal(0))
 
 
 async def statement_payload(

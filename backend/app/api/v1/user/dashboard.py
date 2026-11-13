@@ -12,7 +12,7 @@ from app.models.holding import Holding
 from app.models.order import Order, OrderStatus
 from app.models.position import Position, PositionStatus
 from app.schemas.common import APIResponse
-from app.services import market_data_service, wallet_service
+from app.services import market_data_service, tradebook_builder, wallet_service
 from app.utils.decimal_utils import to_decimal
 
 logger = logging.getLogger(__name__)
@@ -64,11 +64,8 @@ async def summary(user: CurrentUser):
         logger.exception("dashboard_holdings_failed")
         holdings = []
 
-    # Fetch all LTPs in one parallel gather (holdings + positions tokens combined)
-    all_tokens = list(
-        {h.instrument.token for h in holdings}
-        | {p.instrument.token for p in open_positions}
-    )
+    # Fetch the holdings' LTPs in one parallel gather
+    all_tokens = list({h.instrument.token for h in holdings})
     if all_tokens:
         _ltp_results = await asyncio.gather(
             *[market_data_service.get_ltp(tok) for tok in all_tokens],
@@ -91,14 +88,9 @@ async def summary(user: CurrentUser):
         except Exception:
             logger.exception("dashboard_holding_calc_failed")
 
-    today_pnl = 0.0
-    for p in open_positions:
-        try:
-            ltp = ltp_map.get(p.instrument.token, 0.0)
-            today_pnl += (ltp - float(to_decimal(p.avg_price))) * float(p.quantity)
-            today_pnl += float(to_decimal(p.realized_pnl))
-        except Exception:
-            logger.exception("dashboard_position_pnl_failed")
+    # The IST day's Billing statement Net P&L — the same figure as
+    # /positions/pnl-summary's today_pnl, which replaces it after first paint.
+    today_pnl = await tradebook_builder.net([user.id], *tradebook_builder.periods()["today"])
 
     return APIResponse(
         data={
@@ -109,6 +101,6 @@ async def summary(user: CurrentUser):
             "holdings_value": round(holdings_value, 2),
             "holdings_invested": round(holdings_invested, 2),
             "holdings_pnl": round(holdings_value - holdings_invested, 2),
-            "today_pnl": round(today_pnl, 2),
+            "today_pnl": float(today_pnl),
         }
     )

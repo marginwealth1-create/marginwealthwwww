@@ -24,21 +24,21 @@ export function PnlSummaryCards() {
         label="Today"
         sublabel="Today's PNL"
         value={pnl?.today_pnl ?? 0}
-        hint={`Realised ${formatINR(pnl?.today_realised ?? 0)} + Unrealised ${formatINR(pnl?.open_unrealised ?? 0)}`}
+        hint={`Booked, net of brokerage · Open M2M ${formatINR(pnl?.open_unrealised ?? 0)}`}
         icon={(pnl?.today_pnl ?? 0) >= 0 ? TrendingUp : TrendingDown}
       />
       <PnlCard
         label="This Week"
         sublabel="This Week's PNL"
         value={pnl?.week_pnl ?? 0}
-        hint="Sun → today (IST)"
+        hint="Mon → today (IST)"
         icon={(pnl?.week_pnl ?? 0) >= 0 ? TrendingUp : TrendingDown}
       />
       <PnlCard
         label="Last Week"
         sublabel="Last Week's PNL"
         value={pnl?.last_week_pnl ?? 0}
-        hint="Previous Sun → Sat — realised only"
+        hint="Previous Mon → Sun (IST)"
         icon={CalendarDays}
       />
     </section>

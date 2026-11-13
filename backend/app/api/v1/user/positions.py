@@ -17,7 +17,7 @@ from app.models.position import Position, PositionStatus
 from app.models.trade import LIVE_FILL, Trade
 from app.schemas.common import APIResponse
 from app.schemas.trading import HoldingOut, PositionOut
-from app.services import audit_service, market_data_service, netting_service, order_service, order_validator, position_service
+from app.services import audit_service, market_data_service, netting_service, order_service, order_validator, position_service, tradebook_builder
 from app.utils.decimal_utils import to_decimal
 
 router = APIRouter(prefix="/positions", tags=["user-positions"])
@@ -2072,15 +2072,17 @@ _PNL_SUMMARY_TTL = 1.5
 async def positions_pnl_summary(user: CurrentUser):
     """Per-user PnL windows for the dashboard cards (Today / Week / Last week).
 
-    today_pnl     — realised P&L since IST midnight + current open unrealised.
-    week_pnl      — same, since the most recent IST Sunday 00:00.
-    last_week_pnl — total realised P&L of the previous Sun→Sat window.
+    today_pnl / week_pnl / last_week_pnl — the user's Billing statement Net
+    P&L (Gross − Brokerage, tradebook_builder.booked) for the IST day, this
+    IST week (Mon 00:00 → now) and last week (Mon → Sun): every close at what
+    the wallet booked, settlements included, undone fills out. The
+    ``*_realised`` fields carry the same figures (kept for older clients).
+    Floating M2M is in no period figure; it is ``open_unrealised``.
 
-    NOTE on FX: ``Position.realized_pnl`` and ``unrealized_pnl`` are stored in
-    the instrument's NATIVE currency (USD for crypto/forex). We convert each
-    USD-quoted position to INR using the position's locked-at-open USD/INR
-    rate (realised) or the live rate (unrealised), matching what ``_pos()``
-    sends to the live-positions strip.
+    NOTE on FX: ``Position.unrealized_pnl`` is stored in the instrument's
+    NATIVE currency (USD for crypto/forex); each USD-quoted open position is
+    converted at the live rate, matching what ``_pos()`` sends to the
+    live-positions strip.
     """
     # Short-TTL cache hit — skip the whole heavy recompute (see note above).
     _ck = str(user.id)
@@ -2088,67 +2090,15 @@ async def positions_pnl_summary(user: CurrentUser):
     if _hit is not None and _hit[0] > _pnl_time.monotonic():
         return APIResponse(data=_hit[1])
 
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-
-    IST = _tz(_td(hours=5, minutes=30))
-    now_ist = _dt.now(IST)
-    today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-    days_back = (now_ist.weekday() + 1) % 7
-    week_start_ist = today_start_ist - _td(days=days_back)
-    last_week_start_ist = week_start_ist - _td(days=7)
-    last_week_end_ist = week_start_ist  # exclusive
-
-    today_start = today_start_ist.astimezone(_tz.utc)
-    week_start = week_start_ist.astimezone(_tz.utc)
-    last_week_start = last_week_start_ist.astimezone(_tz.utc)
-    last_week_end = last_week_end_ist.astimezone(_tz.utc)
+    windows = tradebook_builder.periods()
+    today_net, week_net, last_week_net = await asyncio.gather(
+        *(tradebook_builder.net([user.id], *windows[k]) for k in ("today", "week", "last_week"))
+    )
 
     current_usd_inr = market_data_service.get_usd_inr_rate()
 
     def _is_usd(p: Position) -> bool:
         return market_data_service.position_is_usd(p)
-
-    def _realised_inr(p: Position) -> float:
-        raw = float(str(p.realized_pnl))
-        if not _is_usd(p):
-            return raw
-        rate = (
-            float(str(p.open_usd_inr_rate))
-            if p.open_usd_inr_rate is not None
-            else current_usd_inr
-        )
-        return raw * rate
-
-    async def _realised_in(window_start, window_end=None) -> float:
-        # Use trades (closing fills with pnl_inr set) as the source of truth —
-        # same as the admin trading.py pnl-summary endpoint so user and admin
-        # numbers always agree.  The old position-based approach (summing
-        # position.realized_pnl where closed_at OR updated_at fell in window)
-        # had two bugs: (1) it was gross P&L without brokerage deduction, and
-        # (2) the updated_at branch dragged in realized P&L from open positions
-        # that were touched by the risk enforcer / tick, causing massive
-        # over-counting on accounts with many open positions.
-        rng: dict[str, Any] = {"$gte": window_start}
-        if window_end is not None:
-            rng["$lt"] = window_end
-        trades = await Trade.find(
-            {
-                "user_id": user.id,
-                "executed_at": rng,
-                "pnl_inr": {"$ne": None},
-                "price": {"$gt": 0},
-            }
-        ).to_list()
-        gross = sum(float(str(t.pnl_inr)) for t in trades if t.pnl_inr is not None)
-        charges = sum(
-            float(str(getattr(t, "total_charges", None) or t.brokerage or 0))
-            for t in trades
-        )
-        return gross - charges
-
-    today_realised = await _realised_in(today_start)
-    week_realised = await _realised_in(week_start)
-    last_week_realised = await _realised_in(last_week_start, last_week_end)
 
     open_positions = await Position.find(
         {"user_id": user.id, "status": PositionStatus.OPEN.value}
@@ -2188,16 +2138,16 @@ async def positions_pnl_summary(user: CurrentUser):
         total_unrealised += raw
 
     _data = {
-        "today_pnl": round(today_realised + total_unrealised, 2),
-        "today_realised": round(today_realised, 2),
+        "today_pnl": float(today_net),
+        "today_realised": float(today_net),
         "open_unrealised": round(total_unrealised, 2),
-        "week_pnl": round(week_realised + total_unrealised, 2),
-        "week_realised": round(week_realised, 2),
-        "last_week_pnl": round(last_week_realised, 2),
-        "today_start": today_start.isoformat(),
-        "week_start": week_start.isoformat(),
-        "last_week_start": last_week_start.isoformat(),
-        "last_week_end": last_week_end.isoformat(),
+        "week_pnl": float(week_net),
+        "week_realised": float(week_net),
+        "last_week_pnl": float(last_week_net),
+        "today_start": windows["today"][0].isoformat(),
+        "week_start": windows["week"][0].isoformat(),
+        "last_week_start": windows["last_week"][0].isoformat(),
+        "last_week_end": windows["last_week"][1].isoformat(),
         "usd_inr_rate": round(current_usd_inr, 4),
     }
     # Cache for the next 1.5 s so concurrent / rapid polls reuse this compute.

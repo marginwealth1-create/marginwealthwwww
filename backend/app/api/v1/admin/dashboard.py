@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import timedelta
+from decimal import Decimal
 
 from fastapi import APIRouter
 
@@ -24,6 +25,8 @@ from app.models.transaction import (
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.schemas.common import APIResponse
+from app.services import tradebook_builder
+from app.utils.decimal_utils import quantize_money, to_decimal
 from app.utils.time_utils import now_utc
 
 logger = logging.getLogger(__name__)
@@ -164,10 +167,12 @@ async def stats(admin: CurrentAdmin):
         ).count(),
         0,
     )
-    trade_q: dict = {"executed_at": {"$gte": today_start}, **user_id_filter, **LIVE_FILL}
+    # Today = the IST day, the window every Today P&L / brokerage figure reads.
+    day_lo, day_hi = tradebook_builder.periods()["today"]
+    trade_q: dict = {"executed_at": {"$gte": day_lo, "$lte": day_hi}, **user_id_filter, **LIVE_FILL}
     trades_today = await _safe(Trade.find(trade_q).to_list(), [])
-    today_volume = sum(float(str(t.value)) for t in trades_today)
-    today_revenue = sum(float(str(t.brokerage)) for t in trades_today)
+    today_volume = sum((to_decimal(t.value) for t in trades_today), Decimal(0))
+    today_revenue = sum((to_decimal(t.brokerage) for t in trades_today), Decimal(0))
 
     wallets = await _safe(Wallet.find(user_id_filter).to_list(), [])
     total_balance = sum(float(str(w.available_balance)) for w in wallets)
@@ -187,8 +192,8 @@ async def stats(admin: CurrentAdmin):
                 "open_positions": open_positions,
                 "pending_orders": pending_orders,
                 "trades_today": len(trades_today),
-                "today_volume": round(today_volume, 2),
-                "today_revenue": round(today_revenue, 2),
+                "today_volume": float(quantize_money(today_volume)),
+                "today_revenue": float(quantize_money(today_revenue)),
                 "holdings_count": holdings_count,
             },
             "approvals": {

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from beanie import PydanticObjectId
@@ -20,7 +21,7 @@ from app.core.dependencies import (
     scoped_user_ids,
 )
 from app.core.exceptions import InsufficientPermissionsError, NotFoundError
-from app.models.trade import Trade
+from app.models.trade import LIVE_FILL, Trade
 from app.models.transaction import (
     DepositRequest,
     DepositStatus,
@@ -31,6 +32,7 @@ from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.schemas.common import APIResponse
 from app.services import report_pdf_service, tradebook_builder
+from app.utils.decimal_utils import quantize_money, to_decimal
 from app.utils.time_utils import now_ist, now_utc
 
 logger = logging.getLogger(__name__)
@@ -119,23 +121,29 @@ async def trades_report(
     admin: CurrentAdmin,
     _: None = Depends(require_perm("reports", "read")),
 ):
-    today = now_utc() - timedelta(hours=24)
-    week = now_utc() - timedelta(days=7)
+    # The IST day and the IST week (Mon 00:00 → now) — the windows every P&L
+    # card reads — so "week" brokerage is the Billing statements' Brokerage.
+    windows = tradebook_builder.periods()
     scope = await scoped_user_ids(admin, all_pools=True)
     if not scope:
         empty = {"count": 0, "volume": 0.0, "brokerage": 0.0, "charges": 0.0}
         return APIResponse(data={"today": empty, "week": empty})
-    # Fills an admin delete / reopen refunded are out of every brokerage sum.
-    base = {"user_id": {"$in": scope}, "superseded_by_reopen": {"$ne": True}}
-    today_trades = await Trade.find({**base, "executed_at": {"$gte": today}}).to_list()
-    week_trades = await Trade.find({**base, "executed_at": {"$gte": week}}).to_list()
+    # Fills an admin delete / reopen took back are out of every sum.
+    base = {"user_id": {"$in": scope}, **LIVE_FILL}
+    today_trades, week_trades = [
+        await Trade.find({**base, "executed_at": {"$gte": windows[k][0], "$lte": windows[k][1]}}).to_list()
+        for k in ("today", "week")
+    ]
 
     def _agg(rows):
+        def total(field: str) -> float:
+            return float(quantize_money(sum((to_decimal(getattr(t, field)) for t in rows), Decimal(0))))
+
         return {
             "count": len(rows),
-            "volume": round(sum(float(str(t.value)) for t in rows), 2),
-            "brokerage": round(sum(float(str(t.brokerage)) for t in rows), 2),
-            "charges": round(sum(float(str(t.total_charges)) for t in rows), 2),
+            "volume": total("value"),
+            "brokerage": total("brokerage"),
+            "charges": total("total_charges"),
         }
 
     return APIResponse(data={"today": _agg(today_trades), "week": _agg(week_trades)})

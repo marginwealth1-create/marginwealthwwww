@@ -230,7 +230,7 @@ export default function AdminUsersPage() {
         return (
           <span
             className={`text-sm font-semibold tabular-nums ${up ? "text-emerald-500" : "text-destructive"}`}
-            title="Realised P&L booked this week (Mon → now)"
+            title="Billing statement Net P&L this week (Mon → now, IST), net of brokerage"
           >
             {up ? "+" : "−"}₹
             {Math.abs(v).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from io import BytesIO
@@ -45,15 +46,10 @@ router = APIRouter(prefix="/accounts", tags=["admin-accounts"])
 
 IST = ZoneInfo("Asia/Kolkata")
 
-_WEEK_PRESETS = {
-    "current_week": lambda now: (
-        (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0),
-        now,
-    ),
-    "last_week": lambda now: (
-        (now - timedelta(days=now.weekday() + 7)).replace(hour=0, minute=0, second=0, microsecond=0),
-        (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(seconds=1),
-    ),
+_WEEK_PRESETS: dict[str, Callable[[datetime], tuple[datetime, datetime]]] = {
+    # The P&L cards' IST weeks, Mon 00:00 → Sun 23:59:59.999.
+    "current_week": lambda now: tradebook_builder.periods(now)["week"],
+    "last_week": lambda now: tradebook_builder.periods(now)["last_week"],
     "this_month": lambda now: (
         now.replace(day=1, hour=0, minute=0, second=0, microsecond=0),
         now,

@@ -33,7 +33,7 @@ from app.models.position import Position, PositionStatus
 from app.models.trade import LIVE_FILL, Trade
 from app.models.user import User, UserRole
 from app.schemas.common import APIResponse
-from app.services import market_data_service, order_service, position_service
+from app.services import market_data_service, order_service, position_service, tradebook_builder
 from app.services.audit_service import log_event
 
 
@@ -540,22 +540,11 @@ async def force_cancel(
 # model would reject the dict with a 500 (which then loses CORS headers and
 # surfaces in the browser as a misleading "blocked by CORS / ERR_FAILED").
 def _last_week_start_utc() -> datetime:
-    """Start (UTC) of LAST week — the most recent IST-Sunday 00:00 minus 7
-    days. The admin Closed-Trades view uses this as a lower bound so it shows
-    only LAST week + the CURRENT week (the same window as the two Net-P&L
-    cards), instead of the entire all-time closed history the admin asked to
-    stop scrolling through."""
-    from datetime import timedelta as _td, timezone as _tz
-
-    IST = _tz(_td(hours=5, minutes=30))
-    now_ist = datetime.now(IST)
-    today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-    # Monday-anchored week (Mon=0 … Sun=6) — matches the Net-P&L cards and the
-    # Accounts dashboard so the Closed tab spans the same current+last week.
-    days_back = now_ist.weekday()
-    week_start_ist = today_start_ist - _td(days=days_back)
-    last_week_start_ist = week_start_ist - _td(days=7)
-    return last_week_start_ist.astimezone(_tz.utc)
+    """Start (UTC) of LAST week — Monday 00:00 IST, the P&L cards' and the
+    Accounts dashboard's week. The admin Closed-Trades view uses it as a lower
+    bound so it shows only LAST week + the CURRENT week instead of the entire
+    all-time closed history the admin asked to stop scrolling through."""
+    return tradebook_builder.periods()["last_week"][0]
 
 
 def _format_closed_fifo_rows(fifo_events: list[dict], user_id: str) -> list[dict]:
@@ -2123,10 +2112,13 @@ async def positions_pnl_summary(
 ):
     """Aggregate PnL windows for the admin dashboard cards.
 
-    today_pnl    — sum of realised P&L from trades + unrealised on open
-                   positions, since IST midnight.
-    week_pnl     — same, since the most recent IST Sunday 00:00.
-    last_week_pnl — total realised P&L of the previous Sun→Sat window.
+    today_pnl / week_pnl / last_week_pnl (and the ``*_realised`` twins) — the
+    pool's Billing statement Net P&L (Gross − Brokerage, tradebook_builder.booked)
+    over the IST day, this IST week (Mon 00:00 → now) and last week (Mon →
+    Sun). ``week_*`` / ``last_week_*`` net_client_pnl / brokerage /
+    total_of_both are the same windows' Gross, Brokerage and broker view —
+    the Accounts dashboard's figures. Floating M2M is ``open_unrealised``
+    only.
 
     `user_id` (optional) narrows the aggregate to a single user's
     positions only — passed by the admin Positions page when a user
@@ -2138,56 +2130,20 @@ async def positions_pnl_summary(
     if _hit is not None and _hit[0] > _admin_pnl_time.monotonic():
         return APIResponse(data=_hit[1])
 
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from app.utils.time_utils import to_ist
 
-    IST = _tz(_td(hours=5, minutes=30))
-    now_ist = _dt.now(IST)
-    today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
-    # Monday-anchored week — MUST match the Accounts dashboard / P&L-sharing
-    # report (both use `now - weekday`, Mon=0). Sunday-anchoring here made the
-    # Positions cards span a different 7-day window than Accounts, so the two
-    # pages showed different "This Week" numbers for the same book.
-    days_back = now_ist.weekday()
-    week_start_ist = today_start_ist - _td(days=days_back)
-    last_week_start_ist = week_start_ist - _td(days=7)
-    last_week_end_ist = week_start_ist  # exclusive
-    # Full Mon→Sun span for the card label (data still runs only to `now`, but
-    # the header shows the whole week like Accounts' "17 Aug – 23 Aug").
-    week_end_ist = week_start_ist + _td(days=6)
-    last_week_end_disp_ist = last_week_start_ist + _td(days=6)
+    windows = tradebook_builder.periods()
 
-    def _fmt_range(a: _dt, b: _dt) -> str:
+    def _fmt_range(a: datetime, b: datetime) -> str:
+        a, b = to_ist(a), to_ist(b)
         return f"{a.day} {a.strftime('%b')} – {b.day} {b.strftime('%b')}"
 
-    today_start = today_start_ist.astimezone(_tz.utc)
-    week_start = week_start_ist.astimezone(_tz.utc)
-    last_week_start = last_week_start_ist.astimezone(_tz.utc)
-    last_week_end = last_week_end_ist.astimezone(_tz.utc)
-
-    # Realised P&L lives on each Position (set on SELL closes/flips). We sum
-    # across positions whose closed_at OR updated_at falls in the window —
-    # covers fully-closed and partially-closed-but-still-open positions in
-    # one query (positions that closed in window have closed_at set; ones
-    # still open with realised slices booked have updated_at in window).
-    #
-    # FX: realized_pnl + unrealized_pnl are stored in NATIVE currency. For
-    # USD-quoted (crypto/forex) we convert to INR via the locked open rate
-    # (realised) or live rate (unrealised) — same logic as _pos() view.
+    # FX: unrealized_pnl is stored in NATIVE currency; USD-quoted
+    # (crypto/forex) open positions convert at the live rate.
     current_usd_inr = market_data_service.get_usd_inr_rate()
 
     def _is_usd(p: Position) -> bool:
         return market_data_service.position_is_usd(p)
-
-    def _realised_inr(p: Position) -> float:
-        raw = float(str(p.realized_pnl))
-        if not _is_usd(p):
-            return raw
-        rate = (
-            float(str(p.open_usd_inr_rate))
-            if p.open_usd_inr_rate is not None
-            else current_usd_inr
-        )
-        return raw * rate
 
     # Scope user pool for sub-admins. None for SUPER_ADMIN = no filter.
     # own_scope (super-admin Positions page): the super-admin's OWN direct
@@ -2224,154 +2180,6 @@ async def positions_pnl_summary(
                     }
                 )
             scope = [user_filter_oid]
-
-    # Sum charges (brokerage + other) across all trades that belong to a
-    # given position. Mirrors the per-row attribution in the /positions
-    # endpoint so the aggregate tile and the per-row table never disagree.
-    # Without this, the dashboard's "This Week's Closed PNL" stayed at
-    # gross while every trade card on the APK showed net — the difference
-    # equalled the brokerage bill for the week.
-    from datetime import timedelta as _td_sum
-
-    async def _charges_for_positions(positions: list[Position]) -> dict[str, float]:
-        if not positions:
-            return {}
-        user_ids = list({p.user_id for p in positions})
-        tokens = list({p.instrument.token for p in positions})
-        oldest = min((p.opened_at for p in positions if p.opened_at), default=None)
-        tq: dict[str, Any] = {
-            "user_id": {"$in": user_ids},
-            "instrument.token": {"$in": tokens},
-        }
-        if oldest is not None:
-            tq["executed_at"] = {"$gte": oldest - _td_sum(seconds=5)}
-        trades = await Trade.find(tq).sort("+executed_at").to_list()
-        bucket: dict[tuple[str, str, str], list[Trade]] = {}
-        for t in trades:
-            bucket.setdefault(
-                (str(t.user_id), t.instrument.token, t.product_type.value), []
-            ).append(t)
-        slack = _td_sum(seconds=5)
-        out: dict[str, float] = {}
-        for p in positions:
-            key = (str(p.user_id), p.instrument.token, p.product_type.value)
-            ts = bucket.get(key, [])
-            if not ts:
-                out[str(p.id)] = 0.0
-                continue
-            if not p.opened_at:
-                out[str(p.id)] = sum(
-                    float(str(getattr(t, "total_charges", None) or t.brokerage or 0))
-                    for t in ts
-                )
-                continue
-            cycle_start = p.reopened_at or p.opened_at
-            pos_open = p.opened_at
-            pos_end = p.closed_at  # None = OPEN, no upper bound for opening fills
-            total = 0.0
-            for t in ts:
-                if position_service.in_reopen_gap(p, t.executed_at):
-                    continue  # another position's, traded while this one sat closed
-                charge = float(str(getattr(t, "total_charges", None) or t.brokerage or 0))
-                if getattr(t, "pnl_inr", None) is not None:
-                    if t.executed_at < cycle_start - slack:
-                        continue
-                    if pos_end is not None and t.executed_at > pos_end + slack:
-                        continue
-                    total += charge
-                else:
-                    if t.executed_at < pos_open - slack:
-                        continue
-                    if pos_end is not None and t.executed_at > pos_end + slack:
-                        continue
-                    total += charge
-            out[str(p.id)] = total
-        return out
-
-    async def _realised_in(window_start, window_end=None):
-        # CORRECT source for window realized P&L = Trade.pnl_inr summed
-        # over Trade.executed_at in the window. Trade.pnl_inr is the
-        # per-fill closing P&L frozen at execution time (matching engine
-        # writes it on the closing leg), so it's a true DELTA per event.
-        #
-        # The earlier implementation queried Position rows where
-        # `closed_at OR updated_at` fell in the window and summed
-        # Position.realized_pnl. That cumulative field plus the
-        # updated_at branch caused massive over-counting: every open
-        # position's updated_at refreshes on every tick / risk-enforcer
-        # cycle / SL-TP edit, which dragged its FULL running realized
-        # (booked weeks earlier) into "This Week's Net P&L". A 67-open
-        # admin pool was showing ₹-17.7 lakh for a 2-day window.
-        rng: dict[str, Any] = {"$gte": window_start}
-        if window_end is not None:
-            rng["$lt"] = window_end
-        # Filter out bogus zero-priced fills.  Before the matching engine
-        # got the STALE_FEED guard, a stale Zerodha WS could push LTP = 0
-        # into get_ltp() and a market order would execute at ₹0.00, booking
-        # a phantom loss equal to the entire notional.  Those rows are
-        # still in `trades` for the audit trail but they MUST NOT
-        # contribute to the admin's headline P&L — they aren't real
-        # market activity.  Same exclusion keeps settlement_outstanding
-        # off the card too: settlement is tracked on Wallet, not Trade,
-        # so dropping zero-priced trades from the realised sum is the
-        # only filter needed here.
-        # Trade.pnl_inr is already NET of closing brokerage — matching_engine
-        # stores pnl_inr_dec = raw_realized - brokerage. Do NOT subtract
-        # total_charges again (that double-counts brokerage).
-        #
-        # REOPEN / DELETE handling — `superseded_by_reopen`:
-        # When an admin reopens or deletes a closed position, every fill of the
-        # undone close is flagged `superseded_by_reopen=True`. Excluding those
-        # fills here drops the reopened/deleted position's P&L **and** brokerage
-        # straight out of the card (pnl_inr is net of brokerage, so one filter
-        # removes both). This REPLACES the old `gross + REVERSAL/RECOVERY
-        # correction` approach, which over-corrected on CROSS-WEEK reopens — a
-        # position closed last week (loss in last week's gross) and reopened
-        # this week added a phantom +reversal to THIS week's card with no
-        # matching loss (operator: "card me se nahi hatta"). Superseded-
-        # exclusion nets reopens/deletes cleanly with no window mismatch, and
-        # it's the SAME rule reports.py + accounts_dashboard already use, so
-        # every page now agrees. The reopen/delete WALLET reversal is untouched.
-        query: dict[str, Any] = {
-            "executed_at": rng,
-            "pnl_inr": {"$ne": None},
-            "price": {"$gt": 0},
-            "superseded_by_reopen": {"$ne": True},
-        }
-        if scope is not None:
-            if not scope:
-                return 0.0
-            query["user_id"] = {"$in": scope}
-        trades = await Trade.find(query).to_list()
-        gross = sum(float(str(t.pnl_inr)) for t in trades if t.pnl_inr is not None)
-
-        from app.models.transaction import (  # noqa: PLC0415
-            WalletTransaction as _WT,
-            TransactionType as _TT,
-        )
-
-        # Settlement PnL — weekly settlement books directly to wallet via
-        # wallet_service.adjust(TransactionType.PNL, reference_type="POSITION_SETTLEMENT").
-        # No Trade record is created, so it never appears in `gross` above.
-        # Add it here so the card shows the TRUE net including settlement booking.
-        settle_q: dict[str, Any] = {
-            "transaction_type": _TT.PNL.value,
-            "reference_type": "POSITION_SETTLEMENT",
-            "created_at": {"$gte": window_start},
-            "superseded_by_reopen": {"$ne": True},
-        }
-        if window_end is not None:
-            settle_q["created_at"]["$lt"] = window_end
-        if scope is not None:
-            settle_q["user_id"] = {"$in": scope}
-        settle_txns = await _WT.find(settle_q).to_list()
-        settlement_pnl = sum(float(str(t.amount)) for t in settle_txns)
-
-        return gross + settlement_pnl
-
-    today_realised = await _realised_in(today_start)
-    week_realised = await _realised_in(week_start)
-    last_week_realised = await _realised_in(last_week_start, last_week_end)
 
     # Recompute unrealised LIVE per position rather than reading the stored
     # `p.unrealized_pnl` field — that field is only refreshed when the
@@ -2459,19 +2267,23 @@ async def positions_pnl_summary(
         _acct_ids = await super_admin_direct_user_ids()
     else:
         _acct_ids = await _acct_pool(admin.id, admin.role.value)
-    _wk_tot = await _client_totals(_acct_ids, week_start, None)
-    _lw_tot = await _client_totals(_acct_ids, last_week_start, last_week_end)
+    _td_tot, _wk_tot, _lw_tot = await asyncio.gather(
+        *(_client_totals(_acct_ids, *windows[k]) for k in ("today", "week", "last_week"))
+    )
 
     def _f(d) -> float:
         return round(float(d), 2)
 
+    def _net(t) -> float:
+        return _f(t["net_client_pnl"] - t["net_client_bkg"])
+
     _data = {
-        "today_pnl": round(today_realised + total_unrealised, 2),
-        "today_realised": round(today_realised, 2),
+        "today_pnl": _net(_td_tot),
+        "today_realised": _net(_td_tot),
         "open_unrealised": round(total_unrealised, 2),
-        "week_pnl": round(week_realised + total_unrealised, 2),
-        "week_realised": round(week_realised, 2),
-        "last_week_pnl": round(last_week_realised, 2),
+        "week_pnl": _net(_wk_tot),
+        "week_realised": _net(_wk_tot),
+        "last_week_pnl": _net(_lw_tot),
         # Accounts-parity trio (current + last week) — headline is Total-of-Both.
         "week_net_client_pnl": _f(_wk_tot["net_client_pnl"]),
         "week_brokerage": _f(_wk_tot["net_client_bkg"]),
@@ -2479,12 +2291,12 @@ async def positions_pnl_summary(
         "last_week_net_client_pnl": _f(_lw_tot["net_client_pnl"]),
         "last_week_brokerage": _f(_lw_tot["net_client_bkg"]),
         "last_week_total_of_both": _f(_lw_tot["total_of_both"]),
-        "today_start": today_start.isoformat(),
-        "week_start": week_start.isoformat(),
-        "last_week_start": last_week_start.isoformat(),
-        "last_week_end": last_week_end.isoformat(),
-        "week_label": _fmt_range(week_start_ist, week_end_ist),
-        "last_week_label": _fmt_range(last_week_start_ist, last_week_end_disp_ist),
+        "today_start": windows["today"][0].isoformat(),
+        "week_start": windows["week"][0].isoformat(),
+        "last_week_start": windows["last_week"][0].isoformat(),
+        "last_week_end": windows["last_week"][1].isoformat(),
+        "week_label": _fmt_range(*windows["week"]),
+        "last_week_label": _fmt_range(*windows["last_week"]),
         "usd_inr_rate": round(current_usd_inr, 4),
     }
     # Cache for the next 2 s so the Dashboard/Positions/Orders polls share it.
