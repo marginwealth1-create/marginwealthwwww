@@ -1187,13 +1187,16 @@ async def list_closed_trade_events_fifo(
     from app.models.trade import Trade
 
     # A deleted position's fills are out of the book, opening legs included,
-    # and so is a close a reopen undid from §2.6 on (superseded_at).
+    # and so is a close a reopen undid from §2.6 on (superseded_at). The whole
+    # history: a newest-N cap left an older statement window with no rows and
+    # cut a close off from its open (open leg's brokerage lost).
+    # ponytail: every live fill of the user per call; project to the walk's
+    # fields if a heavy client's Closed tab gets slow.
     trades = await (
         Trade.find(
             {"user_id": PydanticObjectId(user_id), "fifo_deleted": {"$ne": True}, "superseded_at": None}
         )
         .sort("-executed_at")
-        .limit(3000)
         .to_list()
     )
     trades.reverse()  # chronological for FIFO walk
@@ -1286,6 +1289,9 @@ async def list_closed_trade_events_fifo(
             "product_type": _p.product_type,
             "pid": _p.id,
             "close_reason": _p.close_reason,
+            # The rate the settlement moved the wallet at (1 for INR and for
+            # USD positions booked before the conversion).
+            "fx_rate": float(position_fx_rate(_p)),
         })
 
     def _charge(tr: Any) -> float:
@@ -1321,8 +1327,8 @@ async def list_closed_trade_events_fifo(
         if _kind == "settle":
             b = _obj
             sign = 1.0 if b["side"] == "BUY" else -1.0
-            # Same gross formula the trade-FIFO path uses (no FX — closed
-            # rows render P&L raw, matching the rest of this blotter).
+            # Native gross like every row here; fx_rate converts it to what
+            # the wallet booked.
             gross = (b["settle_price"] - b["entry_price"]) * b["qty"] * sign
             events.append({
                 "_row_id": f"wsettle_{b['pid']}",
@@ -1335,6 +1341,7 @@ async def list_closed_trade_events_fifo(
                 "close_price": b["settle_price"],
                 "qty": b["qty"],
                 "gross_pnl": gross,
+                "fx_rate": b["fx_rate"],
                 "brokerage": 0.0,  # weekly settlement charges no brokerage
                 "opened_at": b["ts"],
                 "closed_at": b["ts"],

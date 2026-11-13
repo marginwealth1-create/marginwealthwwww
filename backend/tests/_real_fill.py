@@ -51,6 +51,7 @@ async def market(
     product: ProductType = ProductType.MIS,
     basis: str | None = None,
     placed_at: datetime | None = None,
+    instrument: InstrumentRef = INSTRUMENT,
 ) -> Trade:
     """Fill a MARKET order for `user`. `at` moves only the Trade's clock into a
     test's window; the brokerage on it is whatever the engine charged.
@@ -61,7 +62,7 @@ async def market(
     order = Order(
         order_number=f"TB{secrets.token_hex(6)}",
         user_id=user.id,
-        instrument=INSTRUMENT,
+        instrument=instrument,
         action=OrderAction(action),
         order_type=OrderType.MARKET,
         product_type=product,

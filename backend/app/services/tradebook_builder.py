@@ -44,11 +44,13 @@ async def fifo_closed_rows(
     the user builder ignores the extra ``open_time`` / ``open_com``).
 
     ``net_pnl`` is Σ gross P&L — the SAME per-row figure the Closed tab shows
-    (``realized_pnl = gross``, brokerage listed separately).
+    (``realized_pnl = gross × fx_rate``, brokerage listed separately), in the
+    wallet's units: a USD row converts at the rate the wallet booked it.
     """
     from app.services import position_service
+    from app.utils.decimal_utils import quantize_money, to_decimal
 
-    # limit huge → every event (the function itself caps input trades at 3000).
+    # limit huge → every event.
     events, _total = await position_service.list_closed_trade_events_fifo(
         user_id, skip=0, limit=1_000_000
     )
@@ -56,7 +58,7 @@ async def fifo_closed_rows(
     lo = _naive(from_date)
     hi = _naive(to_date)
     rows: list[dict[str, Any]] = []
-    net_pnl = 0.0
+    net_pnl = to_decimal(0)
     sum_brokerage = 0.0
 
     for ev in events:
@@ -71,9 +73,11 @@ async def fifo_closed_rows(
         entry = float(ev["entry_price"])
         close = float(ev["close_price"])
         qty = float(ev["qty"])
-        gross = float(ev["gross_pnl"])
+        # The walk's gross is native; brokerage is already in wallet units.
+        gross_d = to_decimal(float(ev["gross_pnl"])) * to_decimal(float(ev.get("fx_rate") or 1))
+        gross = float(gross_d)
         brk = float(ev["brokerage"])
-        net_pnl += gross
+        net_pnl += gross_d
         sum_brokerage += brk
 
         rows.append(
@@ -100,4 +104,4 @@ async def fifo_closed_rows(
             }
         )
 
-    return rows, round(net_pnl, 2), round(sum_brokerage, 2)
+    return rows, float(quantize_money(net_pnl)), round(sum_brokerage, 2)
