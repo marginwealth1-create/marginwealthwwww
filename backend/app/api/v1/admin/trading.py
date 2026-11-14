@@ -1859,8 +1859,6 @@ async def admin_reopen_position(
         except Exception:
             logger.exception("reopen_lookup_settlement_failed", extra={"pos_id": str(p.id)})
             booked_total = _Decimal("0")
-    pnl_cash = undone + booked_total if undone < 0 else undone
-    cash_refund = pnl_cash - brokerage
 
     # ── Claim: one reopen per close ─────────────────────────────────────
     # Two submits both passed the status check and both refunded. Taking the
@@ -1885,8 +1883,12 @@ async def admin_reopen_position(
             await _fills.update_many({"_id": {"$in": _ids}}, {"$set": _set})
         if booked_total > _Decimal("0"):
             wallet_doc = await _ws.get_or_create(p.user_id)
-            new_settle = max(_Decimal("0"), _td(wallet_doc.settlement_outstanding or 0) - booked_total)
-            wallet_doc.settlement_outstanding = Decimal128(str(new_settle))
+            cur_settle = _td(wallet_doc.settlement_outstanding or 0)
+            # A due netting already took out of cash is owed no more: it comes
+            # back with the cash refund below; only the rest is unbooked.
+            booked_total = min(booked_total, cur_settle)
+        if booked_total > _Decimal("0"):
+            wallet_doc.settlement_outstanding = Decimal128(str(cur_settle - booked_total))
             wallet_doc.version = (wallet_doc.version or 0) + 1
             await wallet_doc.save()
             # balance_before == balance_after — only the settlement field moved.
@@ -1912,6 +1914,8 @@ async def admin_reopen_position(
         # A debit past free cash comes out of the margin other open positions
         # lock, as a close loss does — floored to a due, it never left the
         # week's P&L.
+        pnl_cash = undone + booked_total if undone < 0 else undone
+        cash_refund = pnl_cash - brokerage
         if cash_refund != _Decimal("0"):
             await _ws.adjust(
                 p.user_id,
@@ -2754,8 +2758,15 @@ async def delete_position(
                 from app.models.wallet import Wallet as _Wallet
                 wallet_doc = await wallet_service.get_or_create(user_id)
                 cur_settle = to_decimal(wallet_doc.settlement_outstanding or 0)
-                new_settle = max(_Decimal("0"), cur_settle - booked_total)
-                wallet_doc.settlement_outstanding = _Dec128(str(new_settle))
+                # A due netting already took out of cash is owed no more: it
+                # comes back with the cash refund (Step C); only the rest is
+                # unbooked here.
+                booked_total = min(booked_total, cur_settle)
+            except Exception as e:
+                raise await _abort(f"Settlement unwind failed; delete aborted: {e}")
+        if booked_total > _Decimal("0"):
+            try:
+                wallet_doc.settlement_outstanding = _Dec128(str(cur_settle - booked_total))
                 wallet_doc.version = (wallet_doc.version or 0) + 1
                 await wallet_doc.save()
                 avail_str = str(wallet_doc.available_balance)

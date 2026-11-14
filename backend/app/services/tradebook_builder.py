@@ -499,11 +499,19 @@ async def statement_payload(
         if wallet
         else Decimal(0)
     )
-    done = {"user_id": uid, "status": TransactionStatus.COMPLETED.value}
-    since = await WalletTransaction.find(
-        {**done, **({"created_at": {"$gte": from_date}} if from_date else {})}
+    # One read of the rows for both edges, so a write landing mid-statement
+    # moves Opening and Balance alike.
+    lower = min(from_date, to_date) if from_date and to_date else from_date
+    ledger = await WalletTransaction.find(
+        {
+            "user_id": uid,
+            "status": TransactionStatus.COMPLETED.value,
+            **({"created_at": {"$gte": lower}} if lower else {}),
+        }
     ).to_list()
-    opening = worth - sum((_worth_change(t) for t in since), Decimal(0))
+    since, until = _between(from_date, None), _between(None, to_date)
+    opening = worth - sum((_worth_change(t) for t in ledger if since(t.created_at)), Decimal(0))
+    balance = worth - sum((_worth_change(t) for t in ledger if not until(t.created_at)), Decimal(0))
 
     # ── Everything charged in the window ───────────────────────────────
     fill_q: dict[str, Any] = {"user_id": uid, **LIVE_FILL}
@@ -566,13 +574,8 @@ async def statement_payload(
     gross = sum(grossed, Decimal(0))
 
     # ── Financial Standings: four figures that reconcile with the above ─
-    after = (
-        []
-        if to_date is None
-        else await WalletTransaction.find({**done, "created_at": {"$gt": to_date}}).to_list()
-    )
     financial = {
-        "balance": _money(worth - sum((_worth_change(t) for t in after), Decimal(0))),
+        "balance": _money(balance),
         "gross_pnl": _money(gross),
         "brokerage": _money(brokerage),
         "net_pnl": _money(gross - brokerage),

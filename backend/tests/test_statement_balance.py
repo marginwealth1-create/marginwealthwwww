@@ -26,16 +26,26 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from app.api.v1.admin import trading
 from app.core.config import settings
 from app.core.database import _document_models
+from app.models._base import Exchange
+from app.models.order import InstrumentRef
 from app.models.position import Position
-from app.models.transaction import SettlementRequest, TransactionType
+from app.models.transaction import SettlementRequest, TransactionType, WalletTransaction
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.services import tradebook_builder, wallet_service
 from app.utils.time_utils import now_utc, to_ist
-from tests._real_fill import later, market, set_commission_per_lot
+from tests._real_fill import INSTRUMENT, later, market, set_commission_per_lot
 
 _DB = f"{settings.MONGODB_DB_NAME}_test_statement_balance"
 WEEK = 8 * 24 * 60  # minutes: the next trade lands in the next window
+OTHER = InstrumentRef(
+    token="TSBO2",
+    symbol="TSBO",
+    trading_symbol="TSBO-EQ",
+    exchange=Exchange.NSE,
+    segment="NSE_EQUITY",
+    lot_size=1,
+)
 
 
 @pytest_asyncio.fixture
@@ -129,8 +139,8 @@ async def test_a_stop_out_past_the_wallet_still_adds_up(w, mode):
     """A stop-out losing 3,020 on a 1,000 wallet: the client owes 2,020 —
     auto settlement books it at the close; manual settlement lets the wallet
     go negative until an admin approves the due (or the boot migration
-    clamps it). The statement's Balance is −2,020 every way, and the next
-    deposit pays the due off first."""
+    clamps it). The statement's Balance is −2,020 every way, and a deposit
+    a week on lifts it to 2,980."""
     c = await w.mk("SB002", auto_settlement=mode == "auto")
     await _deposit(c, "1000")
     await market(c, "BUY", 10, "1000", margin="900")  # brokerage 10
@@ -152,18 +162,69 @@ async def test_a_stop_out_past_the_wallet_still_adds_up(w, mode):
     assert second_close == await _worth(c) == Decimal("2980")
 
 
+async def _owed(c: User) -> Decimal:
+    return Decimal(str((await Wallet.find_one(Wallet.user_id == c.id)).settlement_outstanding))
+
+
+async def _due_unbooked(c: User) -> list[Decimal]:
+    rows = await WalletTransaction.find(
+        WalletTransaction.user_id == c.id,
+        WalletTransaction.transaction_type == TransactionType.SETTLEMENT_OUTSTANDING_RECOVERY,
+        WalletTransaction.reference_type == "Position",
+    ).to_list()
+    return [Decimal(str(r.amount)) for r in rows]
+
+
+async def _undo(w, c: User, undo: str) -> None:
+    [p] = await Position.find(
+        Position.user_id == c.id, Position.instrument.symbol == INSTRUMENT.symbol
+    ).to_list()
+    if undo == "delete":
+        await trading.delete_position(str(p.id), w.sa, None)
+    else:
+        await trading.admin_reopen_position(str(p.id), w.sa, None)
+
+
 async def test_a_deleted_stop_out_leaves_the_deposit(w):
     """An admin deletes the stop-out: the reversal refunds what the wallet
     paid and unbooks the due (a RECOVERY row that moves no cash). Nothing
     happened, so the statement is the deposit alone."""
-    c = await w.mk("SB003")
+    c = await w.mk("SB003", auto_settlement=True)
     await _deposit(c, "1000")
     await market(c, "BUY", 10, "1000", margin="900")
     await market(c, "SELL", 10, "700", squareoff=True)
     await later(w.db, minutes=10)
-    [p] = await Position.find(Position.user_id == c.id).to_list()
-    await trading.delete_position(str(p.id), w.sa, None)
+    await _undo(w, c, "delete")
 
+    assert await _due_unbooked(c) == [Decimal("2020")]
     opening, balance = _check(await _statement(c, 6, 0))
     assert (opening, balance) == (Decimal(0), Decimal("1000"))
-    assert await _worth(c) == Decimal("1000")
+    assert await _worth(c) == Decimal("1000") and await _owed(c) == 0
+
+
+@pytest.mark.parametrize("undo", ["delete", "reopen"])
+async def test_an_undone_stop_out_whose_due_was_netted_refunds_it(w, undo):
+    """The 2,020 due came out of a later deposit (a fill nets it: a negative
+    RECOVERY row), then an admin undoes the stop-out. Nothing is owed any
+    more, so nothing is unbooked: the 2,020 the client paid comes back as
+    cash. Unbooking the full 2,020 instead left the client 2,020 short and
+    moved every earlier statement's Opening and Balance by it."""
+    c = await w.mk("SB004", auto_settlement=True)
+    await _deposit(c, "1000")
+    await market(c, "BUY", 10, "1000", margin="900")
+    await market(c, "SELL", 10, "700", squareoff=True)
+    await later(w.db, minutes=WEEK)
+    await _deposit(c, "5000")
+    await market(c, "BUY", 1, "100", instrument=OTHER)  # brokerage 1; nets the due
+    assert await _owed(c) == 0
+    before = _check(await _statement(c, 6, 0))  # this week's
+    assert before == (Decimal("-2020"), Decimal("2979"))
+    await later(w.db, minutes=WEEK)  # now last week's
+    await _undo(w, c, undo)
+
+    assert await _due_unbooked(c) == []
+    assert _check(await _statement(c, 13, 7)) == before
+    # A delete takes back all 3,020 the stop-out cost; a reopen the close's
+    # 3,000 and its 10, the position open again on its opening leg's 10.
+    left = Decimal("5999") if undo == "delete" else Decimal("5989")
+    assert await _worth(c) == left and await _owed(c) == 0
