@@ -27,6 +27,7 @@ from app.models.position import Position, PositionStatus
 from app.models.position_settlement import PositionSettlement, PositionSettlementStatus
 from app.models.trade import LIVE_FILL, Trade
 from app.models.transaction import CASH_TYPES, TransactionStatus, TransactionType, WalletTransaction
+from app.models.wallet import Wallet
 from app.services import position_service
 from app.services.admin_settlement_service import ist_week_bounds
 from app.services.market_data_service import is_usd_quoted_segment
@@ -426,6 +427,24 @@ async def net(user_ids: list[Any], from_date: datetime | None, to_date: datetime
     return sum((g - b for g, b in (await booked(user_ids, from_date, to_date)).values()), Decimal(0))
 
 
+def _worth_change(t: WalletTransaction) -> Decimal:
+    """What a COMPLETED ledger row did to cash less settlement outstanding.
+    Its amount, except: a due booked off a negative wallet (an admin
+    approving a SettlementRequest, the boot clamp) only renames that
+    negative cash as owed; a recovery out of cash pays the due with it; a
+    recovery with a positive amount (an admin delete / reopen unbooking a
+    stop-out's due) writes off what was owed, with no cash."""
+    amount = to_decimal(t.amount)
+    if t.transaction_type == TransactionType.SETTLEMENT_OUTSTANDING_BOOKED:
+        clamp = t.reference_type == "SettlementRequest" or (t.narration or "").startswith("Migration:")
+        return Decimal(0) if clamp else amount
+    if t.transaction_type == TransactionType.SETTLEMENT_OUTSTANDING_RECOVERY:
+        return max(amount, Decimal(0))
+    # ponytail: a loss a bonus credit absorbs (BONUSES_ENABLED, off on prod)
+    # writes no row for that part; give the statement a bonus line if it goes live.
+    return amount
+
+
 async def statement_payload(
     user: Any, from_date: datetime | None, to_date: datetime | None, *, brand: str = ""
 ) -> dict[str, Any]:
@@ -437,8 +456,9 @@ async def statement_payload(
     Its tables add up: Σ closed-row brokerage + Σ Carry Forward commission is
     Financial Standings' Brokerage — every charge on a fill executed in the
     window — and Σ closed-row Gross is its Gross PnL (what the wallet booked
-    as P&L in the window); Net = Gross − Brokerage. Balance is the ledger's
-    balance at the end of the window. Nothing here is a live price."""
+    as P&L in the window); Net = Gross − Brokerage. Opening and Balance are
+    what the account is worth at either edge (`_worth_change`), so Opening +
+    Funds + Net PnL is the Balance. Nothing here is a live price."""
     uid = user.id
     span = _span(from_date, to_date)
     inside = _between(from_date, to_date)
@@ -446,7 +466,7 @@ async def statement_payload(
     lots: list[dict[str, Any]] = []
     closed_rows, _, _ = await fifo_closed_rows(uid, from_date, to_date, lots=lots)
 
-    # ── Funds: settled money moves, opening on the ledger's own balance.
+    # ── Funds: settled money moves.
     # CASH_TYPES: an admin's PROMO / PENALTY is Add / Deduct Fund here too.
     tx_q: dict[str, Any] = {
         "user_id": uid,
@@ -465,22 +485,25 @@ async def statement_payload(
         }
         for tx in await WalletTransaction.find(tx_q).sort("+created_at", "+_id").to_list()
     ]
-    # A migration's outstanding row carries the outstanding, not the balance.
-    bal_q: dict[str, Any] = {
-        "user_id": uid,
-        "transaction_type": {"$ne": TransactionType.SETTLEMENT_OUTSTANDING_BOOKED.value},
-    }
-    first = await WalletTransaction.find(
-        {**bal_q, **({"created_at": {"$gte": from_date}} if from_date else {})}
-    ).sort("+created_at", "+_id").first_or_none()
-    before = (
-        None
-        if first or from_date is None
-        else await WalletTransaction.find({**bal_q, "created_at": {"$lt": from_date}})
-        .sort("-created_at", "-_id")
-        .first_or_none()
+    # Opening and Balance: what the account is worth at each edge — cash,
+    # margin in open positions included, less what the client owes — the
+    # wallet's worth now less every row after the edge. Not a row's
+    # balance_before / balance_after: that is the free cash (blocking margin
+    # writes no row), so a window that opened or closed with a position open
+    # read the margin as missing.
+    wallet = await Wallet.find_one(Wallet.user_id == uid)
+    worth = (
+        to_decimal(wallet.available_balance)
+        + to_decimal(wallet.used_margin)
+        - to_decimal(wallet.settlement_outstanding)
+        if wallet
+        else Decimal(0)
     )
-    opening = to_decimal(first.balance_before if first else before.balance_after if before else 0)
+    done = {"user_id": uid, "status": TransactionStatus.COMPLETED.value}
+    since = await WalletTransaction.find(
+        {**done, **({"created_at": {"$gte": from_date}} if from_date else {})}
+    ).to_list()
+    opening = worth - sum((_worth_change(t) for t in since), Decimal(0))
 
     # ── Everything charged in the window ───────────────────────────────
     fill_q: dict[str, Any] = {"user_id": uid, **LIVE_FILL}
@@ -543,11 +566,13 @@ async def statement_payload(
     gross = sum(grossed, Decimal(0))
 
     # ── Financial Standings: four figures that reconcile with the above ─
-    last = await WalletTransaction.find(
-        {**bal_q, **({"created_at": {"$lte": to_date}} if to_date is not None else {})}
-    ).sort("-created_at", "-_id").first_or_none()
+    after = (
+        []
+        if to_date is None
+        else await WalletTransaction.find({**done, "created_at": {"$gt": to_date}}).to_list()
+    )
     financial = {
-        "balance": _money(to_decimal(last.balance_after) if last else Decimal(0)),
+        "balance": _money(worth - sum((_worth_change(t) for t in after), Decimal(0))),
         "gross_pnl": _money(gross),
         "brokerage": _money(brokerage),
         "net_pnl": _money(gross - brokerage),
