@@ -33,6 +33,7 @@ from app.models.transaction import SettlementRequest, TransactionType, WalletTra
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
 from app.services import tradebook_builder, wallet_service
+from app.services.report_pdf_service import _amt, billing_sections
 from app.utils.time_utils import now_utc, to_ist
 from tests._real_fill import INSTRUMENT, later, market, set_commission_per_lot
 
@@ -99,14 +100,21 @@ async def _statement(c: User, from_days: int, to_days: int) -> dict:
 
 
 def _check(payload: dict) -> tuple[Decimal, Decimal]:
-    """(Opening + Net Funds + Net PnL, Balance) — one figure when it adds up.
+    """Opening + Net Funds + Net PnL + Net Adjustments is the Balance.
     Returns (opening, balance)."""
-    funds, fin = payload["funds"], payload["financial"]
+    funds, fin, adj = payload["funds"], payload["financial"], payload["adjustments"]
     opening = Decimal(str(funds["opening_balance"]))
     net_funds = sum((Decimal(str(r["amount"])) for r in funds["rows"]), Decimal(0))
+    net_adj = sum((Decimal(str(r["amount"])) for r in adj), Decimal(0))
     balance = Decimal(str(fin["balance"]))
-    assert opening + net_funds + Decimal(str(fin["net_pnl"])) == balance, (payload["from_label"], funds, fin)
+    assert opening + net_funds + Decimal(str(fin["net_pnl"])) + net_adj == balance, (
+        payload["from_label"], funds, fin, adj
+    )  # fmt: skip
     return opening, balance
+
+
+def _adjusted(payload: dict) -> list[tuple[str, Decimal]]:
+    return [(r["type"], Decimal(str(r["amount"]))) for r in payload["adjustments"]]
 
 
 async def _worth(c: User) -> Decimal:
@@ -217,6 +225,7 @@ async def test_an_undone_stop_out_whose_due_was_netted_refunds_it(w, undo):
     await _deposit(c, "5000")
     await market(c, "BUY", 1, "100", instrument=OTHER)  # brokerage 1; nets the due
     assert await _owed(c) == 0
+    stop_week = _check(await _statement(c, 13, 7))
     before = _check(await _statement(c, 6, 0))  # this week's
     assert before == (Decimal("-2020"), Decimal("2979"))
     await later(w.db, minutes=WEEK)  # now last week's
@@ -224,7 +233,41 @@ async def test_an_undone_stop_out_whose_due_was_netted_refunds_it(w, undo):
 
     assert await _due_unbooked(c) == []
     assert _check(await _statement(c, 13, 7)) == before
+    # The stop-out's week still adds up, its rows now listed as undone.
+    assert _check(await _statement(c, 20, 14)) == stop_week
     # A delete takes back all 3,020 the stop-out cost; a reopen the close's
     # 3,000 and its 10, the position open again on its opening leg's 10.
     left = Decimal("5999") if undo == "delete" else Decimal("5989")
     assert await _worth(c) == left and await _owed(c) == 0
+
+
+@pytest.mark.parametrize("undo", ["delete", "reopen"])
+async def test_an_undo_a_week_later_leaves_both_weeks_adding_up(w, undo):
+    """A +500 close one week, undone by an admin the next. The undone trade
+    leaves the first week's Net PnL, but its P&L and charges stay on that
+    week's ledger; the reversal lands in the second. Each week lists what
+    its Net PnL leaves out under Reversals and Adjustments, so both add up
+    and the second opens where the first closed."""
+    c = await w.mk("SB005")
+    await _deposit(c, "20000")
+    await market(c, "BUY", 10, "1000", margin="5000")  # brokerage 10
+    await market(c, "SELL", 10, "1050")  # +500, brokerage 10
+    await later(w.db, minutes=WEEK)
+    await _undo(w, c, undo)
+
+    first = await _statement(c, 13, 7)
+    second = await _statement(c, 6, 0)
+    _, first_close = _check(first)
+    second_open, second_close = _check(second)
+    assert first_close == second_open == Decimal("20480")
+    assert second_close == await _worth(c)
+    # The close (and, on a delete, the opening leg) is no longer billed.
+    undone = [("Realised P&L", Decimal("500")), ("Brokerage / charges", Decimal("-10"))]
+    if undo == "delete":
+        undone.insert(0, ("Brokerage / charges", Decimal("-10")))
+    assert _adjusted(first) == undone
+    assert all(r["comment"].endswith("(trade since undone)") for r in first["adjustments"])
+    reversal = Decimal("-480") if undo == "delete" else Decimal("-490")
+    assert _adjusted(second) == [("Trade adjustment", reversal)]
+    [section] = [s for s in billing_sections(second) if s.title == "Reversals and Adjustments"]
+    assert section.totals[1:3] == ["Net Adjustments", _amt(reversal)]

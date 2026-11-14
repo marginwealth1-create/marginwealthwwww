@@ -22,6 +22,9 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from bson import ObjectId
+
+from app.api.v1.user.ledger import _LABELS, _sanitize_narration
 from app.core.exceptions import ValidationFailedError
 from app.models.position import Position, PositionStatus
 from app.models.position_settlement import PositionSettlement, PositionSettlementStatus
@@ -427,6 +430,19 @@ async def net(user_ids: list[Any], from_date: datetime | None, to_date: datetime
     return sum((g - b for g, b in (await booked(user_ids, from_date, to_date)).values()), Decimal(0))
 
 
+# What a live fill's or a weekly settlement's own ledger rows are: Net PnL
+# holds them (a stop-out's due is the rest of its loss).
+_BILLED = frozenset(
+    {
+        TransactionType.PNL,
+        TransactionType.CHARGES,
+        TransactionType.BROKERAGE,
+        TransactionType.TRADE,
+        TransactionType.SETTLEMENT_OUTSTANDING_BOOKED,
+    }
+)
+
+
 def _worth_change(t: WalletTransaction) -> Decimal:
     """What a COMPLETED ledger row did to cash less settlement outstanding.
     Its amount, except: a due booked off a negative wallet (an admin
@@ -458,7 +474,8 @@ async def statement_payload(
     window — and Σ closed-row Gross is its Gross PnL (what the wallet booked
     as P&L in the window); Net = Gross − Brokerage. Opening and Balance are
     what the account is worth at either edge (`_worth_change`), so Opening +
-    Funds + Net PnL is the Balance. Nothing here is a live price."""
+    Funds + Net PnL + Reversals & Adjustments is the Balance. Nothing here is
+    a live price."""
     uid = user.id
     span = _span(from_date, to_date)
     inside = _between(from_date, to_date)
@@ -512,6 +529,52 @@ async def statement_payload(
     since, until = _between(from_date, None), _between(None, to_date)
     opening = worth - sum((_worth_change(t) for t in ledger if since(t.created_at)), Decimal(0))
     balance = worth - sum((_worth_change(t) for t in ledger if not until(t.created_at)), Decimal(0))
+
+    # ── Reversals & Adjustments: what moved the account in the window that is
+    # neither Funds nor the trades' Net PnL — an admin undo's reversal
+    # (whichever week the trade was), the P&L and charges of a fill since
+    # undone, a sharing payout … — so Opening + Funds + Net PnL + these is
+    # the Balance. Net PnL already holds a live fill's P&L and charges and a
+    # weekly settlement's P&L. Typed and worded as the client's own ledger.
+    moved = [
+        t
+        for t in ledger
+        if inside(t.created_at) and t.transaction_type not in CASH_TYPES and _worth_change(t)
+    ]
+    orders = {
+        t.reference_id
+        for t in moved
+        if t.reference_type == "ORDER" and ObjectId.is_valid(t.reference_id or "")
+    }
+    live = (
+        {
+            str(f.order_id)
+            for f in await Trade.find(
+                {"user_id": uid, "order_id": {"$in": [ObjectId(o) for o in orders]}, **LIVE_FILL}
+            ).to_list()
+        }
+        if orders
+        else set()
+    )
+
+    def billed(t: WalletTransaction) -> bool:
+        if t.transaction_type not in _BILLED:
+            return False
+        return t.reference_type == "POSITION_SETTLEMENT" or (
+            t.reference_type == "ORDER" and t.reference_id in live
+        )
+
+    adjustments = [
+        {
+            "time": _fmt_dt(t.created_at),
+            "type": _LABELS.get(t.transaction_type, t.transaction_type.value.title()),
+            "amount": _money(_worth_change(t)),
+            "comment": _sanitize_narration(t)
+            + (" (trade since undone)" if t.reference_type == "ORDER" else ""),
+        }
+        for t in sorted(moved, key=lambda t: (_naive(t.created_at), t.id))
+        if not billed(t)
+    ]
 
     # ── Everything charged in the window ───────────────────────────────
     fill_q: dict[str, Any] = {"user_id": uid, **LIVE_FILL}
@@ -587,6 +650,7 @@ async def statement_payload(
         "generated_at": _fmt_dt(now_utc()),
         "brought_forward": brought_forward,
         "funds": {"opening_balance": _money(opening), "rows": funds_rows},
+        "adjustments": adjustments,
         "closed_transactions": closed_rows,
         "script_wise": script_wise(closed_rows),
         "carry_forward": carry_forward,

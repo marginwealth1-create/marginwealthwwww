@@ -512,9 +512,10 @@ def trade_book_section(rows: list[dict[str, Any]]) -> Section:
 def billing_sections(payload: dict[str, Any]) -> list[Section]:
     """The Billing statement's tables (tradebook_builder.statement_payload),
     in the operator's order (handoff §4.1): Brought Forward → Funds
-    Transactions → one Trades List per exchange → Script-wise P&L → Carry
-    Forward → All Segments → Financial Standings. Nothing here is a live
-    price; every Totals line is the sum of the rows printed above it."""
+    Transactions (→ Reversals and Adjustments) → one Trades List per
+    exchange → Script-wise P&L → Carry Forward → All Segments → Financial
+    Standings. Nothing here is a live price; every Totals line is the sum of
+    the rows printed above it."""
     out = [
         Section(
             "Brought Forward",
@@ -542,6 +543,20 @@ def billing_sections(payload: dict[str, Any]) -> list[Section]:
             ["", "Net Funds", _total(a for _, a in money), ""],
         )
     )
+    # What moved the account that is neither Funds nor Net PnL: an undo's
+    # reversal, a since-undone fill's P&L and charges. Opening + Net Funds +
+    # Net PnL + Net Adjustments is the Balance.
+    adjusted = [(m, _amt(m["amount"])) for m in payload.get("adjustments", [])]
+    if adjusted:
+        out.append(
+            Section(
+                "Reversals and Adjustments",
+                ["Time", "Type", "Amount", "Comment"],
+                [10, 8, 8, 24],
+                [[m["time"], m["type"], a, m["comment"]] for m, a in adjusted],
+                ["", "Net Adjustments", _total(a for _, a in adjusted), ""],
+            )
+        )
 
     # One Trades List per exchange; both legs on one line.
     closed = payload.get("closed_transactions", [])
