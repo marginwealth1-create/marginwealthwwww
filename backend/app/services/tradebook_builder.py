@@ -557,7 +557,7 @@ async def statement_payload(
         else set()
     )
 
-    def billed(t: WalletTransaction) -> bool:
+    def priced(t: WalletTransaction) -> bool:
         if t.transaction_type not in _BILLED:
             return False
         return t.reference_type == "POSITION_SETTLEMENT" or (
@@ -573,7 +573,7 @@ async def statement_payload(
             + (" (trade since undone)" if t.reference_type == "ORDER" else ""),
         }
         for t in sorted(moved, key=lambda t: (_naive(t.created_at), t.id))
-        if not billed(t)
+        if not priced(t)
     ]
 
     # ── Everything charged in the window ───────────────────────────────
