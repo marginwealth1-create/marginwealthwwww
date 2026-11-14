@@ -2763,7 +2763,7 @@ async def delete_position(
                 # unbooked here.
                 booked_total = min(booked_total, cur_settle)
             except Exception as e:
-                raise await _abort(f"Settlement unwind failed; delete aborted: {e}")
+                raise await _abort(f"Settlement unwind failed; delete aborted: {e}") from e
         if booked_total > _Decimal("0"):
             try:
                 wallet_doc.settlement_outstanding = _Dec128(str(cur_settle - booked_total))
