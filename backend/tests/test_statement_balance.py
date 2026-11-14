@@ -32,7 +32,7 @@ from app.models.position import Position
 from app.models.transaction import SettlementRequest, TransactionType, WalletTransaction
 from app.models.user import User, UserRole, UserStatus
 from app.models.wallet import Wallet
-from app.services import tradebook_builder, wallet_service
+from app.services import position_service, tradebook_builder, wallet_service
 from app.services.report_pdf_service import _amt, billing_sections
 from app.utils.time_utils import now_utc, to_ist
 from tests._real_fill import INSTRUMENT, later, market, set_commission_per_lot
@@ -261,13 +261,80 @@ async def test_an_undo_a_week_later_leaves_both_weeks_adding_up(w, undo):
     second_open, second_close = _check(second)
     assert first_close == second_open == Decimal("20480")
     assert second_close == await _worth(c)
-    # The close (and, on a delete, the opening leg) is no longer billed.
-    undone = [("Realised P&L", Decimal("500")), ("Brokerage / charges", Decimal("-10"))]
+    # The close's order (and, on a delete, the opening leg's) is no longer
+    # billed: what its ledger rows booked comes back as a trade adjustment.
+    undone = [("Trade adjustment", Decimal("490"))]
     if undo == "delete":
-        undone.insert(0, ("Brokerage / charges", Decimal("-10")))
+        undone.insert(0, ("Trade adjustment", Decimal("-10")))
     assert _adjusted(first) == undone
-    assert all(r["comment"].endswith("(trade since undone)") for r in first["adjustments"])
     reversal = Decimal("-480") if undo == "delete" else Decimal("-490")
     assert _adjusted(second) == [("Trade adjustment", reversal)]
+    assert {r["comment"] for r in first["adjustments"] + second["adjustments"]} == {INSTRUMENT.symbol}
     [section] = [s for s in billing_sections(second) if s.title == "Reversals and Adjustments"]
     assert section.totals[1:3] == ["Net Adjustments", _amt(reversal)]
+
+
+async def test_an_expiry_settlement_is_billed_once(w):
+    """An expiry books its P&L with no fill (reference EXPIRY_SETTLEMENT);
+    Net PnL already prices that close, so it is no adjustment."""
+    c = await w.mk("SB006")
+    await _deposit(c, "20000")
+    await market(c, "BUY", 10, "1000", margin="5000")  # brokerage 10
+    [p] = await Position.find(Position.user_id == c.id).to_list()
+    await position_service.settle_expired_position(p, settlement_price=Decimal("1100"))
+
+    payload = await _statement(c, 6, 0)
+    _check(payload)
+    assert Decimal(str(payload["financial"]["net_pnl"])) == Decimal("990")
+    assert payload["adjustments"] == []
+
+
+@pytest.mark.parametrize("weeks_later", [0, 1])
+async def test_a_close_an_admin_reprices_adds_up(w, weeks_later):
+    """An admin moves a close from 1,050 to 1,060: the fills are re-booked
+    (Net PnL bills +600) and a reversal posts the +100 to the wallet. The
+    close's order shows what its ledger rows booked short of the bill
+    (−100), the reversal shows +100 — in one week they cancel, a week apart
+    each week adds up."""
+    c = await w.mk("SB007")
+    await _deposit(c, "20000")
+    await market(c, "BUY", 10, "1000", margin="5000")
+    await market(c, "SELL", 10, "1050")
+    await later(w.db, minutes=WEEK * weeks_later)
+    [p] = await Position.find(Position.user_id == c.id).to_list()
+    await trading.admin_edit_position(str(p.id), {"close_price": "1060"}, w.sa, None)
+
+    week = await _statement(c, 6, 0)
+    _check(week)
+    if weeks_later:
+        close_week = await _statement(c, 13, 7)
+        _check(close_week)
+        assert _adjusted(close_week) == [("Trade adjustment", Decimal("-100"))]
+        assert _adjusted(week) == [("Trade adjustment", Decimal("100"))]
+    else:
+        assert sum((a for _, a in _adjusted(week)), Decimal(0)) == 0
+    assert Decimal(str(_check(week)[1])) == await _worth(c) == Decimal("20580")
+
+
+@pytest.mark.parametrize("undo", ["delete", "reopen"])
+async def test_an_undo_past_the_cash_reads_as_a_trade_adjustment(w, undo):
+    """The client withdrew everything, then an admin undoes last week's
+    +500: the reversal finds no cash and books it all as a due — a
+    settlement row whose narration names the admin. The client's statement
+    words it as their ledger does: a trade adjustment on the scrip."""
+    c = await w.mk("SB008", auto_settlement=True)
+    await _deposit(c, "20000")
+    await market(c, "BUY", 10, "1000", margin="5000")
+    await market(c, "SELL", 10, "1050")
+    await wallet_service.adjust(
+        c.id, Decimal("-20480"), transaction_type=TransactionType.WITHDRAWAL, narration="NEFT out"
+    )
+    await later(w.db, minutes=WEEK)
+    await _undo(w, c, undo)
+
+    week = await _statement(c, 6, 0)
+    _check(week)
+    assert week["adjustments"]
+    for r in week["adjustments"]:
+        assert r["type"] == "Trade adjustment" and r["comment"] == INSTRUMENT.symbol, r
+    _check(await _statement(c, 13, 7))

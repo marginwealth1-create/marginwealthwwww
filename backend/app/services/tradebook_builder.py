@@ -17,6 +17,7 @@ writes to the database.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -443,6 +444,23 @@ _BILLED = frozenset(
 )
 
 
+# An admin delete / reopen's rows (and a due they booked) name the scrip first.
+_UNDONE = re.compile(r"(?:Delete|Reopen) (\S+)")
+# Non-cash rows that are not a trade's: worded as the client's ledger words them.
+_NOT_TRADES = frozenset(
+    {
+        TransactionType.PNL_SHARING_PAYOUT,
+        TransactionType.PNL_SHARING_RECEIPT,
+        TransactionType.INTER_USER,
+        TransactionType.BONUS_CONVERTED,
+    }
+)
+
+
+def _charge(t: Trade) -> Decimal:
+    return to_decimal(t.total_charges or t.brokerage or 0)
+
+
 def _worth_change(t: WalletTransaction) -> Decimal:
     """What a COMPLETED ledger row did to cash less settlement outstanding.
     Its amount, except: a due booked off a negative wallet (an admin
@@ -459,6 +477,107 @@ def _worth_change(t: WalletTransaction) -> Decimal:
     # ponytail: a loss a bonus credit absorbs (BONUSES_ENABLED, off on prod)
     # writes no row for that part; give the statement a bonus line if it goes live.
     return amount
+
+
+async def _adjustments(
+    ledger: list[WalletTransaction],
+    inside: Callable[[datetime | None], bool],
+    fills: list[Trade],
+    positions: list[Position],
+) -> list[dict[str, Any]]:
+    """The statement's Reversals and Adjustments: what moved the account in
+    the window that Funds and Net PnL leave out, so Opening + Funds + Net PnL
+    + these is the Balance.
+
+    - Per order, what the ledger booked on it in the window less what Net PnL
+      bills of its live fills executed in the window (a close's pnl_inr, an
+      opening leg's charge): a fill since undone, a close an admin repriced,
+      a fill an edit moved to another week.
+    - Every other row that moved the account (an undo's reversal and its due,
+      a netting's P&L, a sharing payout …), but not the settlement P&L Net
+      PnL prices: a weekly row its reopen did not flag, an expiry row while
+      its position is still the one that expiry closed (as user/reports
+      reads them).
+
+    A trade's row is worded as the client's own ledger words a reversal."""
+    moved = [
+        t
+        for t in ledger
+        if inside(t.created_at) and t.transaction_type not in CASH_TYPES and _worth_change(t)
+    ]
+    booked_on: dict[str, list[WalletTransaction]] = {}
+    rest: list[WalletTransaction] = []
+    for t in moved:
+        if t.reference_type == "ORDER" and ObjectId.is_valid(t.reference_id or ""):
+            booked_on.setdefault(str(t.reference_id), []).append(t)
+        else:
+            rest.append(t)
+    billed_on: dict[str, list[Trade]] = {}
+    for f in fills:
+        billed_on.setdefault(str(f.order_id), []).append(f)
+    orders = set(booked_on) | set(billed_on)
+    symbol = (
+        {
+            str(f.order_id): f.instrument.symbol
+            for f in await Trade.find({"order_id": {"$in": [ObjectId(o) for o in orders]}}).to_list()
+        }
+        if orders
+        else {}
+    )
+    on_position = {str(p.id): p for p in positions}
+    flagged = {
+        d["_id"]
+        for d in await WalletTransaction.get_motor_collection()
+        .find({"_id": {"$in": [t.id for t in rest]}, "superseded_by_reopen": True}, {"_id": 1})
+        .to_list(None)
+    }
+
+    def priced(t: WalletTransaction) -> bool:
+        if t.transaction_type not in _BILLED or t.id in flagged:
+            return False
+        p = on_position.get(t.reference_id or "")
+        closed = _naive(p.closed_at) if p is not None and p.status == PositionStatus.CLOSED else None
+        booked_at = _naive(t.created_at)
+        return t.reference_type == "POSITION_SETTLEMENT" or (
+            t.reference_type == "EXPIRY_SETTLEMENT"
+            and closed is not None
+            and booked_at is not None
+            and abs((closed - booked_at).total_seconds()) <= 60
+        )
+
+    def scrip(t: WalletTransaction) -> str:
+        p = on_position.get(t.reference_id or "")
+        if p is not None:
+            return p.instrument.symbol
+        undo = _UNDONE.match(t.narration or "")  # a delete took the position doc
+        if undo:
+            return undo.group(1)
+        as_reversal = t.model_copy(update={"transaction_type": TransactionType.REVERSAL})
+        return _sanitize_narration(as_reversal).partition(" — ")[2]
+
+    found: list[tuple[Any, str, Decimal, str]] = []
+    for order in orders:
+        booked_rows, its_fills = booked_on.get(order, []), billed_on.get(order, [])
+        diff = sum((_worth_change(t) for t in booked_rows), Decimal(0)) - sum(
+            (to_decimal(f.pnl_inr) if f.pnl_inr is not None else -_charge(f) for f in its_fills), Decimal(0)
+        )
+        if diff:
+            times = [_naive(t.created_at) for t in booked_rows] + [_naive(f.executed_at) for f in its_fills]
+            at = min(x for x in times if x is not None)
+            found.append((at, "Trade adjustment", diff, symbol.get(order, "")))
+    for t in rest:
+        if priced(t):
+            continue
+        if t.transaction_type in _NOT_TRADES:
+            found.append(
+                (_naive(t.created_at), _LABELS[t.transaction_type], _worth_change(t), _sanitize_narration(t))
+            )
+        else:
+            found.append((_naive(t.created_at), "Trade adjustment", _worth_change(t), scrip(t)))
+    return [
+        {"time": _fmt_dt(at), "type": kind, "amount": _money(amount), "comment": comment}
+        for at, kind, amount, comment in sorted(found, key=lambda r: r[0])
+    ]
 
 
 async def statement_payload(
@@ -530,62 +649,16 @@ async def statement_payload(
     opening = worth - sum((_worth_change(t) for t in ledger if since(t.created_at)), Decimal(0))
     balance = worth - sum((_worth_change(t) for t in ledger if not until(t.created_at)), Decimal(0))
 
-    # ── Reversals & Adjustments: what moved the account in the window that is
-    # neither Funds nor the trades' Net PnL — an admin undo's reversal
-    # (whichever week the trade was), the P&L and charges of a fill since
-    # undone, a sharing payout … — so Opening + Funds + Net PnL + these is
-    # the Balance. Net PnL already holds a live fill's P&L and charges and a
-    # weekly settlement's P&L. Typed and worded as the client's own ledger.
-    moved = [
-        t
-        for t in ledger
-        if inside(t.created_at) and t.transaction_type not in CASH_TYPES and _worth_change(t)
-    ]
-    orders = {
-        t.reference_id
-        for t in moved
-        if t.reference_type == "ORDER" and ObjectId.is_valid(t.reference_id or "")
-    }
-    live = (
-        {
-            str(f.order_id)
-            for f in await Trade.find(
-                {"user_id": uid, "order_id": {"$in": [ObjectId(o) for o in orders]}, **LIVE_FILL}
-            ).to_list()
-        }
-        if orders
-        else set()
-    )
-
-    def priced(t: WalletTransaction) -> bool:
-        if t.transaction_type not in _BILLED:
-            return False
-        return t.reference_type == "POSITION_SETTLEMENT" or (
-            t.reference_type == "ORDER" and t.reference_id in live
-        )
-
-    adjustments = [
-        {
-            "time": _fmt_dt(t.created_at),
-            "type": _LABELS.get(t.transaction_type, t.transaction_type.value.title()),
-            "amount": _money(_worth_change(t)),
-            "comment": _sanitize_narration(t)
-            + (" (trade since undone)" if t.reference_type == "ORDER" else ""),
-        }
-        for t in sorted(moved, key=lambda t: (_naive(t.created_at), t.id))
-        if not priced(t)
-    ]
-
     # ── Everything charged in the window ───────────────────────────────
     fill_q: dict[str, Any] = {"user_id": uid, **LIVE_FILL}
     if span:
         fill_q["executed_at"] = span
-    brokerage = sum(
-        (to_decimal(t.total_charges or t.brokerage or 0) for t in await Trade.find(fill_q).to_list()),
-        Decimal(0),
-    )
+    fills = await Trade.find(fill_q).to_list()
+    brokerage = sum((_charge(t) for t in fills), Decimal(0))
 
     positions = await Position.find(Position.user_id == uid).sort("+opened_at").to_list()
+
+    adjustments = await _adjustments(ledger, inside, fills, positions)
 
     # ── Brought / Carry Forward: which positions off the Position docs, their
     # units and price off the walk's book at the boundary (`_deal`).
