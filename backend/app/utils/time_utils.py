@@ -115,18 +115,21 @@ def add_business_days(d: date, n: int) -> date:
 # Drives the auto MIS→NRML / carry-forward rollover loop (the minute the
 # per-position Carry-Forward decision runs: ON → carry, OFF → square off).
 # Operator-set rollover times for this platform: NSE/BSE 16:00 IST, MCX
-# 23:40 IST. Global forex (FOREX) rolls at 03:30 IST (FOREX_ROLLOVER); NSE
-# currency futures (CDS) and crypto (24/7) are not rolled.
+# 23:40 IST. The international markets and crypto roll at 03:30 IST
+# (INTL_ROLLOVER); NSE currency futures (CDS) are not rolled.
 # NOTE: these ONLY affect the rollover + `is_after_close` (pending-order
 # firing / risk-EOD) — NEW order acceptance is gated by live-feed staleness,
 # so moving these does not open a stale-price trading window.
 NSE_BSE_CLOSE: time = time(15, 41)  # operator: market close + CF rollover
 MCX_CLOSE: time = time(23, 55)  # operator 2026-11-03; also order_validator, user positions exit
 # guard, zerodha _feed_expected_now, frontend-user lib/marketHours.ts — change together
-# Forex trades 24x5 and closes its day at 17:00 New York = 03:30 IST (operator
-# 2026-11-20): positions carry then, Tue-Sat mornings closing the Mon-Fri sessions.
-FOREX_ROLLOVER: time = time(3, 30)
-FOREX_SEGMENTS: frozenset[str] = frozenset({"FOREX"})
+# Forex and the US stock / index / commodity CFDs close their day at 17:00
+# New York = 03:30 IST (operator 2026-11-20): positions carry then, Tue-Sat
+# mornings closing the Mon-Fri sessions. Crypto (24/7) carries at the same
+# time every day.
+INTL_ROLLOVER: time = time(3, 30)
+INTL_SEGMENTS: frozenset[str] = frozenset({"FOREX", "STOCKS", "INDICES", "COMMODITIES"})
+CRYPTO_SEGMENTS: frozenset[str] = frozenset({"CRYPTO_SPOT", "CRYPTO_FUTURE", "CRYPTO_PERPETUAL"})
 # Session OPEN times — symmetric to the close times above. Needed so the
 # risk enforcer recognises the PRE-OPEN window (weekday midnight → open)
 # as "market closed". Without these, is_after_close() alone returns False
@@ -181,10 +184,9 @@ MCX_SEGMENTS: frozenset[str] = frozenset({
     "MCX_OPTION",
 })
 ROLLOVER_EXEMPT_SEGMENTS: frozenset[str] = frozenset({
-    # Forex: 24/5 — no intraday close, MIS stays MIS across days until weekend.
+    # NSE currency derivatives: MIS stays MIS across days. (Global forex, the
+    # CFDs and crypto roll at INTL_ROLLOVER — see INTL_SEGMENTS.)
     "CDS_FUTURE", "CDS_OPTION_BUY", "CDS_OPTION_SELL",
-    # Crypto: 24/7 — never converts.
-    "CRYPTO_SPOT", "CRYPTO_FUTURE", "CRYPTO_PERPETUAL",
 })
 
 

@@ -72,7 +72,9 @@ def _tier_value(layer: Any, field: str) -> Any:
 
 def _walk_tiers(layers: list[tuple[str, Any]], seg: Any) -> dict[str, dict[str, Any]]:
     """Per field, the first `(tier, override)` layer (most specific first)
-    that holds a value, else the seed segment: {field: {value, tier}}."""
+    that holds a value, else the seed segment: {field: {value, tier}}. An
+    Overnight Margin no tier sets on an OVERNIGHT_DEFAULTS_TO_INTRADAY row is
+    the Intraday one (tier INTRADAY), not the seed's."""
     out: dict[str, dict[str, Any]] = {}
     for f in NETTING_FIELDS:
         out[f] = {"value": getattr(seg, f, None), "tier": "SEED"}
@@ -81,6 +83,9 @@ def _walk_tiers(layers: list[tuple[str, Any]], seg: Any) -> dict[str, dict[str, 
             if v is not None:
                 out[f] = {"value": v, "tier": tier}
                 break
+    unset = out.get("overnightMargin", {}).get("tier") == "SEED"
+    if unset and getattr(seg, "name", "") in OVERNIGHT_DEFAULTS_TO_INTRADAY:
+        out["overnightMargin"] = {"value": None, "tier": "INTRADAY"}
     return out
 
 
@@ -108,15 +113,11 @@ async def _resolve_super_admin_id() -> PydanticObjectId | None:
     _SUPER_ADMIN_ID_CACHE = doc["_id"]
     return _SUPER_ADMIN_ID_CACHE
 
-# Admin matrix rows whose instruments don't settle daily — no separate
-# overnight margin exists. The resolver always reads the *Intraday* column
-# for these rows and the admin UI greys out the overnight cells.
-INTRADAY_ONLY_ADMIN_ROWS = frozenset({"STOCKS", "INDICES", "COMMODITIES", "CRYPTO"})
-# Rows that carry overnight (FOREX rolls at 03:30 IST since 2026-11-20) but
+# Rows that carry overnight since 2026-11-20 (they roll at 03:30 IST) but
 # whose Overnight Margin, until an admin tier sets one, is the Intraday one —
 # the base row's seeded 100 would otherwise turn a 500x book into a 100x
-# carry check overnight.
-OVERNIGHT_DEFAULTS_TO_INTRADAY = frozenset({"FOREX"})
+# carry check overnight. The admin matrix shows that as "same as Intraday".
+OVERNIGHT_DEFAULTS_TO_INTRADAY = frozenset({"FOREX", "STOCKS", "INDICES", "COMMODITIES", "CRYPTO"})
 
 # Module-local debounce for "netting_eff:*" wipes. The admin Segment Matrix
 # fires N parallel PUTs (one per dirty segment); without this each call
@@ -2054,20 +2055,8 @@ def _to_legacy_dict(
     # use it for any product type. The intraday/overnight split only matters
     # for `Percent` / `Fixed` mode, where margin actually carries more cost
     # to hold overnight.
-    #
-    # Infoway-fed segments (FOREX / STOCKS / INDICES / COMMODITIES / CRYPTO)
-    # have no daily settlement — there's no separate "overnight" cost. We
-    # always read the *Intraday* margin for those rows regardless of the
-    # product_type sent by the order. Pairs with the admin matrix UI
-    # gating in nettingMatrixConfig.ts so the overnight columns render as
-    # N/A (—) and aren't editable.
     seg_name_for_check = getattr(seg, "name", "")
-    if seg_name_for_check in INTRADAY_ONLY_ADMIN_ROWS:
-        is_overnight = False
-    else:
-        is_overnight = (
-            False if margin_mode == "times" else (product_type or "").upper() in ("CNC", "NRML")
-        )
+    is_overnight = False if margin_mode == "times" else (product_type or "").upper() in ("CNC", "NRML")
 
     # Resolve effective margin %. Order matters: expiry-day → option BUY/SELL
     # specifics → segment-wide intraday/overnight.
@@ -2192,15 +2181,7 @@ def _to_legacy_dict(
             else float(chosen)
         )
     else:
-        # INTRADAY_ONLY admin rows (Forex / Crypto / spot Commodity / etc.)
-        # have no separate carry-forward concept; the overnight column is
-        # explicitly N/A in the admin matrix. Mirror that here by reusing
-        # the intraday pct rather than a stale `seg_overnight` default.
-        effective_overnight_pct = (
-            effective_margin_pct
-            if seg_name_for_check in INTRADAY_ONLY_ADMIN_ROWS
-            else seg_overnight
-        )
+        effective_overnight_pct = seg_overnight
 
     # Translate the admin's chosen mode into the legacy
     # {leverage, margin_percentage, fixed_margin_per_lot} triple consumed

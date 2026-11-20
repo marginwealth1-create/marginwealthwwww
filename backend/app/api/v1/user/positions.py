@@ -314,15 +314,15 @@ def _pos(p: Position, expiry: str | None = None, carry_enabled: bool = False) ->
 
 def _segment_carryable(segment: str | None) -> bool:
     """True only for segments with a daily EOD rollover: Indian NSE / BSE / MCX
-    F&O, and global forex (03:30 IST). Other 24-hour markets — commodity CFDs
-    (XAGUSD, XAUUSD) / crypto (BTCUSD) — are rollover-exempt, so
-    `convert_intraday_to_carry` never fires for them and the per-position
-    Carry-Forward toggle would do nothing. Gate `carry_forward_enabled` on
-    this so the toggle is hidden there — and shown wherever the rollover runs,
-    or a pool with the toggle on squares every position it could not show."""
-    from app.utils.time_utils import FOREX_SEGMENTS, market_close_time_for_segment
+    F&O, and the international markets and crypto (03:30 IST). NSE currency
+    derivatives (CDS) are rollover-exempt, so `convert_intraday_to_carry`
+    never fires for them and the per-position Carry-Forward toggle would do
+    nothing. Gate `carry_forward_enabled` on this so the toggle is hidden
+    there — and shown wherever the rollover runs, or a pool with the toggle
+    on squares every position it could not show."""
+    from app.utils.time_utils import CRYPTO_SEGMENTS, INTL_SEGMENTS, market_close_time_for_segment
 
-    return market_close_time_for_segment(segment) is not None or segment in FOREX_SEGMENTS
+    return market_close_time_for_segment(segment) is not None or segment in INTL_SEGMENTS | CRYPTO_SEGMENTS
 
 
 async def _expiry_map(tokens: list[str]) -> dict[str, str]:

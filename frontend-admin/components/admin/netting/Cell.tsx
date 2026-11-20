@@ -56,9 +56,14 @@ export function Cell({
 }) {
   const hasInherit = inheritValue !== undefined && inheritValue !== null && inheritValue !== "";
   const shown = hasInherit ? fmtValue(field, inheritValue) : null;
-  const inheritText = inheritTier
-    ? `Not set · ${shown ?? "—"} (${TIER_LABEL[inheritTier] ?? inheritTier})`
-    : shown ?? "inherit";
+  // INTRADAY: an Overnight Margin nobody set on a row that carries at 03:30
+  // IST is the Intraday one (netting_service.OVERNIGHT_DEFAULTS_TO_INTRADAY).
+  const inheritText =
+    inheritTier === "INTRADAY"
+      ? "Not set · same as Intraday"
+      : inheritTier
+        ? `Not set · ${shown ?? "—"} (${TIER_LABEL[inheritTier] ?? inheritTier})`
+        : shown ?? "inherit";
   const zeroHint =
     value === 0
       ? COMMISSION_FIELDS.includes(field.key)

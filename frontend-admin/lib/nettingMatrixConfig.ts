@@ -280,26 +280,6 @@ export const CATEGORY_FIELDS: Record<string, FieldDef[]> = {
   ],
 };
 
-// Admin matrix rows whose underlying instruments don't settle daily —
-// there is no concept of an overnight margin for these segments. Keep
-// in sync with INTRADAY_ONLY_ADMIN_ROWS in
-// backend/app/services/netting_service.py. FOREX carries (03:30 IST rollover).
-const INTRADAY_ONLY_ROWS = new Set(["STOCKS", "INDICES", "COMMODITIES", "CRYPTO"]);
-
-// Field keys that represent an overnight / carryforward dimension of margin.
-// Hidden for the Infoway segments above so admins don't enter values that
-// would never be picked up by the resolver.
-const OVERNIGHT_FIELD_KEYS = new Set([
-  "overnightMargin",
-  "optionBuyOvernight",
-  "optionSellOvernight",
-  "expiryDayIntradayMargin",
-  "expiryDayOptionBuyMargin",
-  "expiryDayOptionSellMargin",
-  "allowOvernight",
-  "carryForwardChargePercent",
-]);
-
 export function isFieldNA(segment: SegmentRow | undefined, categoryId: string, field: FieldDef): boolean {
   if (!segment) return true;
   if (field.allSegments) return false;
@@ -310,6 +290,5 @@ export function isFieldNA(segment: SegmentRow | undefined, categoryId: string, f
   if (categoryId === "quantity" && !segment.qtyApplies) return true;
   if (categoryId === "options" && !segment.optionApplies) return true;
   if (categoryId === "expiryHold" && !segment.expiryHoldApplies) return true;
-  if (INTRADAY_ONLY_ROWS.has(segment.code) && OVERNIGHT_FIELD_KEYS.has(field.key)) return true;
   return false;
 }

@@ -2281,10 +2281,13 @@ def affordable_carry(qty: Decimal, cash: Decimal, locked: Decimal, full_margin: 
 
 def rollover_fire_at(group: str, fire_at: Any, day: Any, muhurat_close: Any = None) -> Any:
     """When `group` rolls on the IST `day`: `fire_at`, a Muhurat session's
-    close + 1 min, or None when it doesn't roll that day. Forex closes its
-    Mon-Fri sessions on Tue-Sat mornings and keeps no Indian calendar."""
-    if group == "FOREX":
+    close + 1 min, or None when it doesn't roll that day. The international
+    markets close their Mon-Fri sessions on Tue-Sat mornings, crypto every
+    day; neither keeps the Indian calendar."""
+    if group == "INTL":
         return fire_at if day.weekday() in (1, 2, 3, 4, 5) else None
+    if group == "CRYPTO":
+        return fire_at
     if muhurat_close is not None:
         return rollover_fire_time(muhurat_close, 1)
     return None if is_weekend(day) else fire_at
@@ -2810,11 +2813,12 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
 
         • NSE/BSE/F&O → 15:41, the platform's NSE close (operator-set)
         • MCX         → close + 1 min
-        • Forex       → 03:30, Tue-Sat (the Mon-Fri sessions' close)
-        • Crypto / other international → no daily close, never rolled
+        • Forex / US stocks / indices / commodity CFDs → 03:30, Tue-Sat
+          (the Mon-Fri sessions' close)
+        • Crypto      → 03:30, every day
 
-    Weekends and the exchange's full-day holidays are skipped (not for
-    forex, which has neither). The "done
+    Weekends and the exchange's full-day holidays are skipped (not for the
+    international markets or crypto, which keep neither). The "done
     today" marker is persisted in Redis as well as memory, so a restart
     after the close never sweeps the same book a second time.
     """
@@ -2826,8 +2830,9 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
     from app.models._base import Exchange as _Exchange
     from app.models.holiday import TradingHoliday as _TradingHoliday
     from app.utils.time_utils import (
-        FOREX_ROLLOVER,
-        FOREX_SEGMENTS,
+        CRYPTO_SEGMENTS,
+        INTL_ROLLOVER,
+        INTL_SEGMENTS,
         INDIAN_EQUITY_FNO_SEGMENTS,
         MCX_CLOSE,
         NSE_BSE_CLOSE,
@@ -2842,7 +2847,8 @@ async def intraday_to_carry_loop(interval_sec: float = 60.0) -> None:
     groups = (
         ("INDIAN_EQUITY_FNO", INDIAN_EQUITY_FNO_SEGMENTS, rollover_fire_time(NSE_BSE_CLOSE, 0)),
         ("MCX", MCX_SEGMENTS, rollover_fire_time(MCX_CLOSE, 1)),
-        ("FOREX", FOREX_SEGMENTS, FOREX_ROLLOVER),
+        ("INTL", INTL_SEGMENTS, INTL_ROLLOVER),
+        ("CRYPTO", CRYPTO_SEGMENTS, INTL_ROLLOVER),
     )
 
     async def _done(group: str, day: str) -> bool:
